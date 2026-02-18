@@ -1,0 +1,39 @@
+{
+  "name": "plex-command-center",
+  "version": "2.5.2",
+  "description": "Advanced Plex Media Server monitoring and control dashboard",
+  "main": "backend-server.js",
+  "scripts": {
+    "start": "node backend-server.js",
+    "dev": "node backend-server.js"
+  },
+  "keywords": [
+    "plex",
+    "media-server",
+    "monitoring",
+    "dashboard",
+    "tautulli",
+    "jellyseerr",
+    "zabbix"
+  ],
+  "author": "Plex Command Center Contributors",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/plex-command-center.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yourusername/plex-command-center/issues"
+  },
+  "homepage": "https://github.com/yourusername/plex-command-center#readme",
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.0",
+    "systeminformation": "^5.21.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

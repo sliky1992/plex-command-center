@@ -1,0 +1,1150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Plex Command Center v2.5.2</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#0a0e27 0%,#1a1f3a 100%);color:#e2e8f0;min-height:100vh}
+    .header{background:rgba(10,14,39,.95);backdrop-filter:blur(20px);border-bottom:1px solid rgba(100,116,139,.2);position:sticky;top:0;z-index:100;box-shadow:0 4px 6px -1px rgba(0,0,0,.3)}
+    .header-content{max-width:1800px;margin:0 auto;padding:.75rem 2rem;display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap}
+    .logo{display:flex;align-items:center;gap:.75rem}
+    .logo-icon{width:44px;height:44px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:1.3rem;box-shadow:0 4px 12px rgba(59,130,246,.4)}
+    .logo-text h1{font-size:1.3rem;font-weight:700;background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+    .logo-text p{font-size:.75rem;color:#94a3b8}
+    .logo-text .server-name{font-size:.8rem;color:#60a5fa;font-weight:600}
+    .nav{display:flex;gap:.25rem;flex-wrap:wrap}
+    .nav-btn{padding:.6rem 1.2rem;background:transparent;border:none;color:#94a3b8;cursor:pointer;font-size:.875rem;font-weight:500;border-radius:8px;transition:all .2s;position:relative;white-space:nowrap}
+    .nav-btn:hover{background:rgba(59,130,246,.1);color:#60a5fa}
+    .nav-btn.active{background:rgba(59,130,246,.15);color:#60a5fa}
+    .badge{margin-left:.4rem;background:#3b82f6;padding:.1rem .45rem;border-radius:9999px;font-size:.7rem}
+    .badge.warn{background:#f59e0b}
+    .main{max-width:1800px;margin:0 auto;padding:1.5rem 2rem}
+    .page-title{font-size:1.4rem;font-weight:600;margin-bottom:1.5rem;display:flex;justify-content:space-between;align-items:center}
+    .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1.25rem}
+    .card{background:rgba(15,23,42,.6);backdrop-filter:blur(20px);border:1px solid rgba(100,116,139,.2);border-radius:14px;padding:1.25rem;transition:all .3s}
+    .card:hover{transform:translateY(-3px);box-shadow:0 10px 24px rgba(0,0,0,.4);border-color:rgba(59,130,246,.3)}
+    .card.clickable{cursor:pointer}
+    .card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:.75rem}
+    .card-title{font-size:.95rem;font-weight:600;display:flex;align-items:center;gap:.5rem}
+    .big-val{font-size:2.2rem;font-weight:700;background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;line-height:1.1}
+    .sub-label{font-size:.8rem;color:#94a3b8;margin-top:.4rem}
+    .dot{width:8px;height:8px;border-radius:50%;background:#10b981;box-shadow:0 0 8px #10b981;animation:pulse 2s infinite}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+    .btn{padding:.5rem 1rem;border:none;border-radius:7px;cursor:pointer;font-size:.8rem;font-weight:600;transition:all .2s}
+    .btn-primary{background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:#fff}
+    .btn-primary:hover{transform:translateY(-1px);box-shadow:0 6px 16px rgba(59,130,246,.3)}
+    .btn-sm{padding:.35rem .75rem;border:none;border-radius:6px;cursor:pointer;font-size:.75rem;font-weight:600;transition:all .2s}
+    .btn-approve{background:rgba(16,185,129,.2);border:1px solid rgba(16,185,129,.4);color:#34d399}
+    .btn-approve:hover{background:rgba(16,185,129,.35)}
+    .btn-decline{background:rgba(239,68,68,.2);border:1px solid rgba(239,68,68,.4);color:#f87171}
+    .btn-decline:hover{background:rgba(239,68,68,.35)}
+    .btn-delete{background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.3);color:#f87171}
+    .btn-outline{background:rgba(59,130,246,.15);border:1px solid rgba(59,130,246,.3);color:#60a5fa}
+    .btn-outline:hover{background:rgba(59,130,246,.25)}
+    .toggle{display:inline-flex;background:rgba(100,116,139,.2);border-radius:7px;padding:.2rem}
+    .toggle-opt{padding:.4rem .9rem;border:none;background:transparent;color:#94a3b8;border-radius:5px;cursor:pointer;font-size:.8rem;transition:all .2s}
+    .toggle-opt.active{background:rgba(59,130,246,.3);color:#60a5fa}
+    .progress-wrap{height:7px;background:rgba(100,116,139,.2);border-radius:4px;overflow:hidden;margin:.4rem 0}
+    .progress-bar{height:100%;background:linear-gradient(90deg,#3b82f6,#8b5cf6);transition:width .5s}
+    .progress-bar.warn{background:#f59e0b}
+    .progress-bar.danger{background:#ef4444}
+    .overlay{position:fixed;inset:0;background:rgba(0,0,0,.85);backdrop-filter:blur(8px);display:flex;align-items:center;justify-content:center;z-index:2000;animation:fade .2s}
+    @keyframes fade{from{opacity:0}to{opacity:1}}
+    .modal{background:rgba(10,18,42,.98);border:1px solid rgba(100,116,139,.3);border-radius:14px;padding:1.75rem;max-width:90vw;max-height:90vh;overflow-y:auto;animation:slideup .3s;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+    .modal.wide{width:900px}
+    .modal.xl{width:1200px}
+    @keyframes slideup{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}
+    .modal-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:1.5rem;padding-bottom:1rem;border-bottom:1px solid rgba(100,116,139,.2)}
+    .modal-title{font-size:1.3rem;font-weight:600}
+    .modal-close{width:30px;height:30px;background:rgba(100,116,139,.2);border:none;border-radius:7px;color:#94a3b8;cursor:pointer;font-size:1.1rem;display:flex;align-items:center;justify-content:center}
+    .modal-close:hover{background:rgba(239,68,68,.2);color:#f87171}
+    .form-row{margin-bottom:1.25rem}
+    .form-label{display:block;margin-bottom:.4rem;font-weight:500;font-size:.875rem;color:#cbd5e1}
+    .form-select,.form-input{width:100%;padding:.65rem;background:rgba(15,23,42,.8);border:1px solid rgba(100,116,139,.3);border-radius:8px;color:#e2e8f0;font-size:.875rem}
+    .form-select:focus,.form-input:focus{outline:none;border-color:rgba(59,130,246,.5)}
+    .req-card{background:rgba(15,23,42,.7);border:1px solid rgba(100,116,139,.2);border-radius:10px;padding:.9rem 1rem;margin-bottom:.6rem;display:flex;align-items:center;gap:.75rem;transition:all .2s}
+    .req-card:hover{border-color:rgba(59,130,246,.3)}
+    .req-poster{width:40px;height:60px;border-radius:5px;object-fit:cover;background:rgba(100,116,139,.2);flex-shrink:0}
+    .req-poster-placeholder{width:40px;height:60px;border-radius:5px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);display:flex;align-items:center;justify-content:center;font-size:1.2rem;flex-shrink:0}
+    .req-info{flex:1;min-width:0}
+    .req-title{font-weight:600;font-size:.9rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .req-meta{font-size:.75rem;color:#94a3b8;margin-top:.2rem}
+    .req-actions{display:flex;gap:.4rem;flex-shrink:0}
+    .status-badge{padding:.2rem .6rem;border-radius:5px;font-size:.7rem;font-weight:600}
+    .status-pending{background:rgba(245,158,11,.2);color:#fbbf24;border:1px solid rgba(245,158,11,.3)}
+    .status-approved{background:rgba(16,185,129,.2);color:#34d399;border:1px solid rgba(16,185,129,.3)}
+    .status-declined{background:rgba(239,68,68,.2);color:#f87171;border:1px solid rgba(239,68,68,.3)}
+    .status-available{background:rgba(59,130,246,.2);color:#60a5fa;border:1px solid rgba(59,130,246,.3)}
+    .col-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:1rem;margin-top:1rem}
+    .col-card{background:rgba(15,23,42,.7);border:1px solid rgba(100,116,139,.2);border-radius:10px;overflow:hidden;transition:all .2s;cursor:pointer}
+    .col-card:hover{transform:translateY(-4px);border-color:rgba(59,130,246,.4);box-shadow:0 8px 20px rgba(0,0,0,.3)}
+    .col-poster{width:100%;aspect-ratio:2/3;object-fit:cover}
+    .col-poster-ph{width:100%;aspect-ratio:2/3;background:linear-gradient(135deg,#1e3a5f,#2d1f6e);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.5rem;font-size:2.5rem}
+    .col-info{padding:.75rem}
+    .col-title{font-weight:600;font-size:.85rem;margin-bottom:.3rem;line-height:1.2}
+    .col-count{font-size:.75rem;color:#94a3b8;margin-bottom:.5rem}
+    .col-actions{display:flex;gap:.4rem}
+    .user-row{display:flex;align-items:center;padding:.75rem;background:rgba(15,23,42,.4);border-radius:8px;margin-bottom:.5rem;cursor:pointer;transition:all .2s;border:1px solid transparent}
+    .user-row:hover{background:rgba(59,130,246,.08);border-color:rgba(59,130,246,.2)}
+    .avatar{width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#3b82f6,#8b5cf6);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:.9rem;flex-shrink:0}
+    .avatar img{width:100%;height:100%;border-radius:50%;object-fit:cover}
+    .stream-card{background:rgba(15,23,42,.7);border:1px solid rgba(100,116,139,.2);border-radius:10px;padding:1.1rem;margin-bottom:.75rem}
+    .stream-card:hover{border-color:rgba(59,130,246,.3)}
+    .info-grid{display:grid;grid-template-columns:1fr 1fr;gap:.5rem}
+    .info-row{display:flex;justify-content:space-between;padding:.6rem 0;border-bottom:1px solid rgba(100,116,139,.1)}
+    .info-label{color:#94a3b8;font-size:.85rem}
+    .info-val{font-weight:600;font-size:.85rem}
+    .search-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:.75rem;margin-top:1rem;max-height:500px;overflow-y:auto}
+    .search-card{background:rgba(15,23,42,.7);border:1px solid rgba(100,116,139,.2);border-radius:10px;overflow:hidden;cursor:pointer;transition:all .2s}
+    .search-card:hover{border-color:rgba(59,130,246,.4);transform:translateY(-3px)}
+    .search-poster{width:100%;aspect-ratio:2/3;object-fit:cover;background:rgba(100,116,139,.2)}
+    .search-info{padding:.6rem}
+    .search-title{font-weight:600;font-size:.8rem;margin-bottom:.2rem;line-height:1.2}
+    .search-meta{font-size:.7rem;color:#94a3b8;margin-bottom:.4rem}
+    .hist-table{width:100%;border-collapse:collapse}
+    .hist-table th{text-align:left;padding:.65rem;background:rgba(15,23,42,.8);color:#94a3b8;font-size:.8rem;font-weight:600;border-bottom:1px solid rgba(100,116,139,.2)}
+    .hist-table td{padding:.65rem;border-bottom:1px solid rgba(100,116,139,.1);font-size:.8rem}
+    .hist-table tr:hover td{background:rgba(59,130,246,.05)}
+    .spinner{border:3px solid rgba(148,163,184,.2);border-top:3px solid #3b82f6;border-radius:50%;width:36px;height:36px;animation:spin 1s linear infinite;margin:0 auto}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .empty{text-align:center;padding:3rem;color:#94a3b8}
+    .alert-box{padding:.75rem 1rem;border-radius:8px;margin-bottom:1rem;font-size:.875rem}
+    .alert-warn{background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.3);color:#fbbf24}
+    .alert-info{background:rgba(59,130,246,.1);border:1px solid rgba(59,130,246,.3);color:#60a5fa}
+    .alert-success{background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.3);color:#34d399}
+    .alert-error{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#f87171}
+    .tool-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:1.25rem}
+    .tool-card{background:rgba(15,23,42,.6);border:1px solid rgba(100,116,139,.2);border-radius:12px;padding:1.4rem;cursor:pointer;transition:all .2s}
+    .tool-card:hover{transform:translateY(-3px);border-color:rgba(59,130,246,.4);box-shadow:0 8px 20px rgba(0,0,0,.3)}
+    .tool-icon{font-size:2rem;margin-bottom:.75rem}
+    .tool-title{font-size:1rem;font-weight:600;margin-bottom:.4rem}
+    .tool-desc{font-size:.8rem;color:#94a3b8}
+    @media(max-width:1024px){.grid{grid-template-columns:repeat(2,1fr)}}
+    @media(max-width:768px){.grid{grid-template-columns:1fr}.header-content{flex-direction:column}}
+    ::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:rgba(15,23,42,.4)}::-webkit-scrollbar-thumb{background:rgba(100,116,139,.4);border-radius:3px}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState, useEffect, useCallback, useRef} = React;
+
+const fmt = (s) => {
+  if(!s) return '0:00';
+  const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=Math.floor(s%60);
+  return h>0?`${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`:`${m}:${String(sec).padStart(2,'0')}`;
+};
+const fmtBytes = (b) => {
+  if(!b) return '0 B';
+  const k=1024,s=['B','KB','MB','GB','TB'];
+  const i=Math.floor(Math.log(b)/Math.log(k));
+  return (b/Math.pow(k,i)).toFixed(1)+' '+s[i];
+};
+const fmtUptime = (s) => {
+  if(!s) return 'Unknown';
+  const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60);
+  return d>0?`${d}d ${h}h ${m}m`:`${h}h ${m}m`;
+};
+const ago = (dateStr) => {
+  const d = new Date(dateStr);
+  const diff = Date.now()-d;
+  const days=Math.floor(diff/86400000),hrs=Math.floor(diff/3600000),mins=Math.floor(diff/60000);
+  if(days>0) return `${days}d ago`;
+  if(hrs>0) return `${hrs}h ago`;
+  return `${mins}m ago`;
+};
+
+function App() {
+  const [tab, setTab] = useState('dashboard');
+  const [status, setStatus] = useState(null);
+  const [plexRes, setPlexRes] = useState(null);
+  const [dockerRes, setDockerRes] = useState(null);
+  const [resMode, setResMode] = useState('plex');
+  const [streams, setStreams] = useState([]);
+  const [requests, setRequests] = useState([]);
+  const [collections, setCollections] = useState([]);
+  const [topUsers, setTopUsers] = useState([]);
+  const [tautulliUsers, setTautulliUsers] = useState([]);
+  const [history, setHistory] = useState([]);
+  const [libraries, setLibraries] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  // Modals
+  const [serverModal, setServerModal] = useState(false);
+  const [userModal, setUserModal] = useState(null);
+  const [allUsersModal, setAllUsersModal] = useState(false);
+  const [jellyseerrModal, setJellyseerrModal] = useState(false);
+  const [colModal, setColModal] = useState(false);
+  const [streamModal, setStreamModal] = useState(null);
+  const [unwatchedModal, setUnwatchedModal] = useState(false);
+  const [toast, setToast] = useState(null);
+
+  // Jellyseerr search
+  const [searchQ, setSearchQ] = useState('');
+  const [searchRes, setSearchRes] = useState([]);
+  const [searching, setSearching] = useState(false);
+
+  // Collection create
+  const [colType, setColType] = useState('genre');
+  const [colGenre, setColGenre] = useState('Action');
+  const [colYear, setColYear] = useState('2020');
+  const [colActor, setColActor] = useState('');
+  const [colLib, setColLib] = useState('');
+  const [colCreating, setColCreating] = useState(false);
+  const [colResult, setColResult] = useState(null);
+
+  // History filters
+  const [histUser, setHistUser] = useState('');
+  const [histSearch, setHistSearch] = useState('');
+
+  // Unwatched
+  const [uwLib, setUwLib] = useState('');
+  const [uwData, setUwData] = useState(null);
+  const [uwLoading, setUwLoading] = useState(false);
+
+  const [widgets, setWidgets] = useState(() => {
+    const s = localStorage.getItem('widgets_v252');
+    return s ? JSON.parse(s) : ['serverStatus','activeStreams','systemAlerts','topUser','resources','jellyseerr','collections'];
+  });
+  const [widgetSettings, setWidgetSettings] = useState(false);
+
+  const showToast = (msg, type='success') => {
+    setToast({msg, type});
+    setTimeout(() => setToast(null), 3000);
+  };
+
+  const fetchAll = useCallback(async () => {
+    try {
+      const [st, pr, dr, sess, reqs, cols, users, libs, tUsers] = await Promise.all([
+        fetch('/api/plex/status').then(r=>r.json()).catch(()=>({online:false})),
+        fetch('/api/plex/resources').then(r=>r.json()).catch(()=>null),
+        fetch('/api/docker/resources').then(r=>r.json()).catch(()=>null),
+        fetch('/api/plex/sessions').then(r=>r.json()).catch(()=>[]),
+        fetch('/api/jellyseerr/requests?take=10').then(r=>r.json()).catch(()=>[]),
+        fetch('/api/plex/collections').then(r=>r.json()).catch(()=>[]),
+        fetch('/api/tautulli/user-stats').then(r=>r.json()).catch(()=>[]),
+        fetch('/api/plex/libraries').then(r=>r.json()).catch(()=>[]),
+        fetch('/api/tautulli/users').then(r=>r.json()).catch(()=>[])
+      ]);
+      setStatus(st); setPlexRes(pr); setDockerRes(dr);
+      setStreams(sess); setRequests(reqs); setCollections(cols);
+      setTopUsers(users); setLibraries(libs); setTautulliUsers(tUsers);
+      setLoading(false);
+    } catch(e) { setLoading(false); }
+  }, []);
+
+  useEffect(() => {
+    fetchAll();
+    const t = setInterval(fetchAll, 10000);
+    return () => clearInterval(t);
+  }, [fetchAll]);
+
+  const loadHistory = async () => {
+    const params = new URLSearchParams({ length: 50 });
+    if (histUser) params.append('user', histUser);
+    if (histSearch) params.append('search', histSearch);
+    const r = await fetch(`/api/tautulli/history?${params}`).then(x=>x.json()).catch(()=>({data:[]}));
+    setHistory(r.data || []);
+  };
+
+  useEffect(() => {
+    if (tab === 'history') loadHistory();
+  }, [tab]);
+
+  const doAction = async (url, method='POST', body=null) => {
+    const opts = { method };
+    if (body) { opts.headers={'Content-Type':'application/json'}; opts.body=JSON.stringify(body); }
+    const r = await fetch(url, opts);
+    return r.json();
+  };
+
+  const approveReq = async (id) => {
+    const r = await doAction(`/api/jellyseerr/request/${id}/approve`);
+    if (r.success) { showToast('Request approved!'); fetchAll(); }
+    else showToast('Failed to approve: '+r.error, 'error');
+  };
+
+  const declineReq = async (id) => {
+    const r = await doAction(`/api/jellyseerr/request/${id}/decline`);
+    if (r.success) { showToast('Request declined'); fetchAll(); }
+    else showToast('Failed to decline: '+r.error, 'error');
+  };
+
+  const deleteReq = async (id) => {
+    if (!confirm('Delete this request?')) return;
+    const r = await doAction(`/api/jellyseerr/request/${id}`, 'DELETE');
+    if (r.success) { showToast('Request deleted'); fetchAll(); }
+    else showToast('Failed to delete: '+r.error, 'error');
+  };
+
+  const stopStream = async (id) => {
+    if (!confirm('Stop this stream?')) return;
+    const r = await doAction(`/api/plex/sessions/${id}/stop`);
+    if (r.success) { showToast('Stream stopped!'); fetchAll(); }
+    else showToast('Failed to stop stream', 'error');
+  };
+
+  const searchJelly = async () => {
+    if (!searchQ.trim()) return;
+    setSearching(true);
+    const r = await fetch(`/api/jellyseerr/search?query=${encodeURIComponent(searchQ)}`).then(x=>x.json()).catch(()=>({results:[]}));
+    setSearchRes(r.results || []);
+    setSearching(false);
+  };
+
+  const requestMedia = async (media) => {
+    const body = { mediaType: media.mediaType, mediaId: media.id };
+    if (media.mediaType === 'tv') { body.tvdbId = media.tvdbId; body.seasons = 'all'; }
+    const r = await doAction('/api/jellyseerr/request', 'POST', body);
+    if (r.success) { showToast(`Requested: ${media.title||media.name}!`); fetchAll(); }
+    else showToast('Failed: '+(r.error||'Unknown error'), 'error');
+  };
+
+  const createCollection = async () => {
+    if (!colLib) { showToast('Select a library', 'error'); return; }
+    setColCreating(true); setColResult(null);
+    let title='', value='';
+    if (colType==='genre') { title=`${colGenre} Movies`; value=colGenre; }
+    else if (colType==='year') { title=`${colYear}s Movies`; value=colYear; }
+    else { title=`${colActor} Movies`; value=colActor; }
+    const r = await doAction('/api/plex/collections/create', 'POST', { libraryKey: colLib, title, type: colType, value });
+    setColCreating(false);
+    if (r.success) {
+      setColResult({ type:'success', msg: r.message });
+      showToast(r.message);
+      fetchAll();
+    } else {
+      setColResult({ type:'error', msg: r.error });
+      showToast('Failed: '+r.error, 'error');
+    }
+  };
+
+  const deleteCollection = async (key) => {
+    if (!confirm('Delete this collection?')) return;
+    const r = await doAction(`/api/plex/collections/${key}`, 'DELETE');
+    if (r.success) { showToast('Collection deleted'); fetchAll(); }
+    else showToast('Failed to delete', 'error');
+  };
+
+  const genUnwatched = async () => {
+    if (!uwLib) { showToast('Select a library', 'error'); return; }
+    setUwLoading(true); setUwData(null);
+    const r = await fetch(`/api/plex/library/${uwLib}/unwatched`).then(x=>x.json()).catch(()=>null);
+    setUwData(r); setUwLoading(false);
+  };
+
+  const exportCSV = () => {
+    if (!uwData) return;
+    const csv = ['Title,Type,Added,Size,Last Watched',
+      ...uwData.items.map(i=>`"${i.title}","${i.type}","${i.added}","${fmtBytes(i.size)}","${i.lastWatched}"`)
+    ].join('\n');
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+    a.download=`unwatched-${Date.now()}.csv`; a.click();
+  };
+
+  const cur = resMode === 'plex' ? plexRes : dockerRes;
+  const pendingCount = requests.filter(r=>r.status==='pending').length;
+
+  const WIDGET_LIST = [
+    {id:'serverStatus',name:'Server Status'},
+    {id:'activeStreams',name:'Active Streams'},
+    {id:'systemAlerts',name:'System Alerts'},
+    {id:'topUser',name:'Top User'},
+    {id:'resources',name:'System Resources'},
+    {id:'jellyseerr',name:'Recent Requests'},
+    {id:'collections',name:'Collections'}
+  ];
+
+  if(loading) return (
+    <div style={{display:'flex',alignItems:'center',justifyContent:'center',minHeight:'100vh',flexDirection:'column',gap:'1rem'}}>
+      <div className="spinner"/>
+      <p style={{color:'#94a3b8'}}>Loading Plex Command Center v2.5.2...</p>
+    </div>
+  );
+
+  return (
+    <div>
+      {/* TOAST */}
+      {toast && (
+        <div style={{position:'fixed',bottom:'2rem',right:'2rem',zIndex:9999,padding:'1rem 1.5rem',borderRadius:'10px',fontWeight:600,fontSize:'.875rem',boxShadow:'0 10px 30px rgba(0,0,0,.5)',animation:'slideup .3s'}}
+          className={`alert-${toast.type}`}>
+          {toast.msg}
+        </div>
+      )}
+
+      {/* HEADER */}
+      <header className="header">
+        <div className="header-content">
+          <div className="logo">
+            <div className="logo-icon">🎬</div>
+            <div className="logo-text">
+              <h1>Plex Command Center v2.5.2</h1>
+              {status?.friendlyName && <div className="server-name">📡 {status.friendlyName}</div>}
+              <p>Advanced monitoring & control</p>
+            </div>
+          </div>
+          <nav className="nav">
+            <button className={`nav-btn ${tab==='dashboard'?'active':''}`} onClick={()=>setTab('dashboard')}>Dashboard</button>
+            <button className={`nav-btn ${tab==='streams'?'active':''}`} onClick={()=>setTab('streams')}>
+              Active Streams {streams.length>0&&<span className="badge">{streams.length}</span>}
+            </button>
+            <button className={`nav-btn ${tab==='users'?'active':''}`} onClick={()=>setTab('users')}>Top Users</button>
+            <button className={`nav-btn ${tab==='history'?'active':''}`} onClick={()=>{setTab('history');loadHistory();}}>Watch History</button>
+            <button className={`nav-btn ${tab==='system'?'active':''}`} onClick={()=>setTab('system')}>System</button>
+            <button className={`nav-btn ${tab==='tools'?'active':''}`} onClick={()=>setTab('tools')}>Tools</button>
+          </nav>
+        </div>
+      </header>
+
+      <main className="main">
+
+        {/* ============ DASHBOARD ============ */}
+        {tab==='dashboard' && (
+          <div>
+            <div className="page-title">
+              Dashboard
+              <button className="btn btn-outline btn-sm" onClick={()=>setWidgetSettings(true)}>⚙️ Customize</button>
+            </div>
+            <div className="grid">
+
+              {/* Server Status Widget */}
+              {widgets.includes('serverStatus') && (
+                <div className="card clickable" onClick={()=>setServerModal(true)}>
+                  <div className="card-header">
+                    <div className="card-title">🖥️ Server Status</div>
+                    <div className="dot"/>
+                  </div>
+                  <div className="big-val">{status?.online?'Online':'Offline'}</div>
+                  <div className="sub-label">{status?.friendlyName || 'Plex Server'}</div>
+                  <div className="sub-label" style={{marginTop:'.5rem',color:'#60a5fa',fontSize:'.75rem'}}>
+                    Click for details →
+                  </div>
+                </div>
+              )}
+
+              {/* Active Streams Widget */}
+              {widgets.includes('activeStreams') && (
+                <div className="card clickable" onClick={()=>setTab('streams')}>
+                  <div className="card-header">
+                    <div className="card-title">▶️ Active Streams</div>
+                  </div>
+                  <div className="big-val">{streams.length}</div>
+                  <div className="sub-label">Currently watching</div>
+                  {streams.slice(0,2).map((s,i)=>(
+                    <div key={i} style={{marginTop:'.5rem',fontSize:'.75rem',color:'#94a3b8',display:'flex',gap:'.5rem',alignItems:'center'}}>
+                      <span>👤 {s.user}</span>
+                      <span style={{color:'#60a5fa'}}>•</span>
+                      <span>{s.content?.substring(0,25)}{s.content?.length>25?'...':''}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* System Alerts Widget */}
+              {widgets.includes('systemAlerts') && (
+                <div className="card">
+                  <div className="card-header">
+                    <div className="card-title">⚠️ System Alerts</div>
+                  </div>
+                  <div className="big-val">
+                    {((cur?.cpu>80?1:0)+(cur?.memory>85?1:0)) || 0}
+                  </div>
+                  <div className="sub-label">
+                    {(!cur?.cpu||cur?.cpu<=80)&&(!cur?.memory||cur?.memory<=85)?'All systems normal':'Issues detected'}
+                  </div>
+                </div>
+              )}
+
+              {/* Top User Widget */}
+              {widgets.includes('topUser') && (
+                <div className="card clickable" onClick={()=>setAllUsersModal(true)}>
+                  <div className="card-header">
+                    <div className="card-title">👑 Top User</div>
+                  </div>
+                  {topUsers[0] ? (
+                    <>
+                      <div style={{display:'flex',alignItems:'center',gap:'.75rem',marginTop:'.5rem'}}>
+                        <div className="avatar">{(topUsers[0].friendly_name||topUsers[0].username||'?')[0].toUpperCase()}</div>
+                        <div>
+                          <div style={{fontWeight:700,fontSize:'1.1rem'}}>{topUsers[0].friendly_name||topUsers[0].username}</div>
+                          <div className="sub-label">{topUsers[0].total_plays||topUsers[0].plays||0} plays</div>
+                        </div>
+                      </div>
+                      <div className="sub-label" style={{marginTop:'.75rem',color:'#60a5fa',fontSize:'.75rem'}}>
+                        Click to see all users →
+                      </div>
+                    </>
+                  ) : (
+                    <div className="sub-label">No data yet</div>
+                  )}
+                </div>
+              )}
+
+              {/* System Resources Widget */}
+              {widgets.includes('resources') && (
+                <div className="card" style={{gridColumn:'span 2'}}>
+                  <div className="card-header">
+                    <div className="card-title">📊 System Resources</div>
+                    <div className="toggle">
+                      <button className={`toggle-opt ${resMode==='plex'?'active':''}`} onClick={()=>setResMode('plex')}>Plex Server</button>
+                      <button className={`toggle-opt ${resMode==='docker'?'active':''}`} onClick={()=>setResMode('docker')}>Docker</button>
+                    </div>
+                  </div>
+                  {resMode==='plex' && cur?.available===false && (
+                    <div className="alert-box alert-warn" style={{marginBottom:'1rem'}}>
+                      ⚠️ {cur?.message || 'Plex server metrics require Zabbix. Add ZABBIX_URL, ZABBIX_USER, ZABBIX_PASSWORD, ZABBIX_HOST_ID to docker-compose.yml'}
+                    </div>
+                  )}
+                  {resMode==='plex' && cur?.source==='zabbix' && (
+                    <div className="alert-box alert-info" style={{marginBottom:'.75rem',fontSize:'.75rem',padding:'.5rem .75rem'}}>
+                      📡 Live data from Zabbix • Host: {cur?.hostname || 'Unknown'} • Uptime: {fmtUptime(cur?.uptime)}
+                    </div>
+                  )}
+                  <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'1.25rem'}}>
+                    <div>
+                      <div style={{display:'flex',justifyContent:'space-between',marginBottom:'.35rem',fontSize:'.85rem'}}>
+                        <span>CPU Usage</span>
+                        <span style={{fontWeight:600,color:cur?.cpu>80?'#ef4444':cur?.cpu>60?'#f59e0b':'#10b981'}}>{parseFloat(cur?.cpu||0).toFixed(1)}%</span>
+                      </div>
+                      <div className="progress-wrap">
+                        <div className="progress-bar" style={{width:`${cur?.cpu||0}%`,background:cur?.cpu>80?'#ef4444':cur?.cpu>60?'#f59e0b':undefined}}/>
+                      </div>
+                    </div>
+                    <div>
+                      <div style={{display:'flex',justifyContent:'space-between',marginBottom:'.35rem',fontSize:'.85rem'}}>
+                        <span>Memory Usage</span>
+                        <span style={{fontWeight:600,color:cur?.memory>85?'#ef4444':cur?.memory>70?'#f59e0b':'#10b981'}}>{parseFloat(cur?.memory||0).toFixed(1)}%</span>
+                      </div>
+                      <div className="progress-wrap">
+                        <div className="progress-bar" style={{width:`${cur?.memory||0}%`,background:cur?.memory>85?'#ef4444':cur?.memory>70?'#f59e0b':undefined}}/>
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{marginTop:'.75rem',fontSize:'.85rem',display:'flex',justifyContent:'space-between',color:'#94a3b8'}}>
+                    <span>Network I/O</span>
+                    <span>↓ {cur?.network?.rx||0} KB/s &nbsp;↑ {cur?.network?.tx||0} KB/s</span>
+                  </div>
+                  {cur?.disks && cur.disks.length > 0 && (
+                    <div style={{marginTop:'.75rem'}}>
+                      <div style={{fontSize:'.85rem',fontWeight:600,marginBottom:'.5rem',color:'#cbd5e1'}}>
+                        💾 Disk Usage ({cur.disks.length} {cur.disks.length===1?'disk':'disks'})
+                      </div>
+                      {cur.diskChanges && (cur.diskChanges.added.length > 0 || cur.diskChanges.removed.length > 0) && (
+                        <div style={{marginBottom:'.75rem'}}>
+                          {cur.diskChanges.added.length > 0 && (
+                            <div className="alert-box alert-success" style={{padding:'.5rem',marginBottom:'.4rem',fontSize:'.75rem'}}>
+                              ➕ New disk{cur.diskChanges.added.length>1?'s':''} detected: {cur.diskChanges.added.join(', ')}
+                            </div>
+                          )}
+                          {cur.diskChanges.removed.length > 0 && (
+                            <div className="alert-box alert-error" style={{padding:'.5rem',fontSize:'.75rem'}}>
+                              ⚠️ Disk{cur.diskChanges.removed.length>1?'s':''} removed: {cur.diskChanges.removed.join(', ')}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      <div style={{maxHeight:'180px',overflowY:'auto',paddingRight:'.5rem'}}>
+                        {cur.disks.map((d,idx)=>(
+                          <div key={idx} style={{marginBottom:'.6rem'}}>
+                            <div style={{display:'flex',justifyContent:'space-between',fontSize:'.8rem',marginBottom:'.25rem'}}>
+                              <span style={{fontWeight:500}}>{d.label || d.name} <span style={{color:'#64748b',fontSize:'.7rem'}}>{d.mount !== d.label ? d.mount : ''}</span></span>
+                              <span style={{fontWeight:600,color:d.percentage>90?'#ef4444':d.percentage>75?'#f59e0b':'#10b981'}}>
+                                {d.sizeFormatted || `${d.percentage}%`}
+                              </span>
+                            </div>
+                            <div className="progress-wrap" style={{height:'6px'}}>
+                              <div className="progress-bar" style={{width:`${d.percentage}%`,background:d.percentage>90?'#ef4444':d.percentage>75?'#f59e0b':undefined}}/>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Jellyseerr Widget */}
+              {widgets.includes('jellyseerr') && (
+                <div className="card" style={{gridColumn:'span 2'}}>
+                  <div className="card-header">
+                    <div className="card-title">
+                      📬 Recent Requests
+                      {pendingCount>0&&<span className="badge warn">{pendingCount} pending</span>}
+                    </div>
+                    <button className="btn-sm btn-outline" onClick={()=>setJellyseerrModal(true)}>🔍 Search & Request</button>
+                  </div>
+                  {requests.length===0 ? (
+                    <div style={{color:'#94a3b8',fontSize:'.875rem',textAlign:'center',padding:'1rem'}}>No requests found</div>
+                  ) : (
+                    requests.slice(0,4).map((req,i)=>(
+                      <div key={i} className="req-card">
+                        {req.posterPath
+                          ? <img src={req.posterPath} className="req-poster" alt={req.title} onError={e=>{e.target.style.display='none'}}/>
+                          : <div className="req-poster-placeholder">{req.type==='movie'?'🎬':'📺'}</div>
+                        }
+                        <div className="req-info">
+                          <div className="req-title">{req.title || 'Unknown Title'}{req.year?` (${req.year})`:''}</div>
+                          <div className="req-meta">by {req.requestedBy} • {ago(req.createdAt)}</div>
+                        </div>
+                        <div className="req-actions">
+                          {req.status==='pending' ? (
+                            <>
+                              <button className="btn-sm btn-approve" onClick={()=>approveReq(req.id)}>✓</button>
+                              <button className="btn-sm btn-decline" onClick={()=>declineReq(req.id)}>✗</button>
+                            </>
+                          ) : (
+                            <span className={`status-badge status-${req.status}`}>{req.status}</span>
+                          )}
+                          {req.canRemove !== false && <button className="btn-sm btn-delete" onClick={()=>deleteReq(req.id)}>🗑️</button>}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+
+              {/* Collections Widget */}
+              {widgets.includes('collections') && (
+                <div className="card" style={{gridColumn:'span 4'}}>
+                  <div className="card-header">
+                    <div className="card-title">📚 Collections ({collections.length})</div>
+                    <button className="btn-sm btn-outline" onClick={()=>{setColModal(true);setColResult(null);}}>+ Create Collection</button>
+                  </div>
+                  {collections.length===0 ? (
+                    <div className="empty"><p>No collections found</p></div>
+                  ) : (
+                    <div className="col-grid">
+                      {collections.slice(0,8).map((col,i)=>(
+                        <div key={i} className="col-card">
+                          {col.thumb
+                            ? <img src={col.thumb} className="col-poster" alt={col.title} onError={e=>{e.target.parentNode.querySelector('.col-poster-ph')?.style&&(e.target.style.display='none');}}/>
+                            : <div className="col-poster-ph"><span>📚</span></div>
+                          }
+                          <div className="col-info">
+                            <div className="col-title">{col.title}</div>
+                            <div className="col-count">{col.itemCount} items • {col.library}</div>
+                            <div className="col-actions">
+                              <button className="btn-sm btn-delete" style={{flex:1}} onClick={()=>deleteCollection(col.key)}>🗑️ Delete</button>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ============ ACTIVE STREAMS ============ */}
+        {tab==='streams' && (
+          <div>
+            <div className="page-title">Active Streams ({streams.length})</div>
+            {streams.length===0 ? (
+              <div className="card empty"><div style={{fontSize:'3rem'}}>😴</div><h3>No active streams</h3><p>Nobody is watching right now</p></div>
+            ) : streams.map((s,i)=>(
+              <div key={i} className="stream-card">
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:'.75rem'}}>
+                  <div style={{display:'flex',gap:'.75rem',alignItems:'center'}}>
+                    <div className="avatar">{s.user[0].toUpperCase()}</div>
+                    <div>
+                      <div style={{fontWeight:700,fontSize:'1rem'}}>{s.user}</div>
+                      <div style={{fontSize:'.75rem',color:'#94a3b8'}}>📍 {s.ip} &nbsp;•&nbsp; 🖥️ {s.device}</div>
+                    </div>
+                  </div>
+                  <div style={{display:'flex',gap:'.5rem'}}>
+                    <button className="btn-sm btn-outline" onClick={()=>setStreamModal(s)}>ℹ️ Details</button>
+                    <button className="btn-sm btn-delete" onClick={()=>stopStream(s.sessionId)}>⏹️ Stop</button>
+                  </div>
+                </div>
+                <div style={{fontSize:'1rem',fontWeight:600,marginBottom:'.5rem'}}>{s.content}</div>
+                <div style={{display:'flex',gap:'.5rem',marginBottom:'.75rem',flexWrap:'wrap'}}>
+                  <span className="status-badge status-available">{s.quality}</span>
+                  <span className="status-badge status-approved">{s.contentType}</span>
+                  {s.transcoding&&<span className="status-badge status-pending">Transcoding</span>}
+                  <span className="status-badge" style={{background:'rgba(100,116,139,.2)',color:'#94a3b8',border:'1px solid rgba(100,116,139,.2)'}}>{s.bandwidth} KB/s</span>
+                </div>
+                <div style={{display:'flex',alignItems:'center',gap:'.75rem'}}>
+                  <div className="progress-wrap" style={{flex:1,height:'8px'}}>
+                    <div className="progress-bar" style={{width:`${s.progress}%`}}/>
+                  </div>
+                  <span style={{fontSize:'.85rem',fontWeight:700,minWidth:'40px',textAlign:'right'}}>{s.progress}%</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* ============ TOP USERS ============ */}
+        {tab==='users' && (
+          <div>
+            <div className="page-title">Top Users</div>
+            <div className="card">
+              {topUsers.length===0 ? (
+                <div className="empty"><p>No user data available</p><p style={{marginTop:'.5rem',fontSize:'.875rem'}}>Check Tautulli configuration</p></div>
+              ) : topUsers.map((u,i)=>(
+                <div key={i} className="user-row" onClick={()=>setUserModal(u)}>
+                  <div style={{width:'32px',height:'32px',borderRadius:'50%',background:'linear-gradient(135deg,#3b82f6,#8b5cf6)',display:'flex',alignItems:'center',justifyContent:'center',fontWeight:700,fontSize:'.85rem',flexShrink:0}}>#{i+1}</div>
+                  <div className="avatar" style={{width:'36px',height:'36px',fontSize:'.85rem'}}>
+                    {u.user_thumb ? <img src={u.user_thumb} alt="" onError={e=>e.target.style.display='none'}/> : (u.friendly_name||u.username||'?')[0].toUpperCase()}
+                  </div>
+                  <div style={{flex:1}}>
+                    <div style={{fontWeight:600}}>{u.friendly_name||u.username}</div>
+                    <div style={{fontSize:'.75rem',color:'#94a3b8'}}>
+                      {u.total_plays||u.plays||0} plays &nbsp;•&nbsp; {Math.round(((u.total_duration||u.duration)||0)/3600)}h watched
+                    </div>
+                  </div>
+                  <div style={{display:'flex',flexDirection:'column',alignItems:'flex-end'}}>
+                    <div style={{fontWeight:700,color:'#60a5fa',fontSize:'1.1rem'}}>{u.total_plays||0}</div>
+                    <div style={{fontSize:'.7rem',color:'#94a3b8'}}>plays</div>
+                  </div>
+                  <span style={{color:'#94a3b8',marginLeft:'.5rem'}}>›</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* ============ WATCH HISTORY ============ */}
+        {tab==='history' && (
+          <div>
+            <div className="page-title">Watch History</div>
+            <div style={{display:'flex',gap:'.75rem',marginBottom:'1.25rem',flexWrap:'wrap',alignItems:'center'}}>
+              <select className="form-select" style={{width:'auto',minWidth:'160px'}} value={histUser} onChange={e=>setHistUser(e.target.value)}>
+                <option value="">All users</option>
+                {tautulliUsers.map((u,i)=><option key={i} value={u.user_id}>{u.friendly_name||u.username}</option>)}
+              </select>
+              <input type="text" className="form-input" placeholder="Search content..." style={{width:'280px'}} value={histSearch} onChange={e=>setHistSearch(e.target.value)} onKeyPress={e=>e.key==='Enter'&&loadHistory()}/>
+              <button className="btn btn-primary btn-sm" onClick={loadHistory}>Apply Filters</button>
+            </div>
+            <div className="card" style={{padding:0,overflow:'hidden'}}>
+              <table className="hist-table">
+                <thead><tr><th>Date</th><th>User</th><th>Content</th><th>IP</th><th>Device</th><th>Duration</th></tr></thead>
+                <tbody>
+                  {history.length===0 ? (
+                    <tr><td colSpan="6" style={{textAlign:'center',padding:'2rem',color:'#94a3b8'}}>No history data. Try clicking Apply Filters.</td></tr>
+                  ) : history.map((h,i)=>(
+                    <tr key={i}>
+                      <td>{h.date_formatted||new Date(h.date*1000).toLocaleString()}</td>
+                      <td>{h.friendly_name||h.user}</td>
+                      <td>{h.full_title||h.title}</td>
+                      <td>{h.ip_address}</td>
+                      <td>{h.player}</td>
+                      <td>{h.duration_formatted||fmt(h.duration)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* ============ SYSTEM ============ */}
+        {tab==='system' && (
+          <div>
+            <div className="page-title">System Information</div>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'1.25rem',marginBottom:'1.25rem'}}>
+              <div className="card">
+                <div className="card-title" style={{marginBottom:'1rem'}}>📡 Plex Server</div>
+                {[
+                  ['Status', status?.online?'🟢 Online':'🔴 Offline'],
+                  ['Name', status?.friendlyName||'Unknown'],
+                  ['Version', status?.version||'Unknown'],
+                  ['Platform', status?.platform||'Unknown'],
+                  ['Local IP', status?.localIP||'Unknown'],
+                  ['Libraries', status?.libraryCount||0],
+                ].map(([l,v],i)=>(
+                  <div key={i} className="info-row">
+                    <span className="info-label">{l}</span>
+                    <span className="info-val">{v}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="card">
+                <div className="card-title" style={{marginBottom:'1rem'}}>📚 Libraries</div>
+                {(status?.libraries||[]).map((lib,i)=>(
+                  <div key={i} className="info-row">
+                    <span className="info-label">{lib.title}</span>
+                    <span className="info-val">{lib.type} • {lib.count} items</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            {dockerRes?.disks && (
+              <div className="card">
+                <div className="card-title" style={{marginBottom:'1rem'}}>💾 Docker Container Disks</div>
+                {dockerRes.disks.filter(d=>d.total>0).slice(0,5).map((d,i)=>(
+                  <div key={i} style={{marginBottom:'1.1rem'}}>
+                    <div style={{display:'flex',justifyContent:'space-between',marginBottom:'.35rem',fontSize:'.85rem'}}>
+                      <span style={{fontWeight:600}}>{d.mount}</span>
+                      <span style={{color:d.percentage>90?'#ef4444':d.percentage>75?'#f59e0b':'#10b981'}}>{d.percentage}% used</span>
+                    </div>
+                    <div className="progress-wrap" style={{height:'10px'}}>
+                      <div className="progress-bar" style={{width:`${d.percentage}%`,background:d.percentage>90?'#ef4444':d.percentage>75?'#f59e0b':undefined}}/>
+                    </div>
+                    <div style={{fontSize:'.75rem',color:'#94a3b8',marginTop:'.3rem'}}>{d.used}GB used / {d.free}GB free / {d.total}GB total</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ============ TOOLS ============ */}
+        {tab==='tools' && (
+          <div>
+            <div className="page-title">Tools & Utilities</div>
+            <div className="tool-grid">
+              {[
+                {icon:'📊',title:'Unwatched Report',desc:'Generate reports of unwatched content by library',action:()=>setUnwatchedModal(true)},
+                {icon:'📸',title:'System Snapshot',desc:'Download current system status as JSON',action:async()=>{
+                  const r=await fetch('/api/docker/resources').then(x=>x.json());
+                  const s=await fetch('/api/plex/status').then(x=>x.json());
+                  const blob=new Blob([JSON.stringify({timestamp:new Date(),plex:s,docker:r},null,2)],{type:'application/json'});
+                  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`plex-snapshot-${Date.now()}.json`;a.click();
+                  showToast('Snapshot downloaded!');
+                }},
+                {icon:'🧹',title:'Watch History Cleaner',desc:'Coming soon: Fix Continue Watching issues',action:()=>showToast('Feature coming soon','warn')},
+                {icon:'📅',title:'Date Added Editor',desc:'Coming soon: Change date added for items',action:()=>showToast('Feature coming soon','warn')},
+                {icon:'👥',title:'Copy Watch History',desc:'Coming soon: Copy watched status between users',action:()=>showToast('Feature coming soon','warn')},
+                {icon:'📈',title:'Analytics Export',desc:'Coming soon: Export statistics to CSV/JSON',action:()=>showToast('Feature coming soon','warn')}
+              ].map((t,i)=>(
+                <div key={i} className="tool-card" onClick={t.action}>
+                  <div className="tool-icon">{t.icon}</div>
+                  <div className="tool-title">{t.title}</div>
+                  <div className="tool-desc">{t.desc}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </main>
+
+      {/* ============ SERVER DETAILS MODAL ============ */}
+      {serverModal && (
+        <div className="overlay" onClick={()=>setServerModal(false)}>
+          <div className="modal wide" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">🖥️ {status?.friendlyName || 'Server Details'}</div>
+              <button className="modal-close" onClick={()=>setServerModal(false)}>✕</button>
+            </div>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'1rem',marginBottom:'1.25rem'}}>
+              {[
+                ['Status', status?.online?'🟢 Online':'🔴 Offline'],
+                ['Server Name', status?.friendlyName||'Unknown'],
+                ['Version', status?.version||'Unknown'],
+                ['Platform', `${status?.platform||'?'} ${status?.platformVersion||''}`],
+                ['Local IP', status?.localIP||'Unknown'],
+                ['Tailscale IP', status?.tailscaleIP||'Check Zabbix'],
+                ['Libraries', `${status?.libraryCount||0} libraries`],
+                ['Active Streams', streams.length],
+              ].map(([l,v],i)=>(
+                <div key={i} style={{padding:'.9rem',background:'rgba(15,23,42,.5)',borderRadius:'8px'}}>
+                  <div style={{fontSize:'.75rem',color:'#94a3b8',marginBottom:'.25rem'}}>{l}</div>
+                  <div style={{fontWeight:700,fontSize:'1rem'}}>{v}</div>
+                </div>
+              ))}
+            </div>
+            <div className="modal-title" style={{fontSize:'1rem',marginBottom:'.75rem'}}>📚 Libraries</div>
+            {(status?.libraries||[]).map((lib,i)=>(
+              <div key={i} className="info-row">
+                <span style={{fontWeight:500}}>{lib.title}</span>
+                <span style={{color:'#94a3b8',fontSize:'.85rem'}}>{lib.type} • {lib.count} items</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ============ USER DETAILS MODAL ============ */}
+      {userModal && (
+        <div className="overlay" onClick={()=>setUserModal(null)}>
+          <div className="modal wide" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">👤 {userModal.friendly_name||userModal.username}</div>
+              <button className="modal-close" onClick={()=>setUserModal(null)}>✕</button>
+            </div>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'1rem'}}>
+              {[
+                ['Total Plays', userModal.total_plays||userModal.plays||0],
+                ['Total Watch Time', Math.round(((userModal.total_duration||userModal.duration)||0)/3600)+'h'],
+                ['Last Seen', userModal.last_seen?new Date(userModal.last_seen*1000).toLocaleString():'Never'],
+                ['Last Played', userModal.last_played||'Unknown'],
+                ['IP Address', userModal.ip_address||'Unknown'],
+                ['Platform', userModal.platform||'Unknown'],
+                ['Player', userModal.player||'Unknown'],
+                ['Is Admin', userModal.is_admin?'Yes':'No'],
+              ].map(([l,v],i)=>(
+                <div key={i} style={{padding:'.9rem',background:'rgba(15,23,42,.5)',borderRadius:'8px'}}>
+                  <div style={{fontSize:'.75rem',color:'#94a3b8',marginBottom:'.25rem'}}>{l}</div>
+                  <div style={{fontWeight:700}}>{v}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ============ ALL USERS MODAL ============ */}
+      {allUsersModal && (
+        <div className="overlay" onClick={()=>setAllUsersModal(false)}>
+          <div className="modal wide" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">👥 All Users ({topUsers.length})</div>
+              <button className="modal-close" onClick={()=>setAllUsersModal(false)}>✕</button>
+            </div>
+            {topUsers.map((u,i)=>(
+              <div key={i} className="user-row" onClick={()=>{setAllUsersModal(false);setUserModal(u);}}>
+                <div style={{width:'28px',height:'28px',borderRadius:'50%',background:'linear-gradient(135deg,#3b82f6,#8b5cf6)',display:'flex',alignItems:'center',justifyContent:'center',fontWeight:700,fontSize:'.8rem'}}>#{i+1}</div>
+                <div className="avatar" style={{width:'34px',height:'34px',fontSize:'.8rem'}}>
+                  {(u.friendly_name||u.username||'?')[0].toUpperCase()}
+                </div>
+                <div style={{flex:1}}>
+                  <div style={{fontWeight:600}}>{u.friendly_name||u.username}</div>
+                  <div style={{fontSize:'.75rem',color:'#94a3b8'}}>{u.total_plays||u.plays||0} plays • {Math.round(((u.total_duration||u.duration)||0)/3600)}h • Last: {u.last_seen?new Date(u.last_seen*1000).toLocaleDateString():'Never'}</div>
+                </div>
+                <span style={{color:'#60a5fa',fontWeight:700}}>{u.total_plays||u.plays||0} plays</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ============ JELLYSEERR SEARCH MODAL ============ */}
+      {jellyseerrModal && (
+        <div className="overlay" onClick={()=>setJellyseerrModal(false)}>
+          <div className="modal xl" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">🔍 Search & Request Media</div>
+              <button className="modal-close" onClick={()=>setJellyseerrModal(false)}>✕</button>
+            </div>
+            <div style={{display:'flex',gap:'.75rem',marginBottom:'1.25rem'}}>
+              <input className="form-input" placeholder="Search movies & TV shows..." value={searchQ}
+                onChange={e=>setSearchQ(e.target.value)} onKeyPress={e=>e.key==='Enter'&&searchJelly()} style={{flex:1}}/>
+              <button className="btn btn-primary" onClick={searchJelly} disabled={searching}>
+                {searching?'Searching...':'Search'}
+              </button>
+            </div>
+
+            {/* All Requests List */}
+            <div className="modal-title" style={{fontSize:'1rem',marginBottom:'.75rem'}}>All Requests</div>
+            <div style={{maxHeight:'200px',overflowY:'auto',marginBottom:'1.25rem'}}>
+              {requests.map((req,i)=>(
+                <div key={i} className="req-card">
+                  {req.posterPath
+                    ? <img src={req.posterPath} className="req-poster" alt="" onError={e=>e.target.style.display='none'}/>
+                    : <div className="req-poster-placeholder">{req.type==='movie'?'🎬':'📺'}</div>
+                  }
+                  <div className="req-info">
+                    <div className="req-title">{req.title}{req.year?` (${req.year})`:''}</div>
+                    <div className="req-meta">by {req.requestedBy} • {ago(req.createdAt)}</div>
+                  </div>
+                  <div className="req-actions">
+                    {req.status==='pending'?(
+                      <><button className="btn-sm btn-approve" onClick={()=>approveReq(req.id)}>✓ Approve</button>
+                      <button className="btn-sm btn-decline" onClick={()=>declineReq(req.id)}>✗ Decline</button></>
+                    ):<span className={`status-badge status-${req.status}`}>{req.status}</span>}
+                    {req.canRemove !== false && <button className="btn-sm btn-delete" onClick={()=>deleteReq(req.id)}>🗑️</button>}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Search Results */}
+            {searchRes.length > 0 && (
+              <>
+                <div className="modal-title" style={{fontSize:'1rem',marginBottom:'.75rem'}}>Search Results</div>
+                <div className="search-grid">
+                  {searchRes.map((r,i)=>(
+                    <div key={i} className="search-card">
+                      {r.posterPath
+                        ? <img src={`https://image.tmdb.org/t/p/w200${r.posterPath}`} className="search-poster" alt="" onError={e=>e.target.style.display='none'}/>
+                        : <div style={{width:'100%',aspectRatio:'2/3',background:'linear-gradient(135deg,#1e3a5f,#2d1f6e)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'2rem'}}>{r.mediaType==='movie'?'🎬':'📺'}</div>
+                      }
+                      <div className="search-info">
+                        <div className="search-title">{r.title||r.name}</div>
+                        <div className="search-meta">{r.mediaType} • {(r.releaseDate||r.firstAirDate||'').substring(0,4)}</div>
+                        <button className="btn btn-primary" style={{width:'100%',padding:'.4rem',fontSize:'.75rem'}} onClick={()=>requestMedia(r)}>+ Request</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ============ COLLECTION CREATOR MODAL ============ */}
+      {colModal && (
+        <div className="overlay" onClick={()=>setColModal(false)}>
+          <div className="modal" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">📚 Create Collection</div>
+              <button className="modal-close" onClick={()=>setColModal(false)}>✕</button>
+            </div>
+            {colResult && <div className={`alert-box alert-${colResult.type}`} style={{marginBottom:'1rem'}}>{colResult.msg}</div>}
+            <div className="form-row">
+              <label className="form-label">Library</label>
+              <select className="form-select" value={colLib} onChange={e=>setColLib(e.target.value)}>
+                <option value="">Select library...</option>
+                {libraries.filter(l=>l.type==='movie'||l.type==='show').map(l=>(
+                  <option key={l.key} value={l.key}>{l.title} ({l.count} items)</option>
+                ))}
+              </select>
+            </div>
+            <div className="form-row">
+              <label className="form-label">Create By</label>
+              <select className="form-select" value={colType} onChange={e=>setColType(e.target.value)}>
+                <option value="genre">Genre</option>
+                <option value="year">Decade</option>
+                <option value="actor">Actor</option>
+              </select>
+            </div>
+            {colType==='genre' && (
+              <div className="form-row">
+                <label className="form-label">Genre</label>
+                <select className="form-select" value={colGenre} onChange={e=>setColGenre(e.target.value)}>
+                  {['Action','Adventure','Animation','Comedy','Crime','Documentary','Drama','Family','Fantasy','History','Horror','Music','Mystery','Romance','Science Fiction','Thriller','War','Western'].map(g=>(
+                    <option key={g}>{g}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+            {colType==='year' && (
+              <div className="form-row">
+                <label className="form-label">Decade Start Year</label>
+                <select className="form-select" value={colYear} onChange={e=>setColYear(e.target.value)}>
+                  {['2020','2010','2000','1990','1980','1970','1960'].map(y=>(
+                    <option key={y} value={y}>{y}s</option>
+                  ))}
+                </select>
+              </div>
+            )}
+            {colType==='actor' && (
+              <div className="form-row">
+                <label className="form-label">Actor Name</label>
+                <input className="form-input" placeholder="e.g. Tom Hanks" value={colActor} onChange={e=>setColActor(e.target.value)}/>
+              </div>
+            )}
+            <button className="btn btn-primary" onClick={createCollection} disabled={colCreating} style={{width:'100%',padding:'.75rem'}}>
+              {colCreating ? '⏳ Creating...' : '✨ Create Collection'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ============ STREAM DETAILS MODAL ============ */}
+      {streamModal && (
+        <div className="overlay" onClick={()=>setStreamModal(null)}>
+          <div className="modal" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">▶️ Stream Details</div>
+              <button className="modal-close" onClick={()=>setStreamModal(null)}>✕</button>
+            </div>
+            {[['User',streamModal.user],['Content',streamModal.content],['IP Address',streamModal.ip],['Device',streamModal.device],['Platform',streamModal.platform],['Quality',streamModal.quality],['Progress',`${streamModal.progress}%`],['Transcoding',streamModal.transcoding?'Yes':'No (Direct Play)'],['Bandwidth',`${streamModal.bandwidth} KB/s`],['State',streamModal.state]].map(([l,v],i)=>(
+              <div key={i} className="info-row">
+                <span className="info-label">{l}</span>
+                <span className="info-val">{v||'Unknown'}</span>
+              </div>
+            ))}
+            <button className="btn btn-primary" style={{width:'100%',marginTop:'1rem',background:'linear-gradient(135deg,#ef4444,#dc2626)'}} onClick={()=>{stopStream(streamModal.sessionId);setStreamModal(null);}}>⏹️ Stop Stream</button>
+          </div>
+        </div>
+      )}
+
+      {/* ============ UNWATCHED REPORT MODAL ============ */}
+      {unwatchedModal && (
+        <div className="overlay" onClick={()=>setUnwatchedModal(false)}>
+          <div className="modal wide" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">📊 Unwatched Report</div>
+              <button className="modal-close" onClick={()=>setUnwatchedModal(false)}>✕</button>
+            </div>
+            <div className="form-row">
+              <label className="form-label">Library</label>
+              <select className="form-select" value={uwLib} onChange={e=>setUwLib(e.target.value)}>
+                <option value="">Select library...</option>
+                {libraries.map(l=><option key={l.key} value={l.key}>{l.title}</option>)}
+              </select>
+            </div>
+            <button className="btn btn-primary" onClick={genUnwatched} disabled={uwLoading} style={{marginBottom:'1.25rem'}}>
+              {uwLoading?'Generating...':'Generate Report'}
+            </button>
+            {uwData && (
+              <div>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'.75rem'}}>
+                  <span style={{fontWeight:600}}>{uwData.totalItems} unwatched items • {fmtBytes(uwData.totalSize)}</span>
+                  <button className="btn-sm btn-outline" onClick={exportCSV}>📥 Export CSV</button>
+                </div>
+                <div style={{maxHeight:'400px',overflowY:'auto'}}>
+                  {uwData.items.slice(0,50).map((item,i)=>(
+                    <div key={i} style={{display:'flex',justifyContent:'space-between',padding:'.65rem',background:'rgba(15,23,42,.5)',borderRadius:'7px',marginBottom:'.4rem',fontSize:'.85rem'}}>
+                      <div>
+                        <div style={{fontWeight:600}}>{item.title}</div>
+                        <div style={{color:'#94a3b8',fontSize:'.75rem',marginTop:'.2rem'}}>Added: {item.added} • Last watched: {item.lastWatched}</div>
+                      </div>
+                      <div style={{color:'#94a3b8',textAlign:'right',flexShrink:0}}>
+                        <div>{item.type}</div>
+                        <div style={{fontSize:'.75rem'}}>{fmtBytes(item.size)}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ============ WIDGET SETTINGS MODAL ============ */}
+      {widgetSettings && (
+        <div className="overlay" onClick={()=>setWidgetSettings(false)}>
+          <div className="modal" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">⚙️ Customize Dashboard</div>
+              <button className="modal-close" onClick={()=>setWidgetSettings(false)}>✕</button>
+            </div>
+            {WIDGET_LIST.map(w=>(
+              <div key={w.id} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'.9rem',background:'rgba(15,23,42,.4)',borderRadius:'8px',marginBottom:'.5rem'}}>
+                <span style={{fontWeight:500}}>{w.name}</span>
+                <button className={`btn-sm ${widgets.includes(w.id)?'btn-approve':'btn-outline'}`}
+                  onClick={()=>{
+                    setWidgets(prev=>{
+                      const next=prev.includes(w.id)?prev.filter(x=>x!==w.id):[...prev,w.id];
+                      localStorage.setItem('widgets_v252',JSON.stringify(next));
+                      return next;
+                    });
+                  }}>
+                  {widgets.includes(w.id)?'✓ Enabled':'Disabled'}
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const WIDGET_LIST = [
+  {id:'serverStatus',name:'Server Status'},
+  {id:'activeStreams',name:'Active Streams'},
+  {id:'systemAlerts',name:'System Alerts'},
+  {id:'topUser',name:'Top User'},
+  {id:'resources',name:'System Resources'},
+  {id:'jellyseerr',name:'Recent Requests'},
+  {id:'collections',name:'Collections'}
+];
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
