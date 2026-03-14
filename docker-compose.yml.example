@@ -4,59 +4,51 @@ services:
   plex-command-center:
     build:
       context: .
-      dockerfile: Dockerfile
-    container_name: plex-command-center
+      dockerfile: Dockerfile-v2.5.2
+    container_name: plex-command-center-v2.5
     restart: unless-stopped
     ports:
       - "3001:3001"
     environment:
-      # ===== REQUIRED CONFIGURATION =====
-      
-      # Plex Media Server
-      - PLEX_URL=http://192.168.1.100:32400  # Your Plex server URL
-      - PLEX_TOKEN=YOUR_PLEX_TOKEN_HERE      # Get from Plex: Play media → View XML → X-Plex-Token in URL
+      # Plex
+      - PLEX_URL=http://YOUR_PLEX_IP:32400
+      - PLEX_TOKEN=YOUR_PLEX_TOKEN
 
       # Tautulli
-      - TAUTULLI_URL=http://192.168.1.100:8181  # Your Tautulli URL
-      - TAUTULLI_API_KEY=YOUR_TAUTULLI_KEY      # Get from Tautulli: Settings → Web Interface → API
+      - TAUTULLI_URL=http://YOUR_TAUTULLI_IP:8181
+      - TAUTULLI_API_KEY=YOUR_TAUTULLI_API_KEY
 
       # Jellyseerr
-      # IMPORTANT: Do NOT include trailing slash!
-      - JELLYSEERR_URL=https://jellyseerr.yourdomain.com  # Your Jellyseerr URL (NO TRAILING SLASH!)
-      - JELLYSEERR_API_KEY=YOUR_JELLYSEERR_KEY            # Get from Jellyseerr: Settings → API Key
+      - JELLYSEERR_URL=https://your-jellyseerr-domain.com
+      - JELLYSEERR_API_KEY=YOUR_JELLYSEERR_API_KEY
 
-      # ===== OPTIONAL: ZABBIX INTEGRATION =====
-      # Enable this to see real CPU/RAM/Disk metrics from your Windows Plex server
-      # Leave blank to disable (will show "Configure Zabbix" message)
-      
-      - ZABBIX_URL=                     # Example: http://192.168.1.50/zabbix
-      - ZABBIX_USER=                    # Usually: Admin
-      - ZABBIX_PASSWORD=                # Your Zabbix password
-      - ZABBIX_HOST_ID=                 # Get from Zabbix: Config → Hosts → Click host → hostid=XXXXX in URL
-      
-      # Optional: Display Tailscale IP in server details
-      - TAILSCALE_IP=                   # Example: 100.99.196.121
+      # Zabbix (Optional - for REAL Plex server metrics)
+      - ZABBIX_URL=http://YOUR_ZABBIX_IP/zabbix
+      - ZABBIX_USER=Admin
+      - ZABBIX_PASSWORD=YOUR_ZABBIX_PASSWORD
+      - ZABBIX_HOST_ID=YOUR_HOST_ID
 
-      # ===== APP SETTINGS =====
-      
-      - PORT=3001                       # Application port (default: 3001)
+      # Tailscale IP of your Plex machine (Optional - for display)
+      - TAILSCALE_IP=YOUR_TAILSCALE_IP
+      - LOCAL_IP=YOUR_LOCAL_IP
+
+      # App settings
+      - PORT=3001
       - NODE_ENV=production
-      - TZ=America/New_York             # Your timezone (https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)
+      - TZ=America/New_York
+
+      # Virtual Linear TV
+      - LIVETV_ENABLED=true
+      - LIVETV_BASE_URL=http://YOUR_SERVER_IP:3001
+      - LIVETV_GUIDE_HOURS=48
+      - LIVETV_FILLER_INTERVAL=3
 
     volumes:
-      # Optional: Persist data and logs
       - ./data:/app/data
       - ./logs:/app/logs
 
     networks:
       - plex-network
-      
-    healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3001/api/health',(r)=>{process.exit(r.statusCode===200?0:1)})"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
 
 networks:
   plex-network:
