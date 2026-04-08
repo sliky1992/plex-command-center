@@ -1,0 +1,41 @@
+{
+  "name": "plex-livetv",
+  "version": "1.0.0",
+  "description": "Plex Live TV Desktop Player",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win portable",
+    "build-installer": "electron-builder --win nsis"
+  },
+  "author": "Plex Command Center",
+  "license": "MIT",
+  "devDependencies": {
+    "@electron/packager": "^18.3.5",
+    "electron": "^28.3.3",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.plexcommandcenter.livetv",
+    "productName": "Plex LiveTV",
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        "portable"
+      ],
+      "icon": "icon.ico"
+    },
+    "portable": {
+      "artifactName": "PlexLiveTV.exe"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "icon.ico",
+      "icon.png"
+    ]
+  }
+}

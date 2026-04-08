@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  plex-command-center:
+    build:
+      context: .
+      dockerfile: Dockerfile-v2.5.2
+    container_name: plex-command-center
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      # Plex - REQUIRED
+      - PLEX_URL=http://YOUR_PLEX_IP:32400
+      - PLEX_TOKEN=YOUR_PLEX_TOKEN
+
+      # Tautulli - Optional (for user stats & watch history)
+      - TAUTULLI_URL=http://YOUR_TAUTULLI_IP:8181
+      - TAUTULLI_API_KEY=YOUR_TAUTULLI_API_KEY
+
+      # Jellyseerr - Optional (for media requests)
+      - JELLYSEERR_URL=http://YOUR_JELLYSEERR_IP:5055
+      - JELLYSEERR_API_KEY=YOUR_JELLYSEERR_API_KEY
+
+      # Zabbix - Optional (for real Plex server hardware metrics)
+      # - ZABBIX_URL=http://YOUR_ZABBIX_IP/zabbix
+      # - ZABBIX_USER=Admin
+      # - ZABBIX_PASSWORD=YOUR_ZABBIX_PASSWORD
+      # - ZABBIX_HOST_ID=YOUR_HOST_ID
+
+      # Network IPs - Optional (for display purposes)
+      # - TAILSCALE_IP=YOUR_TAILSCALE_IP
+      # - LOCAL_IP=YOUR_LOCAL_IP
+
+      # App settings
+      - PORT=3001
+      - NODE_ENV=production
+      - TZ=UTC
+
+      # Virtual Linear TV
+      - LIVETV_ENABLED=true
+      # - LIVETV_BASE_URL=http://YOUR_SERVER_IP:3001
+      - LIVETV_GUIDE_HOURS=48
+      - LIVETV_FILLER_INTERVAL=3
+
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+
+    networks:
+      - plex-network
+
+networks:
+  plex-network:
+    driver: bridge

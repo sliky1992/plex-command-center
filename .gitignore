@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Data & logs (user-specific)
+data/
+logs/
+
+# Claude settings
+.claude/
+
+# Old/debug versions of files
+backend-server-v2.5.2-debug.js
+backend-server-v2.5.2-fix.js
+backend-server-v2.5.2-smart.js
+backend-server.js
+plex-command-center-v2.5.2.html
+docker-compose-v2.5.2.yml
+Dockerfile
+package.json
+deploy-v2.5.2.sh
+hotpatch-v2.5.2.sh
+
+# Desktop app build artifacts
+PlexLiveTV-win64.zip
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

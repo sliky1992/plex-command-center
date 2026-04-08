@@ -1,0 +1,2445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Plex Command Center v2.5.2</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#0a0e27 0%,#1a1f3a 100%);color:#e2e8f0;min-height:100vh}
+    .header{background:rgba(10,14,39,.95);backdrop-filter:blur(20px);border-bottom:1px solid rgba(100,116,139,.2);position:sticky;top:0;z-index:100;box-shadow:0 4px 6px -1px rgba(0,0,0,.3)}
+    .header-content{max-width:1800px;margin:0 auto;padding:.75rem 2rem;display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap}
+    .logo{display:flex;align-items:center;gap:.75rem}
+    .logo-icon{width:44px;height:44px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:1.3rem;box-shadow:0 4px 12px rgba(59,130,246,.4)}
+    .logo-text h1{font-size:1.3rem;font-weight:700;background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+    .logo-text p{font-size:.75rem;color:#94a3b8}
+    .logo-text .server-name{font-size:.8rem;color:#60a5fa;font-weight:600}
+    .nav{display:flex;gap:.25rem;flex-wrap:wrap}
+    .nav-btn{padding:.6rem 1.2rem;background:transparent;border:none;color:#94a3b8;cursor:pointer;font-size:.875rem;font-weight:500;border-radius:8px;transition:all .2s;position:relative;white-space:nowrap}
+    .nav-btn:hover{background:rgba(59,130,246,.1);color:#60a5fa}
+    .nav-btn.active{background:rgba(59,130,246,.15);color:#60a5fa}
+    .badge{margin-left:.4rem;background:#3b82f6;padding:.1rem .45rem;border-radius:9999px;font-size:.7rem}
+    .badge.warn{background:#f59e0b}
+    .main{max-width:1800px;margin:0 auto;padding:1.5rem 2rem}
+    .page-title{font-size:1.4rem;font-weight:600;margin-bottom:1.5rem;display:flex;justify-content:space-between;align-items:center}
+    .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1.25rem}
+    .card{background:rgba(15,23,42,.6);backdrop-filter:blur(20px);border:1px solid rgba(100,116,139,.2);border-radius:14px;padding:1.25rem;transition:all .3s}
+    .card:hover{transform:translateY(-3px);box-shadow:0 10px 24px rgba(0,0,0,.4);border-color:rgba(59,130,246,.3)}
+    .card.clickable{cursor:pointer}
+    .card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:.75rem}
+    .card-title{font-size:.95rem;font-weight:600;display:flex;align-items:center;gap:.5rem}
+    .big-val{font-size:2.2rem;font-weight:700;background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;line-height:1.1}
+    .sub-label{font-size:.8rem;color:#94a3b8;margin-top:.4rem}
+    .dot{width:8px;height:8px;border-radius:50%;background:#10b981;box-shadow:0 0 8px #10b981;animation:pulse 2s infinite}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+    .btn{padding:.5rem 1rem;border:none;border-radius:7px;cursor:pointer;font-size:.8rem;font-weight:600;transition:all .2s}
+    .btn-primary{background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:#fff}
+    .btn-primary:hover{transform:translateY(-1px);box-shadow:0 6px 16px rgba(59,130,246,.3)}
+    .btn-sm{padding:.35rem .75rem;border:none;border-radius:6px;cursor:pointer;font-size:.75rem;font-weight:600;transition:all .2s}
+    .btn-approve{background:rgba(16,185,129,.2);border:1px solid rgba(16,185,129,.4);color:#34d399}
+    .btn-approve:hover{background:rgba(16,185,129,.35)}
+    .btn-decline{background:rgba(239,68,68,.2);border:1px solid rgba(239,68,68,.4);color:#f87171}
+    .btn-decline:hover{background:rgba(239,68,68,.35)}
+    .btn-delete{background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.3);color:#f87171}
+    .btn-outline{background:rgba(59,130,246,.15);border:1px solid rgba(59,130,246,.3);color:#60a5fa}
+    .btn-outline:hover{background:rgba(59,130,246,.25)}
+    .toggle{display:inline-flex;background:rgba(100,116,139,.2);border-radius:7px;padding:.2rem}
+    .toggle-opt{padding:.4rem .9rem;border:none;background:transparent;color:#94a3b8;border-radius:5px;cursor:pointer;font-size:.8rem;transition:all .2s}
+    .toggle-opt.active{background:rgba(59,130,246,.3);color:#60a5fa}
+    .progress-wrap{height:7px;background:rgba(100,116,139,.2);border-radius:4px;overflow:hidden;margin:.4rem 0}
+    .progress-bar{height:100%;background:linear-gradient(90deg,#3b82f6,#8b5cf6);transition:width .5s}
+    .progress-bar.warn{background:#f59e0b}
+    .progress-bar.danger{background:#ef4444}
+    .overlay{position:fixed;inset:0;background:rgba(0,0,0,.85);backdrop-filter:blur(8px);display:flex;align-items:center;justify-content:center;z-index:2000;animation:fade .2s}
+    @keyframes fade{from{opacity:0}to{opacity:1}}
+    .modal{background:rgba(10,18,42,.98);border:1px solid rgba(100,116,139,.3);border-radius:14px;padding:1.75rem;max-width:90vw;max-height:90vh;overflow-y:auto;animation:slideup .3s;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+    .modal.wide{width:900px}
+    .modal.xl{width:1200px}
+    @keyframes slideup{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}
+    .modal-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:1.5rem;padding-bottom:1rem;border-bottom:1px solid rgba(100,116,139,.2)}
+    .modal-title{font-size:1.3rem;font-weight:600}
+    .modal-close{width:30px;height:30px;background:rgba(100,116,139,.2);border:none;border-radius:7px;color:#94a3b8;cursor:pointer;font-size:1.1rem;display:flex;align-items:center;justify-content:center}
+    .modal-close:hover{background:rgba(239,68,68,.2);color:#f87171}
+    .form-row{margin-bottom:1.25rem}
+    .form-label{display:block;margin-bottom:.4rem;font-weight:500;font-size:.875rem;color:#cbd5e1}
+    .form-select,.form-input{width:100%;padding:.65rem;background:rgba(15,23,42,.8);border:1px solid rgba(100,116,139,.3);border-radius:8px;color:#e2e8f0;font-size:.875rem}
+    .form-select:focus,.form-input:focus{outline:none;border-color:rgba(59,130,246,.5)}
+    .req-card{background:rgba(15,23,42,.7);border:1px solid rgba(100,116,139,.2);border-radius:10px;padding:.9rem 1rem;margin-bottom:.6rem;display:flex;align-items:center;gap:.75rem;transition:all .2s}
+    .req-card:hover{border-color:rgba(59,130,246,.3)}
+    .req-poster{width:40px;height:60px;border-radius:5px;object-fit:cover;background:rgba(100,116,139,.2);flex-shrink:0}
+    .req-poster-placeholder{width:40px;height:60px;border-radius:5px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);display:flex;align-items:center;justify-content:center;font-size:1.2rem;flex-shrink:0}
+    .req-info{flex:1;min-width:0}
+    .req-title{font-weight:600;font-size:.9rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .req-meta{font-size:.75rem;color:#94a3b8;margin-top:.2rem}
+    .req-actions{display:flex;gap:.4rem;flex-shrink:0}
+    .status-badge{padding:.2rem .6rem;border-radius:5px;font-size:.7rem;font-weight:600}
+    .status-pending{background:rgba(245,158,11,.2);color:#fbbf24;border:1px solid rgba(245,158,11,.3)}
+    .status-approved{background:rgba(16,185,129,.2);color:#34d399;border:1px solid rgba(16,185,129,.3)}
+    .status-declined{background:rgba(239,68,68,.2);color:#f87171;border:1px solid rgba(239,68,68,.3)}
+    .status-available{background:rgba(59,130,246,.2);color:#60a5fa;border:1px solid rgba(59,130,246,.3)}
+    .col-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:1rem;margin-top:1rem}
+    .col-card{background:rgba(15,23,42,.7);border:1px solid rgba(100,116,139,.2);border-radius:10px;overflow:hidden;transition:all .2s;cursor:pointer}
+    .col-card:hover{transform:translateY(-4px);border-color:rgba(59,130,246,.4);box-shadow:0 8px 20px rgba(0,0,0,.3)}
+    .col-poster{width:100%;aspect-ratio:2/3;object-fit:cover}
+    .col-poster-ph{width:100%;aspect-ratio:2/3;background:linear-gradient(135deg,#1e3a5f,#2d1f6e);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.5rem;font-size:2.5rem}
+    .col-info{padding:.75rem}
+    .col-title{font-weight:600;font-size:.85rem;margin-bottom:.3rem;line-height:1.2}
+    .col-count{font-size:.75rem;color:#94a3b8;margin-bottom:.5rem}
+    .col-actions{display:flex;gap:.4rem}
+    .user-row{display:flex;align-items:center;padding:.75rem;background:rgba(15,23,42,.4);border-radius:8px;margin-bottom:.5rem;cursor:pointer;transition:all .2s;border:1px solid transparent}
+    .user-row:hover{background:rgba(59,130,246,.08);border-color:rgba(59,130,246,.2)}
+    .avatar{width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#3b82f6,#8b5cf6);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:.9rem;flex-shrink:0}
+    .avatar img{width:100%;height:100%;border-radius:50%;object-fit:cover}
+    .stream-card{background:rgba(15,23,42,.7);border:1px solid rgba(100,116,139,.2);border-radius:10px;padding:1.1rem;margin-bottom:.75rem}
+    .stream-card:hover{border-color:rgba(59,130,246,.3)}
+    .info-grid{display:grid;grid-template-columns:1fr 1fr;gap:.5rem}
+    .info-row{display:flex;justify-content:space-between;padding:.6rem 0;border-bottom:1px solid rgba(100,116,139,.1)}
+    .info-label{color:#94a3b8;font-size:.85rem}
+    .info-val{font-weight:600;font-size:.85rem}
+    .search-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:.75rem;margin-top:1rem;max-height:500px;overflow-y:auto}
+    .search-card{background:rgba(15,23,42,.7);border:1px solid rgba(100,116,139,.2);border-radius:10px;overflow:hidden;cursor:pointer;transition:all .2s}
+    .search-card:hover{border-color:rgba(59,130,246,.4);transform:translateY(-3px)}
+    .search-poster{width:100%;aspect-ratio:2/3;object-fit:cover;background:rgba(100,116,139,.2)}
+    .search-info{padding:.6rem}
+    .search-title{font-weight:600;font-size:.8rem;margin-bottom:.2rem;line-height:1.2}
+    .search-meta{font-size:.7rem;color:#94a3b8;margin-bottom:.4rem}
+    .hist-table{width:100%;border-collapse:collapse}
+    .hist-table th{text-align:left;padding:.65rem;background:rgba(15,23,42,.8);color:#94a3b8;font-size:.8rem;font-weight:600;border-bottom:1px solid rgba(100,116,139,.2)}
+    .hist-table td{padding:.65rem;border-bottom:1px solid rgba(100,116,139,.1);font-size:.8rem}
+    .hist-table tr:hover td{background:rgba(59,130,246,.05)}
+    .spinner{border:3px solid rgba(148,163,184,.2);border-top:3px solid #3b82f6;border-radius:50%;width:36px;height:36px;animation:spin 1s linear infinite;margin:0 auto}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .empty{text-align:center;padding:3rem;color:#94a3b8}
+    .alert-box{padding:.75rem 1rem;border-radius:8px;margin-bottom:1rem;font-size:.875rem}
+    .alert-warn{background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.3);color:#fbbf24}
+    .alert-info{background:rgba(59,130,246,.1);border:1px solid rgba(59,130,246,.3);color:#60a5fa}
+    .alert-success{background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.3);color:#34d399}
+    .alert-error{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#f87171}
+    .tool-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:1.25rem}
+    .tool-card{background:rgba(15,23,42,.6);border:1px solid rgba(100,116,139,.2);border-radius:12px;padding:1.4rem;cursor:pointer;transition:all .2s}
+    .tool-card:hover{transform:translateY(-3px);border-color:rgba(59,130,246,.4);box-shadow:0 8px 20px rgba(0,0,0,.3)}
+    .tool-icon{font-size:2rem;margin-bottom:.75rem}
+    .tool-title{font-size:1rem;font-weight:600;margin-bottom:.4rem}
+    .tool-desc{font-size:.8rem;color:#94a3b8}
+    @media(max-width:1024px){.grid{grid-template-columns:repeat(2,1fr)}}
+    @media(max-width:768px){.grid{grid-template-columns:1fr}.header-content{flex-direction:column}}
+    ::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:rgba(15,23,42,.4)}::-webkit-scrollbar-thumb{background:rgba(100,116,139,.4);border-radius:3px}
+    .login-page{min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#0a0e27 0%,#1a1f3a 100%)}
+    .login-box{background:rgba(15,23,42,.85);backdrop-filter:blur(20px);border:1px solid rgba(100,116,139,.25);border-radius:16px;padding:2.5rem;width:380px;max-width:90vw;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+    .login-logo{text-align:center;margin-bottom:2rem}
+    .login-logo .logo-icon{margin:0 auto .75rem;width:56px;height:56px;font-size:1.6rem}
+    .login-divider{display:flex;align-items:center;gap:1rem;margin:1.5rem 0;color:#64748b;font-size:.8rem}
+    .login-divider::before,.login-divider::after{content:'';flex:1;height:1px;background:rgba(100,116,139,.3)}
+    .btn-plex{background:linear-gradient(135deg,#e5a00d,#cc7b19);color:#000;font-weight:700;width:100%;padding:.75rem;border:none;border-radius:8px;cursor:pointer;font-size:.9rem;transition:all .2s}
+    .btn-plex:hover{transform:translateY(-1px);box-shadow:0 6px 16px rgba(229,160,13,.3)}
+    .user-mgmt-row{display:flex;align-items:center;padding:.75rem 1rem;background:rgba(15,23,42,.5);border:1px solid rgba(100,116,139,.15);border-radius:8px;margin-bottom:.5rem;gap:1rem}
+    .user-mgmt-row:hover{border-color:rgba(59,130,246,.3)}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState, useEffect, useCallback, useRef} = React;
+
+const fmt = (s) => {
+  if(!s) return '0:00';
+  const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=Math.floor(s%60);
+  return h>0?`${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`:`${m}:${String(sec).padStart(2,'0')}`;
+};
+const fmtBytes = (b) => {
+  if(!b) return '0 B';
+  const k=1024,s=['B','KB','MB','GB','TB'];
+  const i=Math.floor(Math.log(b)/Math.log(k));
+  return (b/Math.pow(k,i)).toFixed(1)+' '+s[i];
+};
+const fmtUptime = (s) => {
+  if(!s) return 'Unknown';
+  const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60);
+  return d>0?`${d}d ${h}h ${m}m`:`${h}h ${m}m`;
+};
+const ago = (dateStr) => {
+  const d = new Date(dateStr);
+  const diff = Date.now()-d;
+  const days=Math.floor(diff/86400000),hrs=Math.floor(diff/3600000),mins=Math.floor(diff/60000);
+  if(days>0) return `${days}d ago`;
+  if(hrs>0) return `${hrs}h ago`;
+  return `${mins}m ago`;
+};
+
+function App() {
+  // Auth state
+  const [authState, setAuthState] = useState('checking'); // checking, login, authenticated
+  const [currentUser, setCurrentUser] = useState(null);
+  const [loginError, setLoginError] = useState('');
+  const [loginUser, setLoginUser] = useState('');
+  const [loginPass, setLoginPass] = useState('');
+  const [loginLoading, setLoginLoading] = useState(false);
+  const [adminUsers, setAdminUsers] = useState([]);
+  const [adminUserModal, setAdminUserModal] = useState(false);
+  const [newUser, setNewUser] = useState({username:'',password:'',role:'viewer'});
+
+  // Security state
+  const [secView, setSecView] = useState('live');
+  const [secLive, setSecLive] = useState([]);
+  const [secHistory, setSecHistory] = useState([]);
+  const [secBlocked, setSecBlocked] = useState([]);
+  const [secDaysFilter, setSecDaysFilter] = useState(7);
+  const [blockModal, setBlockModal] = useState(null); // {type, value}
+  const [blockReason, setBlockReason] = useState('');
+
+  const [tab, setTab] = useState('dashboard');
+  const [status, setStatus] = useState(null);
+  const [plexRes, setPlexRes] = useState(null);
+  const [dockerRes, setDockerRes] = useState(null);
+  const [resMode, setResMode] = useState('plex');
+  const [streams, setStreams] = useState([]);
+  const [requests, setRequests] = useState([]);
+  const [collections, setCollections] = useState([]);
+  const [topUsers, setTopUsers] = useState([]);
+  const [tautulliUsers, setTautulliUsers] = useState([]);
+  const [history, setHistory] = useState([]);
+  const [libraries, setLibraries] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  // Modals
+  const [serverModal, setServerModal] = useState(false);
+  const [userModal, setUserModal] = useState(null);
+  const [allUsersModal, setAllUsersModal] = useState(false);
+  const [jellyseerrModal, setJellyseerrModal] = useState(false);
+  const [colModal, setColModal] = useState(false);
+  const [streamModal, setStreamModal] = useState(null);
+  const [unwatchedModal, setUnwatchedModal] = useState(false);
+  const [toast, setToast] = useState(null);
+
+  // Jellyseerr search
+  const [searchQ, setSearchQ] = useState('');
+  const [searchRes, setSearchRes] = useState([]);
+  const [searching, setSearching] = useState(false);
+
+  // Collection create
+  const [colType, setColType] = useState('genre');
+  const [colGenre, setColGenre] = useState('Action');
+  const [colYear, setColYear] = useState('2020');
+  const [colActor, setColActor] = useState('');
+  const [colLib, setColLib] = useState('');
+  const [colCreating, setColCreating] = useState(false);
+  const [colResult, setColResult] = useState(null);
+
+  // History filters
+  const [histUser, setHistUser] = useState('');
+  const [histSearch, setHistSearch] = useState('');
+
+  // Unwatched
+  const [uwLib, setUwLib] = useState('');
+  const [uwData, setUwData] = useState(null);
+  const [uwLoading, setUwLoading] = useState(false);
+
+  const [widgets, setWidgets] = useState(() => {
+    const s = localStorage.getItem('widgets_v252');
+    return s ? JSON.parse(s) : ['serverStatus','activeStreams','systemAlerts','topUser','resources','jellyseerr','collections'];
+  });
+  const [widgetSettings, setWidgetSettings] = useState(false);
+
+  // LiveTV state
+  const [ltvView, setLtvView] = useState('nowplaying');
+  const [ltvChannels, setLtvChannels] = useState([]);
+  const [ltvNowPlaying, setLtvNowPlaying] = useState([]);
+  const [ltvGuide, setLtvGuide] = useState([]);
+  const [ltvGenres, setLtvGenres] = useState([]);
+  const [ltvFillers, setLtvFillers] = useState([]);
+  const [ltvScanning, setLtvScanning] = useState(false);
+  const [ltvChannelModal, setLtvChannelModal] = useState(null);
+  const [ltvNewCh, setLtvNewCh] = useState({number:'',name:'',source_type:'genre',source_value:'',library_key:'',shuffle:false});
+  const [ltvRuleModal, setLtvRuleModal] = useState(null);
+  const [ltvNewRule, setLtvNewRule] = useState({name:'',rule_type:'seasonal',start_month:1,end_month:12,genre_boost:'',boost_pct:20});
+  const [ltvAutoBuild, setLtvAutoBuild] = useState(false);
+  const [ltvAB, setLtvAB] = useState({genre:'Comedy',content_type:'episode',year_from:'',year_to:'',shuffle:true,start_number:'',genre_mode:'primary',exclude_genres:[],library_key:''});
+  const [ltvABPreview, setLtvABPreview] = useState(null);
+  const [ltvABLoading, setLtvABLoading] = useState(false);
+  const [ltvSuccess, setLtvSuccess] = useState(null);
+
+  // YouTube filler download state
+  const [ytModal, setYtModal] = useState(false);
+  const [ytUrl, setYtUrl] = useState('');
+  const [ytInfo, setYtInfo] = useState(null);
+  const [ytInfoLoading, setYtInfoLoading] = useState(false);
+  const [ytQuality, setYtQuality] = useState('480p');
+  const [ytDownloads, setYtDownloads] = useState([]);
+  const [ytDiskSpace, setYtDiskSpace] = useState(null);
+  const [ytSelectedChannels, setYtSelectedChannels] = useState([]);
+
+  const showToast = (msg, type='success') => {
+    setToast({msg, type});
+    setTimeout(() => setToast(null), 3000);
+  };
+
+  // Auth check on mount
+  useEffect(() => {
+    fetch('/api/auth/me').then(r => {
+      if (r.ok) return r.json();
+      throw new Error('not authenticated');
+    }).then(data => {
+      setCurrentUser(data.user);
+      setAuthState('authenticated');
+    }).catch(() => setAuthState('login'));
+  }, []);
+
+  const doLogin = async (e) => {
+    e && e.preventDefault();
+    setLoginLoading(true); setLoginError('');
+    try {
+      const r = await fetch('/api/auth/login', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({username: loginUser, password: loginPass})
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || 'Login failed');
+      setCurrentUser(data.user); setAuthState('authenticated');
+    } catch(err) { setLoginError(err.message); }
+    setLoginLoading(false);
+  };
+
+  const doPlexLogin = async () => {
+    setLoginLoading(true); setLoginError('');
+    try {
+      // Create a Plex PIN
+      const pinRes = await fetch('https://plex.tv/api/v2/pins?strong=true', {
+        method: 'POST',
+        headers: {
+          'Accept': 'application/json',
+          'X-Plex-Product': 'Plex Command Center',
+          'X-Plex-Client-Identifier': 'pcc-' + (localStorage.getItem('pcc_client_id') || (() => { const id = Math.random().toString(36).slice(2); localStorage.setItem('pcc_client_id', id); return id; })())
+        }
+      });
+      const pin = await pinRes.json();
+      const clientId = localStorage.getItem('pcc_client_id');
+      // Open Plex auth in popup
+      const authUrl = `https://app.plex.tv/auth#?clientID=${clientId}&code=${pin.code}&context%5Bdevice%5D%5Bproduct%5D=Plex%20Command%20Center`;
+      const popup = window.open(authUrl, 'PlexAuth', 'width=800,height=600');
+      // Poll for token
+      const pollInterval = setInterval(async () => {
+        try {
+          const checkRes = await fetch(`https://plex.tv/api/v2/pins/${pin.id}`, {
+            headers: { 'Accept': 'application/json', 'X-Plex-Client-Identifier': clientId }
+          });
+          const checkData = await checkRes.json();
+          if (checkData.authToken) {
+            clearInterval(pollInterval);
+            if (popup && !popup.closed) popup.close();
+            // Exchange Plex token for PCC session
+            const loginRes = await fetch('/api/auth/login/plex', {
+              method: 'POST', headers: {'Content-Type':'application/json'},
+              body: JSON.stringify({authToken: checkData.authToken})
+            });
+            const loginData = await loginRes.json();
+            if (!loginRes.ok) throw new Error(loginData.error || 'Plex login failed');
+            setCurrentUser(loginData.user); setAuthState('authenticated');
+            setLoginLoading(false);
+          }
+        } catch(e) { /* keep polling */ }
+      }, 2000);
+      // Timeout after 5 minutes
+      setTimeout(() => { clearInterval(pollInterval); setLoginLoading(false); }, 300000);
+    } catch(err) {
+      setLoginError(err.message);
+      setLoginLoading(false);
+    }
+  };
+
+  const doLogout = async () => {
+    await fetch('/api/auth/logout', {method:'POST'});
+    setCurrentUser(null); setAuthState('login');
+  };
+
+  const loadAdminUsers = async () => {
+    const r = await fetch('/api/admin/users').then(x=>x.json()).catch(()=>[]);
+    setAdminUsers(r);
+  };
+
+  const createUser = async () => {
+    const r = await fetch('/api/admin/users', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(newUser)
+    });
+    const data = await r.json();
+    if (r.ok) { showToast('User created'); setAdminUserModal(false); setNewUser({username:'',password:'',role:'viewer'}); loadAdminUsers(); }
+    else showToast(data.error || 'Failed', 'error');
+  };
+
+  const deleteUser = async (id) => {
+    if (!confirm('Delete this user?')) return;
+    await fetch(`/api/admin/users/${id}`, {method:'DELETE'});
+    loadAdminUsers();
+  };
+
+  const toggleUserEnabled = async (id, enabled) => {
+    await fetch(`/api/admin/users/${id}`, {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled: !enabled})});
+    loadAdminUsers();
+  };
+
+  const loadSecLive = async () => { const r = await fetch('/api/security/connections/live').then(x=>x.json()).catch(()=>[]); setSecLive(r); };
+  const loadSecHistory = async () => { const r = await fetch(`/api/security/connections?days=${secDaysFilter}`).then(x=>x.json()).catch(()=>[]); setSecHistory(r); };
+  const loadSecBlocked = async () => { const r = await fetch('/api/security/blocked').then(x=>x.json()).catch(()=>[]); setSecBlocked(r); };
+  const doBlock = async () => {
+    if (!blockModal) return;
+    await fetch('/api/security/block', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({entity_type:blockModal.type, entity_value:blockModal.value, reason:blockReason})});
+    setBlockModal(null); setBlockReason(''); showToast('Blocked'); loadSecLive(); loadSecBlocked();
+  };
+  const doUnblock = async (id) => { await fetch(`/api/security/block/${id}`, {method:'DELETE'}); showToast('Unblocked'); loadSecBlocked(); };
+
+  const fetchAll = useCallback(async () => {
+    try {
+      const [st, pr, dr, sess, reqs, cols, users, libs, tUsers] = await Promise.all([
+        fetch('/api/plex/status').then(r=>r.json()).catch(()=>({online:false})),
+        fetch('/api/plex/resources').then(r=>r.json()).catch(()=>null),
+        fetch('/api/docker/resources').then(r=>r.json()).catch(()=>null),
+        fetch('/api/plex/sessions').then(r=>r.json()).catch(()=>[]),
+        fetch('/api/jellyseerr/requests?take=10').then(r=>r.json()).catch(()=>[]),
+        fetch('/api/plex/collections').then(r=>r.json()).catch(()=>[]),
+        fetch('/api/tautulli/user-stats').then(r=>r.json()).catch(()=>[]),
+        fetch('/api/plex/libraries').then(r=>r.json()).catch(()=>[]),
+        fetch('/api/tautulli/users').then(r=>r.json()).catch(()=>[])
+      ]);
+      setStatus(st); setPlexRes(pr); setDockerRes(dr);
+      setStreams(sess); setRequests(reqs); setCollections(cols);
+      setTopUsers(users); setLibraries(libs); setTautulliUsers(tUsers);
+      setLoading(false);
+    } catch(e) { setLoading(false); }
+  }, []);
+
+  useEffect(() => {
+    fetchAll();
+    const t = setInterval(fetchAll, 10000);
+    return () => clearInterval(t);
+  }, [fetchAll]);
+
+  const loadHistory = async () => {
+    const params = new URLSearchParams({ length: 50 });
+    if (histUser) params.append('user', histUser);
+    if (histSearch) params.append('search', histSearch);
+    const r = await fetch(`/api/tautulli/history?${params}`).then(x=>x.json()).catch(()=>({data:[]}));
+    setHistory(r.data || []);
+  };
+
+  useEffect(() => {
+    if (tab === 'history') loadHistory();
+  }, [tab]);
+
+  const doAction = async (url, method='POST', body=null) => {
+    const opts = { method };
+    if (body) { opts.headers={'Content-Type':'application/json'}; opts.body=JSON.stringify(body); }
+    const r = await fetch(url, opts);
+    return r.json();
+  };
+
+  const approveReq = async (id) => {
+    const r = await doAction(`/api/jellyseerr/request/${id}/approve`);
+    if (r.success) { showToast('Request approved!'); fetchAll(); }
+    else showToast('Failed to approve: '+r.error, 'error');
+  };
+
+  const declineReq = async (id) => {
+    const r = await doAction(`/api/jellyseerr/request/${id}/decline`);
+    if (r.success) { showToast('Request declined'); fetchAll(); }
+    else showToast('Failed to decline: '+r.error, 'error');
+  };
+
+  const deleteReq = async (id) => {
+    if (!confirm('Delete this request?')) return;
+    const r = await doAction(`/api/jellyseerr/request/${id}`, 'DELETE');
+    if (r.success) { showToast('Request deleted'); fetchAll(); }
+    else showToast('Failed to delete: '+r.error, 'error');
+  };
+
+  const stopStream = async (id) => {
+    if (!confirm('Stop this stream?')) return;
+    const r = await doAction(`/api/plex/sessions/${id}/stop`);
+    if (r.success) { showToast('Stream stopped!'); fetchAll(); }
+    else showToast('Failed to stop stream', 'error');
+  };
+
+  const searchJelly = async () => {
+    if (!searchQ.trim()) return;
+    setSearching(true);
+    const r = await fetch(`/api/jellyseerr/search?query=${encodeURIComponent(searchQ)}`).then(x=>x.json()).catch(()=>({results:[]}));
+    setSearchRes(r.results || []);
+    setSearching(false);
+  };
+
+  const requestMedia = async (media) => {
+    const body = { mediaType: media.mediaType, mediaId: media.id };
+    if (media.mediaType === 'tv') { body.tvdbId = media.tvdbId; body.seasons = 'all'; }
+    const r = await doAction('/api/jellyseerr/request', 'POST', body);
+    if (r.success) { showToast(`Requested: ${media.title||media.name}!`); fetchAll(); }
+    else showToast('Failed: '+(r.error||'Unknown error'), 'error');
+  };
+
+  // --- LiveTV Functions ---
+  const loadLiveTv = async () => {
+    const [np, ch, genres, fillers] = await Promise.all([
+      fetch('/api/livetv/now-playing').then(r=>r.json()).catch(()=>[]),
+      fetch('/api/livetv/channels').then(r=>r.json()).catch(()=>[]),
+      fetch('/api/livetv/genres').then(r=>r.json()).catch(()=>[]),
+      fetch('/api/livetv/fillers').then(r=>r.json()).catch(()=>[])
+    ]);
+    setLtvNowPlaying(np); setLtvChannels(ch); setLtvGenres(genres); setLtvFillers(fillers);
+  };
+  const loadLtvGuide = async () => {
+    const g = await fetch('/api/livetv/guide?hours=6').then(r=>r.json()).catch(()=>[]);
+    setLtvGuide(g);
+  };
+  useEffect(() => {
+    if (tab === 'livetv') { loadLiveTv(); loadLtvGuide(); }
+  }, [tab]);
+  useEffect(() => {
+    if (tab !== 'livetv') return;
+    const t = setInterval(loadLiveTv, 30000);
+    return () => clearInterval(t);
+  }, [tab]);
+
+  const ltvScan = async () => {
+    setLtvScanning(true);
+    showToast('Scanning Plex libraries...','info');
+    const r = await doAction('/api/livetv/scan');
+    setLtvScanning(false);
+    if (r.success) { showToast(`Scan complete: ${r.added} added, ${r.updated} updated (${r.total} total)`); loadLiveTv(); }
+    else showToast('Scan failed: '+(r.error||'Unknown'),'error');
+  };
+  const ltvCreateChannel = async () => {
+    if (!ltvNewCh.number || !ltvNewCh.name || !ltvNewCh.source_value) return showToast('Fill in all required fields','error');
+    const r = await doAction('/api/livetv/channels', 'POST', {...ltvNewCh, number: parseInt(ltvNewCh.number)});
+    if (r.success) {
+      setLtvChannelModal(null);
+      setLtvSuccess({ name: ltvNewCh.name, number: parseInt(ltvNewCh.number), programs: null, hours: null });
+      setLtvNewCh({number:'',name:'',source_type:'genre',source_value:'',library_key:'',shuffle:false});
+      loadLiveTv(); loadLtvGuide();
+    } else showToast('Failed: '+(r.error||'Unknown'),'error');
+  };
+  const ltvDeleteChannel = async (id) => {
+    if (!confirm('Delete this channel?')) return;
+    const r = await doAction(`/api/livetv/channels/${id}`, 'DELETE');
+    if (r.success) { showToast('Channel deleted'); loadLiveTv(); loadLtvGuide(); }
+    else showToast('Failed: '+(r.error||'Unknown'),'error');
+  };
+  const ltvRebuildChannel = async (id) => {
+    const r = await doAction(`/api/livetv/channels/${id}/rebuild`);
+    if (r.success) { showToast(`Rebuilt with ${r.programCount} items`); loadLiveTv(); loadLtvGuide(); }
+    else showToast('Failed: '+(r.error||'Unknown'),'error');
+  };
+  const ltvToggleChannel = async (ch) => {
+    await doAction(`/api/livetv/channels/${ch.id}`, 'PUT', { enabled: !ch.enabled });
+    loadLiveTv();
+  };
+  const ltvAddFiller = async (name, type, duration_ms, plex_rating_key, plex_key) => {
+    const r = await doAction('/api/livetv/fillers', 'POST', { name, type, duration_ms, plex_rating_key, plex_key });
+    if (r.success) { showToast('Filler added'); loadLiveTv(); }
+    else showToast('Failed: '+(r.error||'Unknown'),'error');
+  };
+  const ltvDeleteFiller = async (id) => {
+    if (!confirm('Delete this filler?')) return;
+    await doAction(`/api/livetv/fillers/${id}`, 'DELETE');
+    showToast('Filler deleted'); loadLiveTv();
+  };
+  const ltvScanTrailers = async () => {
+    showToast('Scanning for trailers...','info');
+    const r = await doAction('/api/livetv/fillers/scan-trailers');
+    if (r.success) { showToast(`Found ${r.added} trailers`); loadLiveTv(); }
+    else showToast('Failed: '+(r.error||'Unknown'),'error');
+  };
+
+  // YouTube filler functions
+  const ytCheckInfo = async () => {
+    if (!ytUrl) return;
+    setYtInfoLoading(true); setYtInfo(null);
+    try {
+      const r = await fetch(`/api/livetv/fillers/yt-info?url=${encodeURIComponent(ytUrl)}`).then(x=>x.json());
+      setYtInfo(r);
+      // Also fetch disk space
+      const ds = await fetch('/api/livetv/fillers/disk-space').then(x=>x.json()).catch(()=>null);
+      setYtDiskSpace(ds);
+    } catch(e) { showToast('Failed to fetch video info', 'error'); }
+    setYtInfoLoading(false);
+  };
+  const ytStartDownload = async () => {
+    const r = await fetch('/api/livetv/fillers/yt-download', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ url: ytUrl, quality: ytQuality, channelIds: ytSelectedChannels })
+    }).then(x=>x.json());
+    if (r.success) { showToast('Download started'); setYtModal(false); setYtUrl(''); setYtInfo(null); setYtSelectedChannels([]); ytLoadDownloads(); }
+    else showToast(r.error || 'Failed', 'error');
+  };
+  const ytLoadDownloads = async () => {
+    const r = await fetch('/api/livetv/fillers/yt-downloads').then(x=>x.json()).catch(()=>[]);
+    setYtDownloads(r);
+  };
+  const ytCancelDownload = async (id) => {
+    await fetch(`/api/livetv/fillers/yt-downloads/${id}`, {method:'DELETE'});
+    ytLoadDownloads(); loadLiveTv();
+  };
+  // Auto-poll downloads when active
+  useEffect(() => {
+    if (tab !== 'livetv' || ltvView !== 'fillers') return;
+    ytLoadDownloads();
+    const hasActive = ytDownloads.some(d => d.status === 'downloading' || d.status === 'processing');
+    if (!hasActive) return;
+    const t = setInterval(ytLoadDownloads, 2000);
+    return () => clearInterval(t);
+  }, [tab, ltvView, ytDownloads.length]);
+
+  const ltvAddRule = async (channelId) => {
+    const r = await doAction(`/api/livetv/channels/${channelId}/rules`, 'POST', ltvNewRule);
+    if (r.success) { showToast('Rule added'); setLtvRuleModal(null); setLtvNewRule({name:'',rule_type:'seasonal',start_month:1,end_month:12,genre_boost:'',boost_pct:20}); loadLiveTv(); }
+    else showToast('Failed: '+(r.error||'Unknown'),'error');
+  };
+  const ltvDeleteRule = async (id) => {
+    if (!confirm('Delete this rule?')) return;
+    await doAction(`/api/livetv/rules/${id}`, 'DELETE');
+    showToast('Rule deleted'); loadLiveTv();
+  };
+  const ltvPreviewAutoBuild = async () => {
+    setLtvABLoading(true); setLtvABPreview(null);
+    const r = await doAction('/api/livetv/auto-build/preview', 'POST', ltvAB);
+    setLtvABPreview(r); setLtvABLoading(false);
+  };
+  const ltvRunAutoBuild = async () => {
+    setLtvABLoading(true);
+    const r = await doAction('/api/livetv/auto-build', 'POST', ltvAB);
+    setLtvABLoading(false);
+    if (r.success) {
+      setLtvAutoBuild(false); setLtvABPreview(null);
+      setLtvAB({genre:'Comedy',content_type:'episode',year_from:'',year_to:'',shuffle:true,start_number:'',genre_mode:'primary',exclude_genres:[],library_key:''});
+      setLtvSuccess({ name: r.channel.name, number: r.channel.number, programs: r.stats.programs, hours: r.stats.totalHours });
+      loadLiveTv(); loadLtvGuide();
+    } else showToast('Failed: '+(r.error||'Unknown'),'error');
+  };
+
+  const createCollection = async () => {
+    if (!colLib) { showToast('Select a library', 'error'); return; }
+    setColCreating(true); setColResult(null);
+    let title='', value='';
+    if (colType==='genre') { title=`${colGenre} Movies`; value=colGenre; }
+    else if (colType==='year') { title=`${colYear}s Movies`; value=colYear; }
+    else { title=`${colActor} Movies`; value=colActor; }
+    const r = await doAction('/api/plex/collections/create', 'POST', { libraryKey: colLib, title, type: colType, value });
+    setColCreating(false);
+    if (r.success) {
+      setColResult({ type:'success', msg: r.message });
+      showToast(r.message);
+      fetchAll();
+    } else {
+      setColResult({ type:'error', msg: r.error });
+      showToast('Failed: '+r.error, 'error');
+    }
+  };
+
+  const deleteCollection = async (key) => {
+    if (!confirm('Delete this collection?')) return;
+    const r = await doAction(`/api/plex/collections/${key}`, 'DELETE');
+    if (r.success) { showToast('Collection deleted'); fetchAll(); }
+    else showToast('Failed to delete', 'error');
+  };
+
+  const genUnwatched = async () => {
+    if (!uwLib) { showToast('Select a library', 'error'); return; }
+    setUwLoading(true); setUwData(null);
+    const r = await fetch(`/api/plex/library/${uwLib}/unwatched`).then(x=>x.json()).catch(()=>null);
+    setUwData(r); setUwLoading(false);
+  };
+
+  const exportCSV = () => {
+    if (!uwData) return;
+    const csv = ['Title,Type,Added,Size,Last Watched',
+      ...uwData.items.map(i=>`"${i.title}","${i.type}","${i.added}","${fmtBytes(i.size)}","${i.lastWatched}"`)
+    ].join('\n');
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+    a.download=`unwatched-${Date.now()}.csv`; a.click();
+  };
+
+  const cur = resMode === 'plex' ? plexRes : dockerRes;
+  const pendingCount = requests.filter(r=>r.status==='pending').length;
+
+  const WIDGET_LIST = [
+    {id:'serverStatus',name:'Server Status'},
+    {id:'activeStreams',name:'Active Streams'},
+    {id:'systemAlerts',name:'System Alerts'},
+    {id:'topUser',name:'Top User'},
+    {id:'resources',name:'System Resources'},
+    {id:'jellyseerr',name:'Recent Requests'},
+    {id:'collections',name:'Collections'}
+  ];
+
+  if(loading) return (
+    <div style={{display:'flex',alignItems:'center',justifyContent:'center',minHeight:'100vh',flexDirection:'column',gap:'1rem'}}>
+      <div className="spinner"/>
+      <p style={{color:'#94a3b8'}}>Loading Plex Command Center v2.5.2...</p>
+    </div>
+  );
+
+  // Auth loading screen
+  if (authState === 'checking') return (
+    <div className="login-page"><div className="spinner"></div></div>
+  );
+
+  // Login page
+  if (authState === 'login') return (
+    <div className="login-page">
+      <div className="login-box">
+        <div className="login-logo">
+          <div className="logo-icon" style={{background:'linear-gradient(135deg,#3b82f6,#8b5cf6)',borderRadius:'14px',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'1.6rem',width:'56px',height:'56px',margin:'0 auto .75rem'}}>🎬</div>
+          <h2 style={{fontSize:'1.3rem',fontWeight:700,background:'linear-gradient(135deg,#60a5fa,#a78bfa)',WebkitBackgroundClip:'text',WebkitTextFillColor:'transparent'}}>Plex Command Center</h2>
+          <p style={{fontSize:'.8rem',color:'#94a3b8',marginTop:'.3rem'}}>Sign in to continue</p>
+        </div>
+        <button className="btn-plex" onClick={doPlexLogin} disabled={loginLoading}>
+          {loginLoading ? 'Connecting...' : 'Sign in with Plex'}
+        </button>
+        <div className="login-divider">or sign in with local account</div>
+        <form onSubmit={doLogin}>
+          <div className="form-row">
+            <input className="form-input" placeholder="Username" value={loginUser} onChange={e=>setLoginUser(e.target.value)} autoFocus/>
+          </div>
+          <div className="form-row">
+            <input className="form-input" type="password" placeholder="Password" value={loginPass} onChange={e=>setLoginPass(e.target.value)}/>
+          </div>
+          {loginError && <div className="alert-box alert-error" style={{marginBottom:'1rem'}}>{loginError}</div>}
+          <button type="submit" className="btn btn-primary" style={{width:'100%',padding:'.75rem'}} disabled={loginLoading}>
+            {loginLoading ? 'Signing in...' : 'Sign In'}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+
+  return (
+    <div>
+      {/* TOAST */}
+      {toast && (
+        <div style={{position:'fixed',bottom:'2rem',right:'2rem',zIndex:9999,padding:'1rem 1.5rem',borderRadius:'10px',fontWeight:600,fontSize:'.875rem',boxShadow:'0 10px 30px rgba(0,0,0,.5)',animation:'slideup .3s'}}
+          className={`alert-${toast.type}`}>
+          {toast.msg}
+        </div>
+      )}
+
+      {/* HEADER */}
+      <header className="header">
+        <div className="header-content">
+          <div className="logo">
+            <div className="logo-icon">🎬</div>
+            <div className="logo-text">
+              <h1>Plex Command Center v2.5.2</h1>
+              {status?.friendlyName && <div className="server-name">📡 {status.friendlyName}</div>}
+              <p>Advanced monitoring & control</p>
+            </div>
+          </div>
+          <nav className="nav">
+            <button className={`nav-btn ${tab==='dashboard'?'active':''}`} onClick={()=>setTab('dashboard')}>Dashboard</button>
+            <button className={`nav-btn ${tab==='streams'?'active':''}`} onClick={()=>setTab('streams')}>
+              Active Streams {streams.length>0&&<span className="badge">{streams.length}</span>}
+            </button>
+            <button className={`nav-btn ${tab==='users'?'active':''}`} onClick={()=>setTab('users')}>Top Users</button>
+            <button className={`nav-btn ${tab==='history'?'active':''}`} onClick={()=>{setTab('history');loadHistory();}}>Watch History</button>
+            <button className={`nav-btn ${tab==='system'?'active':''}`} onClick={()=>setTab('system')}>System</button>
+            <button className={`nav-btn ${tab==='tools'?'active':''}`} onClick={()=>setTab('tools')}>Tools</button>
+            {currentUser?.role==='admin' && <button className={`nav-btn ${tab==='security'?'active':''}`} onClick={()=>{setTab('security');loadSecLive();loadSecBlocked();}}>Security</button>}
+            {currentUser?.role==='admin' && <button className={`nav-btn ${tab==='admin'?'active':''}`} onClick={()=>{setTab('admin');loadAdminUsers();}}>Admin</button>}
+            <button className={`nav-btn ${tab==='livetv'?'active':''}`} onClick={()=>setTab('livetv')}>Live TV</button>
+            <div style={{display:'flex',alignItems:'center',gap:'.5rem',marginLeft:'.5rem',paddingLeft:'.75rem',borderLeft:'1px solid rgba(100,116,139,.2)'}}>
+              {currentUser?.plex_thumb ? <img src={currentUser.plex_thumb} style={{width:28,height:28,borderRadius:'50%'}}/> : <div className="avatar" style={{width:28,height:28,fontSize:'.7rem'}}>{currentUser?.username?.[0]?.toUpperCase()}</div>}
+              <span style={{fontSize:'.8rem',color:'#cbd5e1'}}>{currentUser?.username}</span>
+              <button className="btn-sm btn-outline" onClick={doLogout} style={{marginLeft:'.25rem'}}>Logout</button>
+            </div>
+          </nav>
+        </div>
+      </header>
+
+      <main className="main">
+
+        {/* ============ DASHBOARD ============ */}
+        {tab==='dashboard' && (
+          <div>
+            <div className="page-title">
+              Dashboard
+              <button className="btn btn-outline btn-sm" onClick={()=>setWidgetSettings(true)}>⚙️ Customize</button>
+            </div>
+            <div className="grid">
+
+              {/* Server Status Widget */}
+              {widgets.includes('serverStatus') && (
+                <div className="card clickable" onClick={()=>setServerModal(true)}>
+                  <div className="card-header">
+                    <div className="card-title">🖥️ Server Status</div>
+                    <div className="dot"/>
+                  </div>
+                  <div className="big-val">{status?.online?'Online':'Offline'}</div>
+                  <div className="sub-label">{status?.friendlyName || 'Plex Server'}</div>
+                  <div className="sub-label" style={{marginTop:'.5rem',color:'#60a5fa',fontSize:'.75rem'}}>
+                    Click for details →
+                  </div>
+                </div>
+              )}
+
+              {/* Active Streams Widget */}
+              {widgets.includes('activeStreams') && (
+                <div className="card clickable" onClick={()=>setTab('streams')}>
+                  <div className="card-header">
+                    <div className="card-title">▶️ Active Streams</div>
+                  </div>
+                  <div className="big-val">{streams.length}</div>
+                  <div className="sub-label">Currently watching</div>
+                  {streams.slice(0,2).map((s,i)=>(
+                    <div key={i} style={{marginTop:'.5rem',fontSize:'.75rem',color:'#94a3b8',display:'flex',gap:'.5rem',alignItems:'center'}}>
+                      <span>👤 {s.user}</span>
+                      <span style={{color:'#60a5fa'}}>•</span>
+                      <span>{s.content?.substring(0,25)}{s.content?.length>25?'...':''}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* System Alerts Widget */}
+              {widgets.includes('systemAlerts') && (
+                <div className="card">
+                  <div className="card-header">
+                    <div className="card-title">⚠️ System Alerts</div>
+                  </div>
+                  <div className="big-val">
+                    {((cur?.cpu>80?1:0)+(cur?.memory>85?1:0)) || 0}
+                  </div>
+                  <div className="sub-label">
+                    {(!cur?.cpu||cur?.cpu<=80)&&(!cur?.memory||cur?.memory<=85)?'All systems normal':'Issues detected'}
+                  </div>
+                </div>
+              )}
+
+              {/* Top User Widget */}
+              {widgets.includes('topUser') && (
+                <div className="card clickable" onClick={()=>setAllUsersModal(true)}>
+                  <div className="card-header">
+                    <div className="card-title">👑 Top User</div>
+                  </div>
+                  {topUsers[0] ? (
+                    <>
+                      <div style={{display:'flex',alignItems:'center',gap:'.75rem',marginTop:'.5rem'}}>
+                        <div className="avatar">{(topUsers[0].friendly_name||topUsers[0].username||'?')[0].toUpperCase()}</div>
+                        <div>
+                          <div style={{fontWeight:700,fontSize:'1.1rem'}}>{topUsers[0].friendly_name||topUsers[0].username}</div>
+                          <div className="sub-label">{topUsers[0].total_plays||topUsers[0].plays||0} plays</div>
+                        </div>
+                      </div>
+                      <div className="sub-label" style={{marginTop:'.75rem',color:'#60a5fa',fontSize:'.75rem'}}>
+                        Click to see all users →
+                      </div>
+                    </>
+                  ) : (
+                    <div className="sub-label">No data yet</div>
+                  )}
+                </div>
+              )}
+
+              {/* System Resources Widget */}
+              {widgets.includes('resources') && (
+                <div className="card" style={{gridColumn:'span 2'}}>
+                  <div className="card-header">
+                    <div className="card-title">📊 System Resources</div>
+                    <div className="toggle">
+                      <button className={`toggle-opt ${resMode==='plex'?'active':''}`} onClick={()=>setResMode('plex')}>Plex Server</button>
+                      <button className={`toggle-opt ${resMode==='docker'?'active':''}`} onClick={()=>setResMode('docker')}>Docker</button>
+                    </div>
+                  </div>
+                  {resMode==='plex' && cur?.available===false && (
+                    <div className="alert-box alert-warn" style={{marginBottom:'1rem'}}>
+                      ⚠️ {cur?.message || 'Plex server metrics require Zabbix. Add ZABBIX_URL, ZABBIX_USER, ZABBIX_PASSWORD, ZABBIX_HOST_ID to docker-compose.yml'}
+                    </div>
+                  )}
+                  {resMode==='plex' && cur?.source==='zabbix' && (
+                    <div className="alert-box alert-info" style={{marginBottom:'.75rem',fontSize:'.75rem',padding:'.5rem .75rem'}}>
+                      📡 Live data from Zabbix • Host: {cur?.hostname || 'Unknown'} • Uptime: {fmtUptime(cur?.uptime)}
+                    </div>
+                  )}
+                  <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'1.25rem'}}>
+                    <div>
+                      <div style={{display:'flex',justifyContent:'space-between',marginBottom:'.35rem',fontSize:'.85rem'}}>
+                        <span>CPU Usage</span>
+                        <span style={{fontWeight:600,color:cur?.cpu>80?'#ef4444':cur?.cpu>60?'#f59e0b':'#10b981'}}>{parseFloat(cur?.cpu||0).toFixed(1)}%</span>
+                      </div>
+                      <div className="progress-wrap">
+                        <div className="progress-bar" style={{width:`${cur?.cpu||0}%`,background:cur?.cpu>80?'#ef4444':cur?.cpu>60?'#f59e0b':undefined}}/>
+                      </div>
+                    </div>
+                    <div>
+                      <div style={{display:'flex',justifyContent:'space-between',marginBottom:'.35rem',fontSize:'.85rem'}}>
+                        <span>Memory Usage</span>
+                        <span style={{fontWeight:600,color:cur?.memory>85?'#ef4444':cur?.memory>70?'#f59e0b':'#10b981'}}>{parseFloat(cur?.memory||0).toFixed(1)}%</span>
+                      </div>
+                      <div className="progress-wrap">
+                        <div className="progress-bar" style={{width:`${cur?.memory||0}%`,background:cur?.memory>85?'#ef4444':cur?.memory>70?'#f59e0b':undefined}}/>
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{marginTop:'.75rem',fontSize:'.85rem',display:'flex',justifyContent:'space-between',color:'#94a3b8'}}>
+                    <span>Network I/O</span>
+                    <span>↓ {cur?.network?.rx||0} KB/s &nbsp;↑ {cur?.network?.tx||0} KB/s</span>
+                  </div>
+                  {cur?.disks && cur.disks.length > 0 && (
+                    <div style={{marginTop:'.75rem'}}>
+                      <div style={{fontSize:'.85rem',fontWeight:600,marginBottom:'.5rem',color:'#cbd5e1'}}>
+                        💾 Disk Usage ({cur.disks.length} {cur.disks.length===1?'disk':'disks'})
+                      </div>
+                      {cur.diskChanges && (cur.diskChanges.added.length > 0 || cur.diskChanges.removed.length > 0) && (
+                        <div style={{marginBottom:'.75rem'}}>
+                          {cur.diskChanges.added.length > 0 && (
+                            <div className="alert-box alert-success" style={{padding:'.5rem',marginBottom:'.4rem',fontSize:'.75rem'}}>
+                              ➕ New disk{cur.diskChanges.added.length>1?'s':''} detected: {cur.diskChanges.added.join(', ')}
+                            </div>
+                          )}
+                          {cur.diskChanges.removed.length > 0 && (
+                            <div className="alert-box alert-error" style={{padding:'.5rem',fontSize:'.75rem'}}>
+                              ⚠️ Disk{cur.diskChanges.removed.length>1?'s':''} removed: {cur.diskChanges.removed.join(', ')}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      <div style={{maxHeight:'180px',overflowY:'auto',paddingRight:'.5rem'}}>
+                        {cur.disks.map((d,idx)=>(
+                          <div key={idx} style={{marginBottom:'.6rem'}}>
+                            <div style={{display:'flex',justifyContent:'space-between',fontSize:'.8rem',marginBottom:'.25rem'}}>
+                              <span style={{fontWeight:500}}>{d.label || d.name} <span style={{color:'#64748b',fontSize:'.7rem'}}>{d.mount !== d.label ? d.mount : ''}</span></span>
+                              <span style={{fontWeight:600,color:d.percentage>90?'#ef4444':d.percentage>75?'#f59e0b':'#10b981'}}>
+                                {d.sizeFormatted || `${d.percentage}%`}
+                              </span>
+                            </div>
+                            <div className="progress-wrap" style={{height:'6px'}}>
+                              <div className="progress-bar" style={{width:`${d.percentage}%`,background:d.percentage>90?'#ef4444':d.percentage>75?'#f59e0b':undefined}}/>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Jellyseerr Widget */}
+              {widgets.includes('jellyseerr') && (
+                <div className="card" style={{gridColumn:'span 2'}}>
+                  <div className="card-header">
+                    <div className="card-title">
+                      📬 Recent Requests
+                      {pendingCount>0&&<span className="badge warn">{pendingCount} pending</span>}
+                    </div>
+                    <button className="btn-sm btn-outline" onClick={()=>setJellyseerrModal(true)}>🔍 Search & Request</button>
+                  </div>
+                  {requests.length===0 ? (
+                    <div style={{color:'#94a3b8',fontSize:'.875rem',textAlign:'center',padding:'1rem'}}>No requests found</div>
+                  ) : (
+                    requests.slice(0,4).map((req,i)=>(
+                      <div key={i} className="req-card">
+                        {req.posterPath
+                          ? <img src={req.posterPath} className="req-poster" alt={req.title} onError={e=>{e.target.style.display='none'}}/>
+                          : <div className="req-poster-placeholder">{req.type==='movie'?'🎬':'📺'}</div>
+                        }
+                        <div className="req-info">
+                          <div className="req-title">{req.title || 'Unknown Title'}{req.year?` (${req.year})`:''}</div>
+                          <div className="req-meta">by {req.requestedBy} • {ago(req.createdAt)}</div>
+                        </div>
+                        <div className="req-actions">
+                          {req.status==='pending' ? (
+                            <>
+                              <button className="btn-sm btn-approve" onClick={()=>approveReq(req.id)}>✓</button>
+                              <button className="btn-sm btn-decline" onClick={()=>declineReq(req.id)}>✗</button>
+                            </>
+                          ) : (
+                            <span className={`status-badge status-${req.status}`}>{req.status}</span>
+                          )}
+                          <button className="btn-sm btn-delete" onClick={()=>deleteReq(req.id)}>🗑️</button>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+
+              {/* Collections Widget */}
+              {widgets.includes('collections') && (
+                <div className="card" style={{gridColumn:'span 4'}}>
+                  <div className="card-header">
+                    <div className="card-title">📚 Collections ({collections.length})</div>
+                    { /* Collection creation disabled - use Plex Web UI */ }
+                  </div>
+                  {collections.length===0 ? (
+                    <div className="empty"><p>No collections found</p></div>
+                  ) : (
+                    <div className="col-grid">
+                      {collections.slice(0,8).map((col,i)=>(
+                        <div key={i} className="col-card">
+                          {col.thumb
+                            ? <img src={col.thumb} className="col-poster" alt={col.title} onError={e=>{e.target.parentNode.querySelector('.col-poster-ph')?.style&&(e.target.style.display='none');}}/>
+                            : <div className="col-poster-ph"><span>📚</span></div>
+                          }
+                          <div className="col-info">
+                            <div className="col-title">{col.title}</div>
+                            <div className="col-count">{col.itemCount} items • {col.library}</div>
+                            <div className="col-actions">
+                              <button className="btn-sm btn-delete" style={{flex:1}} onClick={()=>deleteCollection(col.key)}>🗑️ Delete</button>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ============ ACTIVE STREAMS ============ */}
+        {tab==='streams' && (
+          <div>
+            <div className="page-title">Active Streams ({streams.length})</div>
+            {streams.length===0 ? (
+              <div className="card empty"><div style={{fontSize:'3rem'}}>😴</div><h3>No active streams</h3><p>Nobody is watching right now</p></div>
+            ) : streams.map((s,i)=>(
+              <div key={i} className="stream-card">
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:'.75rem'}}>
+                  <div style={{display:'flex',gap:'.75rem',alignItems:'center'}}>
+                    <div className="avatar">{s.user[0].toUpperCase()}</div>
+                    <div>
+                      <div style={{fontWeight:700,fontSize:'1rem'}}>{s.user}</div>
+                      <div style={{fontSize:'.75rem',color:'#94a3b8'}}>📍 {s.ip} &nbsp;•&nbsp; 🖥️ {s.device}</div>
+                    </div>
+                  </div>
+                  <div style={{display:'flex',gap:'.5rem'}}>
+                    <button className="btn-sm btn-outline" onClick={()=>setStreamModal(s)}>ℹ️ Details</button>
+                    <button className="btn-sm btn-delete" onClick={()=>stopStream(s.sessionId)}>⏹️ Stop</button>
+                  </div>
+                </div>
+                <div style={{fontSize:'1rem',fontWeight:600,marginBottom:'.5rem'}}>{s.content}</div>
+                <div style={{display:'flex',gap:'.5rem',marginBottom:'.75rem',flexWrap:'wrap'}}>
+                  <span className="status-badge status-available">{s.quality}</span>
+                  <span className="status-badge status-approved">{s.contentType}</span>
+                  {s.transcoding&&<span className="status-badge status-pending">Transcoding</span>}
+                  <span className="status-badge" style={{background:'rgba(100,116,139,.2)',color:'#94a3b8',border:'1px solid rgba(100,116,139,.2)'}}>{s.bandwidth} KB/s</span>
+                </div>
+                <div style={{display:'flex',alignItems:'center',gap:'.75rem'}}>
+                  <div className="progress-wrap" style={{flex:1,height:'8px'}}>
+                    <div className="progress-bar" style={{width:`${s.progress}%`}}/>
+                  </div>
+                  <span style={{fontSize:'.85rem',fontWeight:700,minWidth:'40px',textAlign:'right'}}>{s.progress}%</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* ============ TOP USERS ============ */}
+        {tab==='users' && (
+          <div>
+            <div className="page-title">Top Users</div>
+            <div className="card">
+              {topUsers.length===0 ? (
+                <div className="empty"><p>No user data available</p><p style={{marginTop:'.5rem',fontSize:'.875rem'}}>Check Tautulli configuration</p></div>
+              ) : topUsers.map((u,i)=>(
+                <div key={i} className="user-row" onClick={()=>setUserModal(u)}>
+                  <div style={{width:'32px',height:'32px',borderRadius:'50%',background:'linear-gradient(135deg,#3b82f6,#8b5cf6)',display:'flex',alignItems:'center',justifyContent:'center',fontWeight:700,fontSize:'.85rem',flexShrink:0}}>#{i+1}</div>
+                  <div className="avatar" style={{width:'36px',height:'36px',fontSize:'.85rem'}}>
+                    {u.user_thumb ? <img src={u.user_thumb} alt="" onError={e=>e.target.style.display='none'}/> : (u.friendly_name||u.username||'?')[0].toUpperCase()}
+                  </div>
+                  <div style={{flex:1}}>
+                    <div style={{fontWeight:600}}>{u.friendly_name||u.username}</div>
+                    <div style={{fontSize:'.75rem',color:'#94a3b8'}}>
+                      {u.total_plays||u.plays||0} plays &nbsp;•&nbsp; {Math.round(((u.total_duration||u.duration)||0)/3600)}h watched
+                    </div>
+                  </div>
+                  <div style={{display:'flex',flexDirection:'column',alignItems:'flex-end'}}>
+                    <div style={{fontWeight:700,color:'#60a5fa',fontSize:'1.1rem'}}>{u.total_plays||0}</div>
+                    <div style={{fontSize:'.7rem',color:'#94a3b8'}}>plays</div>
+                  </div>
+                  <span style={{color:'#94a3b8',marginLeft:'.5rem'}}>›</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* ============ WATCH HISTORY ============ */}
+        {tab==='history' && (
+          <div>
+            <div className="page-title">Watch History</div>
+            <div style={{display:'flex',gap:'.75rem',marginBottom:'1.25rem',flexWrap:'wrap',alignItems:'center'}}>
+              <select className="form-select" style={{width:'auto',minWidth:'160px'}} value={histUser} onChange={e=>setHistUser(e.target.value)}>
+                <option value="">All users</option>
+                {tautulliUsers.map((u,i)=><option key={i} value={u.user_id}>{u.friendly_name||u.username}</option>)}
+              </select>
+              <input type="text" className="form-input" placeholder="Search content..." style={{width:'280px'}} value={histSearch} onChange={e=>setHistSearch(e.target.value)} onKeyPress={e=>e.key==='Enter'&&loadHistory()}/>
+              <button className="btn btn-primary btn-sm" onClick={loadHistory}>Apply Filters</button>
+            </div>
+            <div className="card" style={{padding:0,overflow:'hidden'}}>
+              <table className="hist-table">
+                <thead><tr><th>Date</th><th>User</th><th>Content</th><th>IP</th><th>Device</th><th>Duration</th></tr></thead>
+                <tbody>
+                  {history.length===0 ? (
+                    <tr><td colSpan="6" style={{textAlign:'center',padding:'2rem',color:'#94a3b8'}}>No history data. Try clicking Apply Filters.</td></tr>
+                  ) : history.map((h,i)=>(
+                    <tr key={i}>
+                      <td>{h.date_formatted||new Date(h.date*1000).toLocaleString()}</td>
+                      <td>{h.friendly_name||h.user}</td>
+                      <td>{h.full_title||h.title}</td>
+                      <td>{h.ip_address}</td>
+                      <td>{h.player}</td>
+                      <td>{h.duration_formatted||fmt(h.duration)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* ============ SYSTEM ============ */}
+        {tab==='system' && (
+          <div>
+            <div className="page-title">System Information</div>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'1.25rem',marginBottom:'1.25rem'}}>
+              <div className="card">
+                <div className="card-title" style={{marginBottom:'1rem'}}>📡 Plex Server</div>
+                {[
+                  ['Status', status?.online?'🟢 Online':'🔴 Offline'],
+                  ['Name', status?.friendlyName||'Unknown'],
+                  ['Version', status?.version||'Unknown'],
+                  ['Platform', status?.platform||'Unknown'],
+                  ['Local IP', status?.localIP||'Unknown'],
+                  ['Libraries', status?.libraryCount||0],
+                ].map(([l,v],i)=>(
+                  <div key={i} className="info-row">
+                    <span className="info-label">{l}</span>
+                    <span className="info-val">{v}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="card">
+                <div className="card-title" style={{marginBottom:'1rem'}}>📚 Libraries</div>
+                {(status?.libraries||[]).map((lib,i)=>(
+                  <div key={i} className="info-row">
+                    <span className="info-label">{lib.title}</span>
+                    <span className="info-val">{lib.type} • {lib.count} items</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            {dockerRes?.disks && (
+              <div className="card">
+                <div className="card-title" style={{marginBottom:'1rem'}}>💾 Docker Container Disks</div>
+                {dockerRes.disks.filter(d=>d.total>0).slice(0,5).map((d,i)=>(
+                  <div key={i} style={{marginBottom:'1.1rem'}}>
+                    <div style={{display:'flex',justifyContent:'space-between',marginBottom:'.35rem',fontSize:'.85rem'}}>
+                      <span style={{fontWeight:600}}>{d.mount}</span>
+                      <span style={{color:d.percentage>90?'#ef4444':d.percentage>75?'#f59e0b':'#10b981'}}>{d.percentage}% used</span>
+                    </div>
+                    <div className="progress-wrap" style={{height:'10px'}}>
+                      <div className="progress-bar" style={{width:`${d.percentage}%`,background:d.percentage>90?'#ef4444':d.percentage>75?'#f59e0b':undefined}}/>
+                    </div>
+                    <div style={{fontSize:'.75rem',color:'#94a3b8',marginTop:'.3rem'}}>{d.used}GB used / {d.free}GB free / {d.total}GB total</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ============ TOOLS ============ */}
+        {tab==='tools' && (
+          <div>
+            <div className="page-title">Tools & Utilities</div>
+            <div className="tool-grid">
+              {[
+                {icon:'📊',title:'Unwatched Report',desc:'Generate reports of unwatched content by library',action:()=>setUnwatchedModal(true)},
+                {icon:'📸',title:'System Snapshot',desc:'Download current system status as JSON',action:async()=>{
+                  const r=await fetch('/api/docker/resources').then(x=>x.json());
+                  const s=await fetch('/api/plex/status').then(x=>x.json());
+                  const blob=new Blob([JSON.stringify({timestamp:new Date(),plex:s,docker:r},null,2)],{type:'application/json'});
+                  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`plex-snapshot-${Date.now()}.json`;a.click();
+                  showToast('Snapshot downloaded!');
+                }},
+                {icon:'🧹',title:'Watch History Cleaner',desc:'Coming soon: Fix Continue Watching issues',action:()=>showToast('Feature coming soon','warn')},
+                {icon:'📅',title:'Date Added Editor',desc:'Coming soon: Change date added for items',action:()=>showToast('Feature coming soon','warn')},
+                {icon:'👥',title:'Copy Watch History',desc:'Coming soon: Copy watched status between users',action:()=>showToast('Feature coming soon','warn')},
+                {icon:'📈',title:'Analytics Export',desc:'Coming soon: Export statistics to CSV/JSON',action:()=>showToast('Feature coming soon','warn')}
+              ].map((t,i)=>(
+                <div key={i} className="tool-card" onClick={t.action}>
+                  <div className="tool-icon">{t.icon}</div>
+                  <div className="tool-title">{t.title}</div>
+                  <div className="tool-desc">{t.desc}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* ============ SECURITY ============ */}
+        {tab==='security' && currentUser?.role==='admin' && (
+          <div>
+            <div className="page-title">Security Monitor</div>
+            <div className="toggle" style={{marginBottom:'1.5rem'}}>
+              <button className={`toggle-opt ${secView==='live'?'active':''}`} onClick={()=>{setSecView('live');loadSecLive();}}>Live Connections</button>
+              <button className={`toggle-opt ${secView==='history'?'active':''}`} onClick={()=>{setSecView('history');loadSecHistory();}}>Connection History</button>
+              <button className={`toggle-opt ${secView==='blocked'?'active':''}`} onClick={()=>{setSecView('blocked');loadSecBlocked();}}>Blocked ({secBlocked.length})</button>
+            </div>
+
+            {secView==='live' && (
+              <div>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'1rem'}}>
+                  <div style={{fontSize:'.85rem',color:'#94a3b8'}}>{secLive.length} active connection{secLive.length!==1?'s':''}</div>
+                  <button className="btn-sm btn-outline" onClick={loadSecLive}>Refresh</button>
+                </div>
+                {secLive.length===0 ? <div className="empty">No active connections</div> : (
+                  <div>
+                    {secLive.map((c,i) => (
+                      <div key={i} className="stream-card" style={{display:'flex',alignItems:'center',gap:'1rem',flexWrap:'wrap'}}>
+                        <div className="avatar">{c.user[0]?.toUpperCase()}</div>
+                        <div style={{flex:1,minWidth:'150px'}}>
+                          <div style={{fontWeight:600,fontSize:'.9rem'}}>{c.user}</div>
+                          <div style={{fontSize:'.75rem',color:'#94a3b8'}}>{c.content}</div>
+                        </div>
+                        <div style={{minWidth:'100px'}}>
+                          <div style={{fontSize:'.8rem',fontWeight:500}}>{c.ip}</div>
+                          <div style={{fontSize:'.7rem',color:'#94a3b8'}}>{c.device} / {c.platform}</div>
+                        </div>
+                        <div style={{minWidth:'120px'}}>
+                          <div style={{fontSize:'.8rem'}}>{c.geo?.country || 'Unknown'}</div>
+                          <div style={{fontSize:'.7rem',color:'#94a3b8'}}>{c.geo?.city || ''} {c.geo?.isp ? `(${c.geo.isp})` : ''}</div>
+                        </div>
+                        <div style={{display:'flex',gap:'.3rem',flexWrap:'wrap'}}>
+                          <span className={`status-badge ${c.state==='playing'?'status-approved':'status-pending'}`}>{c.state}</span>
+                          <span className="status-badge status-available">{c.quality}</span>
+                          {c.transcoding && <span className="status-badge status-pending">Transcode</span>}
+                        </div>
+                        <div style={{display:'flex',gap:'.3rem'}}>
+                          <button className="btn-sm btn-delete" onClick={()=>setBlockModal({type:'user',value:c.user})} title="Block User">Block User</button>
+                          <button className="btn-sm btn-delete" onClick={()=>setBlockModal({type:'ip',value:c.ip})} title="Block IP">Block IP</button>
+                          <button className="btn-sm btn-delete" onClick={()=>setBlockModal({type:'device',value:c.device})} title="Block Device">Block Device</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {secView==='history' && (
+              <div>
+                <div style={{display:'flex',gap:'.5rem',marginBottom:'1rem',alignItems:'center'}}>
+                  <span style={{fontSize:'.85rem',color:'#94a3b8'}}>Show last</span>
+                  <select className="form-select" style={{width:'auto'}} value={secDaysFilter} onChange={e=>{setSecDaysFilter(e.target.value);setTimeout(loadSecHistory,100);}}>
+                    <option value={1}>24 hours</option><option value={3}>3 days</option><option value={7}>7 days</option><option value={30}>30 days</option><option value={90}>90 days</option>
+                  </select>
+                  <button className="btn-sm btn-outline" onClick={loadSecHistory}>Load</button>
+                </div>
+                {secHistory.length===0 ? <div className="empty">No connection history found</div> : (
+                  <table className="hist-table">
+                    <thead><tr><th>User</th><th>IP</th><th>Device</th><th>Location</th><th>Content</th><th>Last Seen</th><th>Actions</th></tr></thead>
+                    <tbody>
+                      {secHistory.map((c,i) => (
+                        <tr key={i}>
+                          <td style={{fontWeight:600}}>{c.plex_user}</td>
+                          <td>{c.ip_address}</td>
+                          <td>{c.device} <span style={{color:'#64748b'}}>({c.platform})</span></td>
+                          <td>{c.geo_country || ''} {c.geo_city || ''}</td>
+                          <td style={{maxWidth:'200px',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{c.content_title}</td>
+                          <td>{c.last_seen ? ago(c.last_seen) : ''}</td>
+                          <td>
+                            <div style={{display:'flex',gap:'.3rem'}}>
+                              <button className="btn-sm btn-delete" onClick={()=>setBlockModal({type:'ip',value:c.ip_address})}>Block IP</button>
+                              <button className="btn-sm btn-delete" onClick={()=>setBlockModal({type:'user',value:c.plex_user})}>Block User</button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            )}
+
+            {secView==='blocked' && (
+              <div>
+                {secBlocked.length===0 ? <div className="empty">No blocked entities</div> : (
+                  <div>
+                    {secBlocked.map(b => (
+                      <div key={b.id} className="stream-card" style={{display:'flex',alignItems:'center',gap:'1rem'}}>
+                        <span className={`status-badge ${b.entity_type==='ip'?'status-declined':b.entity_type==='user'?'status-pending':'status-available'}`}>{b.entity_type.toUpperCase()}</span>
+                        <div style={{flex:1}}>
+                          <div style={{fontWeight:600}}>{b.entity_value}</div>
+                          <div style={{fontSize:'.75rem',color:'#94a3b8'}}>{b.reason || 'No reason'} — blocked by {b.blocked_by} {b.created_at ? ago(b.created_at) : ''}</div>
+                        </div>
+                        <button className="btn-sm btn-approve" onClick={()=>doUnblock(b.id)}>Unblock</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Block confirmation modal */}
+        {blockModal && (
+          <div className="overlay" onClick={()=>setBlockModal(null)}>
+            <div className="modal" onClick={e=>e.stopPropagation()} style={{width:'400px'}}>
+              <div className="modal-head">
+                <div className="modal-title">Block {blockModal.type}: {blockModal.value}</div>
+                <button className="modal-close" onClick={()=>setBlockModal(null)}>x</button>
+              </div>
+              <p style={{fontSize:'.85rem',color:'#94a3b8',marginBottom:'1rem'}}>This will immediately terminate any active sessions and prevent future connections from this {blockModal.type}.</p>
+              <div className="form-row">
+                <label className="form-label">Reason (optional)</label>
+                <input className="form-input" value={blockReason} onChange={e=>setBlockReason(e.target.value)} placeholder="e.g. Unauthorized access"/>
+              </div>
+              <div style={{display:'flex',gap:'.5rem'}}>
+                <button className="btn btn-primary" style={{flex:1,background:'linear-gradient(135deg,#ef4444,#dc2626)'}} onClick={doBlock}>Confirm Block</button>
+                <button className="btn btn-outline" style={{flex:1}} onClick={()=>setBlockModal(null)}>Cancel</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ============ ADMIN - USER MANAGEMENT ============ */}
+        {tab==='admin' && currentUser?.role==='admin' && (
+          <div>
+            <div className="page-title">
+              User Management
+              <button className="btn btn-primary" onClick={()=>setAdminUserModal(true)}>+ Create User</button>
+            </div>
+            {adminUsers.length===0 ? <div className="empty">No users found</div> : (
+              <div>
+                {adminUsers.map(u => (
+                  <div key={u.id} className="user-mgmt-row">
+                    {u.plex_thumb ? <img src={u.plex_thumb} style={{width:36,height:36,borderRadius:'50%'}}/> : <div className="avatar" style={{width:36,height:36}}>{u.username?.[0]?.toUpperCase()}</div>}
+                    <div style={{flex:1}}>
+                      <div style={{fontWeight:600,fontSize:'.9rem'}}>{u.username} {u.id===currentUser?.id && <span style={{color:'#60a5fa',fontSize:'.75rem'}}>(you)</span>}</div>
+                      <div style={{fontSize:'.75rem',color:'#94a3b8'}}>{u.is_plex_user ? 'Plex user' : 'Local user'} {u.plex_email ? `• ${u.plex_email}` : ''} {u.last_login ? `• Last login: ${ago(u.last_login)}` : ''}</div>
+                    </div>
+                    <span className={`status-badge ${u.role==='admin'?'status-approved':'status-available'}`}>{u.role}</span>
+                    <span className={`status-badge ${u.enabled?'status-approved':'status-declined'}`}>{u.enabled?'Active':'Disabled'}</span>
+                    {u.id !== currentUser?.id && (
+                      <div style={{display:'flex',gap:'.4rem'}}>
+                        <button className="btn-sm btn-outline" onClick={()=>toggleUserEnabled(u.id, u.enabled)}>{u.enabled?'Disable':'Enable'}</button>
+                        <button className="btn-sm btn-delete" onClick={()=>deleteUser(u.id)}>Delete</button>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Admin Create User Modal */}
+        {adminUserModal && (
+          <div className="overlay" onClick={()=>setAdminUserModal(false)}>
+            <div className="modal" onClick={e=>e.stopPropagation()} style={{width:'400px'}}>
+              <div className="modal-head">
+                <div className="modal-title">Create Local User</div>
+                <button className="modal-close" onClick={()=>setAdminUserModal(false)}>×</button>
+              </div>
+              <div className="form-row">
+                <label className="form-label">Username</label>
+                <input className="form-input" value={newUser.username} onChange={e=>setNewUser({...newUser,username:e.target.value})}/>
+              </div>
+              <div className="form-row">
+                <label className="form-label">Password</label>
+                <input className="form-input" type="password" value={newUser.password} onChange={e=>setNewUser({...newUser,password:e.target.value})}/>
+              </div>
+              <div className="form-row">
+                <label className="form-label">Role</label>
+                <select className="form-select" value={newUser.role} onChange={e=>setNewUser({...newUser,role:e.target.value})}>
+                  <option value="viewer">Viewer</option>
+                  <option value="admin">Admin</option>
+                </select>
+              </div>
+              <button className="btn btn-primary" style={{width:'100%'}} onClick={createUser}>Create User</button>
+            </div>
+          </div>
+        )}
+
+        {/* ============ LIVE TV ============ */}
+        {tab==='livetv' && (
+          <div>
+            <div className="page-title">
+              <span>Virtual Linear TV</span>
+              <div style={{display:'flex',gap:'.5rem',alignItems:'center'}}>
+                <div className="toggle">
+                  <button className={`toggle-opt ${ltvView==='nowplaying'?'active':''}`} onClick={()=>setLtvView('nowplaying')}>Now Playing</button>
+                  <button className={`toggle-opt ${ltvView==='guide'?'active':''}`} onClick={()=>{setLtvView('guide');loadLtvGuide();}}>TV Guide</button>
+                  <button className={`toggle-opt ${ltvView==='channels'?'active':''}`} onClick={()=>setLtvView('channels')}>Channels</button>
+                  <button className={`toggle-opt ${ltvView==='fillers'?'active':''}`} onClick={()=>setLtvView('fillers')}>Fillers</button>
+                  <button className={`toggle-opt ${ltvView==='setup'?'active':''}`} onClick={()=>setLtvView('setup')}>Setup</button>
+                </div>
+                <button className="btn btn-primary" onClick={ltvScan} disabled={ltvScanning}>{ltvScanning?'Scanning...':'Scan Libraries'}</button>
+              </div>
+            </div>
+
+            {/* --- NOW PLAYING --- */}
+            {ltvView==='nowplaying' && (
+              <div>
+                {ltvNowPlaying.length===0 ? (
+                  <div className="empty">No channels configured. Go to Channels tab to create one, or click "Scan Libraries" first.</div>
+                ) : (
+                  <div className="grid">
+                    {ltvNowPlaying.map(np => (
+                      <div key={np.channel.id} className="card" style={{position:'relative'}}>
+                        <div className="card-header">
+                          <div className="card-title" style={{fontSize:'.8rem'}}>
+                            <span style={{background:'linear-gradient(135deg,#3b82f6,#8b5cf6)',padding:'.15rem .5rem',borderRadius:'4px',fontSize:'.75rem',fontWeight:700}}>CH {np.channel.number}</span>
+                            {np.channel.name}
+                          </div>
+                          <span style={{fontSize:'.7rem',color:'#94a3b8'}}>{np.channel.category}</span>
+                        </div>
+                        {np.onAir === false ? (
+                          <div style={{textAlign:'center',padding:'1.5rem .5rem'}}>
+                            <div style={{fontSize:'1.5rem',marginBottom:'.5rem',opacity:.5}}>Off Air</div>
+                            <div style={{fontSize:'.8rem',color:'#60a5fa'}}>
+                              {np.nextOnAirTime ? `Resumes ${new Date(np.nextOnAirTime).toLocaleString([], {weekday:'short',hour:'numeric',minute:'2-digit'})}` : 'No schedule set'}
+                            </div>
+                          </div>
+                        ) : np.current ? (
+                          <div>
+                            <div style={{display:'flex',gap:'.75rem',marginBottom:'.75rem'}}>
+                              {np.current.thumb ? (
+                                <img src={np.current.thumb} style={{width:'70px',height:'100px',borderRadius:'6px',objectFit:'cover'}} alt=""/>
+                              ) : (
+                                <div style={{width:'70px',height:'100px',borderRadius:'6px',background:'linear-gradient(135deg,#1e3a5f,#2d1f6e)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'1.5rem'}}>
+                                  {np.current.type==='filler'?'🎬':'📺'}
+                                </div>
+                              )}
+                              <div style={{flex:1,minWidth:0}}>
+                                <div style={{fontWeight:600,fontSize:'.9rem',marginBottom:'.2rem',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>
+                                  {np.current.title}
+                                </div>
+                                {np.current.showTitle && <div style={{fontSize:'.75rem',color:'#a78bfa',marginBottom:'.2rem'}}>{np.current.showTitle}</div>}
+                                {np.current.seasonNum && <div style={{fontSize:'.7rem',color:'#94a3b8'}}>S{String(np.current.seasonNum).padStart(2,'0')}E{String(np.current.episodeNum).padStart(2,'0')}</div>}
+                                <div style={{fontSize:'.7rem',color:'#94a3b8',marginTop:'.3rem'}}>
+                                  {np.current.genre && <span>{np.current.genre.split(',')[0]}</span>}
+                                  {np.current.year && <span> ({np.current.year})</span>}
+                                </div>
+                              </div>
+                            </div>
+                            <div className="progress-wrap">
+                              <div className="progress-bar" style={{width:`${np.current.progress}%`}}></div>
+                            </div>
+                            <div style={{display:'flex',justifyContent:'space-between',fontSize:'.7rem',color:'#94a3b8',marginTop:'.25rem'}}>
+                              <span>{fmt(Math.floor(np.current.offsetMs/1000))}</span>
+                              <span>{fmt(Math.floor(np.current.remainingMs/1000))} remaining</span>
+                            </div>
+                            {np.next && (
+                              <div style={{marginTop:'.6rem',padding:'.5rem',background:'rgba(15,23,42,.5)',borderRadius:'6px',fontSize:'.75rem'}}>
+                                <span style={{color:'#94a3b8'}}>Up Next:</span> <span style={{fontWeight:500}}>{np.next.title}</span>
+                                {np.next.showTitle && <span style={{color:'#a78bfa'}}> ({np.next.showTitle})</span>}
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="empty" style={{padding:'1rem'}}>No programming</div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* --- TV GUIDE --- */}
+            {ltvView==='guide' && (
+              <div style={{overflowX:'auto'}}>
+                {ltvGuide.length===0 ? (
+                  <div className="empty">No guide data available. Create channels first.</div>
+                ) : (
+                  <div style={{minWidth:'900px'}}>
+                    {(() => {
+                      const now = Date.now();
+                      const guideStart = now - 1800000;
+                      const guideEnd = now + 6*3600000;
+                      const totalMs = guideEnd - guideStart;
+                      const hourMarkers = [];
+                      const startHour = new Date(guideStart);
+                      startHour.setMinutes(0,0,0);
+                      for (let t = startHour.getTime(); t < guideEnd; t += 3600000) {
+                        if (t >= guideStart) hourMarkers.push(t);
+                      }
+                      return (
+                        <div>
+                          {/* Time header */}
+                          <div style={{display:'flex',marginLeft:'140px',position:'relative',height:'30px',borderBottom:'1px solid rgba(100,116,139,.2)',marginBottom:'2px'}}>
+                            {hourMarkers.map(t => (
+                              <div key={t} style={{position:'absolute',left:`${((t-guideStart)/totalMs)*100}%`,fontSize:'.7rem',color:'#94a3b8',borderLeft:'1px solid rgba(100,116,139,.2)',paddingLeft:'4px',height:'100%'}}>
+                                {new Date(t).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}
+                              </div>
+                            ))}
+                            {/* Current time marker */}
+                            <div style={{position:'absolute',left:`${((now-guideStart)/totalMs)*100}%`,width:'2px',height:'100%',background:'#ef4444',zIndex:10}}/>
+                          </div>
+                          {/* Channel rows */}
+                          {ltvGuide.map(g => (
+                            <div key={g.channel.id} style={{display:'flex',marginBottom:'2px',height:'60px'}}>
+                              <div style={{width:'140px',flexShrink:0,display:'flex',alignItems:'center',gap:'.5rem',padding:'.5rem',background:'rgba(15,23,42,.6)',borderRadius:'6px 0 0 6px',borderRight:'1px solid rgba(100,116,139,.2)'}}>
+                                <span style={{background:'linear-gradient(135deg,#3b82f6,#8b5cf6)',padding:'.1rem .4rem',borderRadius:'3px',fontSize:'.65rem',fontWeight:700}}>{g.channel.number}</span>
+                                <span style={{fontSize:'.75rem',fontWeight:500,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{g.channel.name}</span>
+                              </div>
+                              <div style={{flex:1,position:'relative',overflow:'hidden',background:'rgba(15,23,42,.3)',borderRadius:'0 6px 6px 0'}}>
+                                {g.programs.map((p, i) => {
+                                  const pStart = Math.max(p.startMs || new Date(p.start).getTime(), guideStart);
+                                  const pEnd = Math.min(p.stopMs || new Date(p.stop).getTime(), guideEnd);
+                                  if (pEnd <= guideStart || pStart >= guideEnd) return null;
+                                  const left = ((pStart - guideStart) / totalMs) * 100;
+                                  const width = ((pEnd - pStart) / totalMs) * 100;
+                                  const isNow = pStart <= now && pEnd > now;
+                                  return (
+                                    <div key={i} title={`${p.title}${p.showTitle?' - '+p.showTitle:''}\n${new Date(p.start).toLocaleTimeString()} - ${new Date(p.stop).toLocaleTimeString()}`}
+                                      style={{position:'absolute',left:`${left}%`,width:`${width}%`,height:'100%',
+                                        background:isNow?'rgba(59,130,246,.25)': p.type==='filler'?'rgba(139,92,246,.15)':'rgba(15,23,42,.5)',
+                                        border:`1px solid ${isNow?'rgba(59,130,246,.5)':'rgba(100,116,139,.15)'}`,
+                                        borderRadius:'3px',padding:'.25rem .4rem',overflow:'hidden',cursor:'default',
+                                        display:'flex',flexDirection:'column',justifyContent:'center'}}>
+                                      <div style={{fontSize:'.7rem',fontWeight:600,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{p.title}</div>
+                                      {p.showTitle && <div style={{fontSize:'.6rem',color:'#a78bfa',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{p.showTitle}</div>}
+                                      <div style={{fontSize:'.6rem',color:'#94a3b8'}}>{new Date(p.start).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</div>
+                                    </div>
+                                  );
+                                })}
+                                {/* Current time line */}
+                                <div style={{position:'absolute',left:`${((now-guideStart)/totalMs)*100}%`,width:'2px',height:'100%',background:'#ef4444',zIndex:5}}/>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      );
+                    })()}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* --- CHANNELS MANAGEMENT --- */}
+            {ltvView==='channels' && (
+              <div>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'1rem'}}>
+                  <div style={{fontSize:'.85rem',color:'#94a3b8'}}>{ltvChannels.length} channel{ltvChannels.length!==1?'s':''}</div>
+                  <div style={{display:'flex',gap:'.5rem'}}>
+                    <button className="btn btn-primary" style={{background:'linear-gradient(135deg,#10b981,#059669)'}} onClick={()=>{setLtvAutoBuild(true);setLtvABPreview(null);}}>Auto Build Channel</button>
+                    <button className="btn btn-primary" onClick={()=>setLtvChannelModal('new')}>+ Manual Channel</button>
+                  </div>
+                </div>
+                {ltvChannels.length===0 ? (
+                  <div className="empty">No channels yet. Click "Scan Libraries" first, then create a channel.</div>
+                ) : (
+                  <div>
+                    {ltvChannels.map(ch => (
+                      <div key={ch.id} className="stream-card" style={{display:'flex',alignItems:'center',gap:'1rem'}}>
+                        <div style={{width:'50px',height:'50px',borderRadius:'8px',background:'linear-gradient(135deg,#1e3a5f,#2d1f6e)',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0}}>
+                          <span style={{fontWeight:700,fontSize:'1.1rem'}}>{ch.number}</span>
+                        </div>
+                        <div style={{flex:1,minWidth:0}}>
+                          <div style={{fontWeight:600,fontSize:'.95rem'}}>{ch.name}</div>
+                          <div style={{fontSize:'.75rem',color:'#94a3b8'}}>
+                            {ch.source_type}: {ch.source_value} | {ch.programCount} items
+                            {ch.currentProgram && <span> | Now: {ch.currentProgram.item?.prog_title || ch.currentProgram.item?.filler_name || '?'}</span>}
+                          </div>
+                        </div>
+                        <div style={{display:'flex',gap:'.4rem',flexShrink:0}}>
+                          <button className={`btn-sm ${ch.enabled?'btn-approve':'btn-decline'}`} onClick={()=>ltvToggleChannel(ch)}>
+                            {ch.enabled?'Enabled':'Disabled'}
+                          </button>
+                          <button className="btn-sm btn-outline" onClick={()=>ltvRebuildChannel(ch.id)}>Rebuild</button>
+                          <button className="btn-sm btn-outline" onClick={()=>setLtvRuleModal(ch.id)}>Rules</button>
+                          <button className="btn-sm btn-delete" onClick={()=>ltvDeleteChannel(ch.id)}>Delete</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* --- FILLERS --- */}
+            {ltvView==='fillers' && (
+              <div>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'1rem'}}>
+                  <div style={{fontSize:'.85rem',color:'#94a3b8'}}>{ltvFillers.length} filler{ltvFillers.length!==1?'s':''}</div>
+                  <div style={{display:'flex',gap:'.5rem'}}>
+                    <button className="btn btn-primary" onClick={()=>{setYtModal(true);ytLoadDownloads();}}>Download from YouTube</button>
+                    <button className="btn btn-primary" onClick={ltvScanTrailers}>Scan Trailers from Plex</button>
+                  </div>
+                </div>
+
+                {/* Active Downloads */}
+                {ytDownloads.filter(d=>d.status==='downloading'||d.status==='processing'||d.status==='pending').length > 0 && (
+                  <div style={{marginBottom:'1.5rem'}}>
+                    <div style={{fontSize:'.85rem',fontWeight:600,marginBottom:'.5rem'}}>Active Downloads</div>
+                    {ytDownloads.filter(d=>d.status!=='done'&&d.status!=='error').map(d => (
+                      <div key={d.id} className="stream-card" style={{display:'flex',alignItems:'center',gap:'1rem'}}>
+                        <div style={{width:'40px',height:'40px',borderRadius:'8px',background:'rgba(239,68,68,.2)',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0,fontSize:'1.2rem'}}>⬇️</div>
+                        <div style={{flex:1}}>
+                          <div style={{fontWeight:500,fontSize:'.85rem'}}>{d.title || d.url}</div>
+                          <div style={{fontSize:'.7rem',color:'#94a3b8'}}>{d.quality} | {d.status}</div>
+                          <div className="progress-wrap" style={{marginTop:'.3rem'}}>
+                            <div className="progress-bar" style={{width:`${d.progress}%`}}></div>
+                          </div>
+                        </div>
+                        <span style={{fontSize:'.8rem',fontWeight:700}}>{d.progress}%</span>
+                        <button className="btn-sm btn-delete" onClick={()=>ytCancelDownload(d.id)}>Cancel</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Recently completed/failed */}
+                {ytDownloads.filter(d=>d.status==='done'||d.status==='error').length > 0 && (
+                  <div style={{marginBottom:'1.5rem'}}>
+                    <div style={{fontSize:'.85rem',fontWeight:600,marginBottom:'.5rem',color:'#94a3b8'}}>Recent Downloads</div>
+                    {ytDownloads.filter(d=>d.status==='done'||d.status==='error').slice(0,5).map(d => (
+                      <div key={d.id} className="stream-card" style={{display:'flex',alignItems:'center',gap:'1rem',opacity: d.status==='error'?.6:1}}>
+                        <span className={`status-badge ${d.status==='done'?'status-approved':'status-declined'}`}>{d.status}</span>
+                        <div style={{flex:1}}>
+                          <div style={{fontWeight:500,fontSize:'.85rem'}}>{d.title || 'Unknown'}</div>
+                          <div style={{fontSize:'.7rem',color:'#94a3b8'}}>
+                            {d.status==='done' ? `${d.quality} | ${d.file_size_bytes ? fmtBytes(d.file_size_bytes) : ''} | ${d.duration_ms ? fmt(Math.floor(d.duration_ms/1000)) : ''}` : d.error_msg || 'Failed'}
+                          </div>
+                        </div>
+                        <button className="btn-sm btn-delete" onClick={()=>ytCancelDownload(d.id)}>Remove</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {ltvFillers.length===0 ? (
+                  <div className="empty">No fillers. Click "Scan Trailers from Plex" or "Download from YouTube" to add filler content.</div>
+                ) : (
+                  <div>
+                    {ltvFillers.map(f => (
+                      <div key={f.id} className="stream-card" style={{display:'flex',alignItems:'center',gap:'1rem'}}>
+                        <div style={{width:'40px',height:'40px',borderRadius:'8px',background:f.type==='youtube'?'rgba(239,68,68,.2)':'rgba(139,92,246,.2)',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0,fontSize:'1.2rem'}}>
+                          {f.type==='youtube'?'▶️':f.type==='trailer'?'🎬':f.type==='bumper'?'📺':f.type==='preroll'?'🎞️':'📢'}
+                        </div>
+                        <div style={{flex:1}}>
+                          <div style={{fontWeight:500,fontSize:'.85rem'}}>{f.name}</div>
+                          <div style={{fontSize:'.7rem',color:'#94a3b8'}}>{f.type} | {fmt(Math.floor(f.duration_ms/1000))}{f.local_path ? ' | Local file' : ''}</div>
+                        </div>
+                        <button className="btn-sm btn-delete" onClick={()=>ltvDeleteFiller(f.id)}>Delete</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* --- SETUP / TUNER INSTRUCTIONS --- */}
+            {ltvView==='setup' && (
+              <div>
+                <div className="card" style={{maxWidth:'700px',margin:'0 auto'}}>
+                  <div className="card-header"><div className="card-title">Tuner Setup Instructions</div></div>
+                  <div style={{fontSize:'.85rem',lineHeight:1.7}}>
+                    <p style={{marginBottom:'1rem'}}>This app emulates an HDHomeRun tuner device. Plex will discover it automatically or you can enter the address manually.</p>
+
+                    <div style={{marginBottom:'1.25rem'}}>
+                      <div className="form-label" style={{fontWeight:700}}>Tuner Device URL (enter this in Plex)</div>
+                      <div style={{display:'flex',gap:'.5rem'}}>
+                        <input className="form-input" readOnly value={`${window.location.origin}`} onClick={e=>e.target.select()} style={{fontWeight:600}}/>
+                        <button className="btn btn-primary" onClick={()=>{navigator.clipboard.writeText(`${window.location.origin}`);showToast('Copied!');}}>Copy</button>
+                      </div>
+                    </div>
+
+                    <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'1rem',marginBottom:'1.25rem'}}>
+                      <div>
+                        <div className="form-label" style={{fontSize:'.75rem'}}>M3U URL (optional/manual)</div>
+                        <div style={{display:'flex',gap:'.4rem'}}>
+                          <input className="form-input" readOnly value={`${window.location.origin}/api/livetv/m3u`} onClick={e=>e.target.select()} style={{fontSize:'.75rem'}}/>
+                          <button className="btn-sm btn-outline" onClick={()=>{navigator.clipboard.writeText(`${window.location.origin}/api/livetv/m3u`);showToast('Copied!');}}>Copy</button>
+                        </div>
+                      </div>
+                      <div>
+                        <div className="form-label" style={{fontSize:'.75rem'}}>XMLTV Guide URL</div>
+                        <div style={{display:'flex',gap:'.4rem'}}>
+                          <input className="form-input" readOnly value={`${window.location.origin}/api/livetv/xmltv`} onClick={e=>e.target.select()} style={{fontSize:'.75rem'}}/>
+                          <button className="btn-sm btn-outline" onClick={()=>{navigator.clipboard.writeText(`${window.location.origin}/api/livetv/xmltv`);showToast('Copied!');}}>Copy</button>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="alert-box alert-info" style={{marginBottom:'1rem'}}>
+                      <strong>Tailscale users:</strong> If Plex runs on a different machine, use your Tailscale IP: <code>http://100.x.x.x:3001</code>
+                    </div>
+
+                    <div style={{marginBottom:'.5rem',fontWeight:600}}>Steps to Add to Plex:</div>
+                    <ol style={{paddingLeft:'1.5rem',color:'#94a3b8'}}>
+                      <li style={{marginBottom:'.4rem'}}>Go to Plex Settings &gt; <strong>Live TV & DVR</strong></li>
+                      <li style={{marginBottom:'.4rem'}}>Click <strong>"Set Up Plex DVR"</strong> or add a new device</li>
+                      <li style={{marginBottom:'.4rem'}}>Plex will scan for devices. If not found, click <strong>"Don't see your HDHomeRun device? Enter its network address manually"</strong></li>
+                      <li style={{marginBottom:'.4rem'}}>Paste the <strong>Tuner Device URL</strong> above</li>
+                      <li style={{marginBottom:'.4rem'}}>Plex will detect <strong>"Plex Command Center LiveTV"</strong> with your channels</li>
+                      <li style={{marginBottom:'.4rem'}}>For the <strong>Program Guide</strong>, select "XMLTV" and paste the XMLTV URL</li>
+                      <li>Map the channels and you're done!</li>
+                    </ol>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </main>
+
+      {/* ============ SERVER DETAILS MODAL ============ */}
+      {serverModal && (
+        <div className="overlay" onClick={()=>setServerModal(false)}>
+          <div className="modal wide" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">🖥️ {status?.friendlyName || 'Server Details'}</div>
+              <button className="modal-close" onClick={()=>setServerModal(false)}>✕</button>
+            </div>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'1rem',marginBottom:'1.25rem'}}>
+              {[
+                ['Status', status?.online?'🟢 Online':'🔴 Offline'],
+                ['Server Name', status?.friendlyName||'Unknown'],
+                ['Version', status?.version||'Unknown'],
+                ['Platform', `${status?.platform||'?'} ${status?.platformVersion||''}`],
+                ['Local IP', status?.localIP||'Unknown'],
+                ['Tailscale IP', status?.tailscaleIP||'Check Zabbix'],
+                ['Libraries', `${status?.libraryCount||0} libraries`],
+                ['Active Streams', streams.length],
+              ].map(([l,v],i)=>(
+                <div key={i} style={{padding:'.9rem',background:'rgba(15,23,42,.5)',borderRadius:'8px'}}>
+                  <div style={{fontSize:'.75rem',color:'#94a3b8',marginBottom:'.25rem'}}>{l}</div>
+                  <div style={{fontWeight:700,fontSize:'1rem'}}>{v}</div>
+                </div>
+              ))}
+            </div>
+            <div className="modal-title" style={{fontSize:'1rem',marginBottom:'.75rem'}}>📚 Libraries</div>
+            {(status?.libraries||[]).map((lib,i)=>(
+              <div key={i} className="info-row">
+                <span style={{fontWeight:500}}>{lib.title}</span>
+                <span style={{color:'#94a3b8',fontSize:'.85rem'}}>{lib.type} • {lib.count} items</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ============ USER DETAILS MODAL ============ */}
+      {userModal && (
+        <div className="overlay" onClick={()=>setUserModal(null)}>
+          <div className="modal wide" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">👤 {userModal.friendly_name||userModal.username}</div>
+              <button className="modal-close" onClick={()=>setUserModal(null)}>✕</button>
+            </div>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'1rem'}}>
+              {[
+                ['Total Plays', userModal.total_plays||userModal.plays||0],
+                ['Total Watch Time', Math.round(((userModal.total_duration||userModal.duration)||0)/3600)+'h'],
+                ['Last Seen', userModal.last_seen?new Date(userModal.last_seen*1000).toLocaleString():'Never'],
+                ['Last Played', userModal.last_played||'Unknown'],
+                ['IP Address', userModal.ip_address||'Unknown'],
+                ['Platform', userModal.platform||'Unknown'],
+                ['Player', userModal.player||'Unknown'],
+                ['Server Owner', (userModal.is_home_user===1 || userModal.is_allow_sync===1)?'Yes':'No'],
+              ].map(([l,v],i)=>(
+                <div key={i} style={{padding:'.9rem',background:'rgba(15,23,42,.5)',borderRadius:'8px'}}>
+                  <div style={{fontSize:'.75rem',color:'#94a3b8',marginBottom:'.25rem'}}>{l}</div>
+                  <div style={{fontWeight:700}}>{v}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ============ ALL USERS MODAL ============ */}
+      {allUsersModal && (
+        <div className="overlay" onClick={()=>setAllUsersModal(false)}>
+          <div className="modal wide" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">👥 All Users ({topUsers.length})</div>
+              <button className="modal-close" onClick={()=>setAllUsersModal(false)}>✕</button>
+            </div>
+            {topUsers.map((u,i)=>(
+              <div key={i} className="user-row" onClick={()=>{setAllUsersModal(false);setUserModal(u);}}>
+                <div style={{width:'28px',height:'28px',borderRadius:'50%',background:'linear-gradient(135deg,#3b82f6,#8b5cf6)',display:'flex',alignItems:'center',justifyContent:'center',fontWeight:700,fontSize:'.8rem'}}>#{i+1}</div>
+                <div className="avatar" style={{width:'34px',height:'34px',fontSize:'.8rem'}}>
+                  {(u.friendly_name||u.username||'?')[0].toUpperCase()}
+                </div>
+                <div style={{flex:1}}>
+                  <div style={{fontWeight:600}}>{u.friendly_name||u.username}</div>
+                  <div style={{fontSize:'.75rem',color:'#94a3b8'}}>{u.total_plays||u.plays||0} plays • {Math.round(((u.total_duration||u.duration)||0)/3600)}h • Last: {u.last_seen?new Date(u.last_seen*1000).toLocaleDateString():'Never'}</div>
+                </div>
+                <span style={{color:'#60a5fa',fontWeight:700}}>{u.total_plays||u.plays||0} plays</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ============ JELLYSEERR SEARCH MODAL ============ */}
+      {jellyseerrModal && (
+        <div className="overlay" onClick={()=>setJellyseerrModal(false)}>
+          <div className="modal xl" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">🔍 Search & Request Media</div>
+              <button className="modal-close" onClick={()=>setJellyseerrModal(false)}>✕</button>
+            </div>
+            <div style={{display:'flex',gap:'.75rem',marginBottom:'1.25rem'}}>
+              <input className="form-input" placeholder="Search movies & TV shows..." value={searchQ}
+                onChange={e=>setSearchQ(e.target.value)} onKeyPress={e=>e.key==='Enter'&&searchJelly()} style={{flex:1}}/>
+              <button className="btn btn-primary" onClick={searchJelly} disabled={searching}>
+                {searching?'Searching...':'Search'}
+              </button>
+            </div>
+
+            {/* All Requests List */}
+            <div className="modal-title" style={{fontSize:'1rem',marginBottom:'.75rem'}}>All Requests</div>
+            <div style={{maxHeight:'200px',overflowY:'auto',marginBottom:'1.25rem'}}>
+              {requests.map((req,i)=>(
+                <div key={i} className="req-card">
+                  {req.posterPath
+                    ? <img src={req.posterPath} className="req-poster" alt="" onError={e=>e.target.style.display='none'}/>
+                    : <div className="req-poster-placeholder">{req.type==='movie'?'🎬':'📺'}</div>
+                  }
+                  <div className="req-info">
+                    <div className="req-title">{req.title}{req.year?` (${req.year})`:''}</div>
+                    <div className="req-meta">by {req.requestedBy} • {ago(req.createdAt)}</div>
+                  </div>
+                  <div className="req-actions">
+                    {req.status==='pending'?(
+                      <><button className="btn-sm btn-approve" onClick={()=>approveReq(req.id)}>✓ Approve</button>
+                      <button className="btn-sm btn-decline" onClick={()=>declineReq(req.id)}>✗ Decline</button></>
+                    ):<span className={`status-badge status-${req.status}`}>{req.status}</span>}
+                    <button className="btn-sm btn-delete" onClick={()=>deleteReq(req.id)}>🗑️</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Search Results */}
+            {searchRes.length > 0 && (
+              <>
+                <div className="modal-title" style={{fontSize:'1rem',marginBottom:'.75rem'}}>Search Results</div>
+                <div className="search-grid">
+                  {searchRes.map((r,i)=>(
+                    <div key={i} className="search-card">
+                      {r.posterPath
+                        ? <img src={`https://image.tmdb.org/t/p/w200${r.posterPath}`} className="search-poster" alt="" onError={e=>e.target.style.display='none'}/>
+                        : <div style={{width:'100%',aspectRatio:'2/3',background:'linear-gradient(135deg,#1e3a5f,#2d1f6e)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'2rem'}}>{r.mediaType==='movie'?'🎬':'📺'}</div>
+                      }
+                      <div className="search-info">
+                        <div className="search-title">{r.title||r.name}</div>
+                        <div className="search-meta">{r.mediaType} • {(r.releaseDate||r.firstAirDate||'').substring(0,4)}</div>
+                        {r.mediaInfo?.status === 5 ? (
+                          <div className="status-badge status-available" style={{width:'100%',textAlign:'center',padding:'.4rem',fontSize:'.75rem',marginTop:'.5rem'}}>✓ Available in Plex</div>
+                        ) : r.mediaInfo?.status === 3 || r.mediaInfo?.status === 4 ? (
+                          <div className="status-badge" style={{width:'100%',textAlign:'center',padding:'.4rem',fontSize:'.75rem',background:'#3b82f6',marginTop:'.5rem'}}>⏳ Requested</div>
+                        ) : (
+                          <button className="btn btn-primary" style={{width:'100%',padding:'.4rem',fontSize:'.75rem'}} onClick={()=>requestMedia(r)}>+ Request</button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ============ COLLECTION CREATOR MODAL ============ */}
+      {colModal && (
+        <div className="overlay" onClick={()=>setColModal(false)}>
+          <div className="modal" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">📚 Create Collection</div>
+              <button className="modal-close" onClick={()=>setColModal(false)}>✕</button>
+            </div>
+            {colResult && <div className={`alert-box alert-${colResult.type}`} style={{marginBottom:'1rem'}}>{colResult.msg}</div>}
+            <div className="form-row">
+              <label className="form-label">Library</label>
+              <select className="form-select" value={colLib} onChange={e=>setColLib(e.target.value)}>
+                <option value="">Select library...</option>
+                {libraries.filter(l=>l.type==='movie'||l.type==='show').map(l=>(
+                  <option key={l.key} value={l.key}>{l.title} ({l.count} items)</option>
+                ))}
+              </select>
+            </div>
+            <div className="form-row">
+              <label className="form-label">Create By</label>
+              <select className="form-select" value={colType} onChange={e=>setColType(e.target.value)}>
+                <option value="genre">Genre</option>
+                <option value="year">Decade</option>
+                <option value="actor">Actor</option>
+              </select>
+            </div>
+            {colType==='genre' && (
+              <div className="form-row">
+                <label className="form-label">Genre</label>
+                <select className="form-select" value={colGenre} onChange={e=>setColGenre(e.target.value)}>
+                  {['Action','Adventure','Animation','Comedy','Crime','Documentary','Drama','Family','Fantasy','History','Horror','Music','Mystery','Romance','Science Fiction','Thriller','War','Western'].map(g=>(
+                    <option key={g}>{g}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+            {colType==='year' && (
+              <div className="form-row">
+                <label className="form-label">Decade Start Year</label>
+                <select className="form-select" value={colYear} onChange={e=>setColYear(e.target.value)}>
+                  {['2020','2010','2000','1990','1980','1970','1960'].map(y=>(
+                    <option key={y} value={y}>{y}s</option>
+                  ))}
+                </select>
+              </div>
+            )}
+            {colType==='actor' && (
+              <div className="form-row">
+                <label className="form-label">Actor Name</label>
+                <input className="form-input" placeholder="e.g. Tom Hanks" value={colActor} onChange={e=>setColActor(e.target.value)}/>
+              </div>
+            )}
+            <button className="btn btn-primary" onClick={createCollection} disabled={colCreating} style={{width:'100%',padding:'.75rem'}}>
+              {colCreating ? '⏳ Creating...' : '✨ Create Collection'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ============ STREAM DETAILS MODAL ============ */}
+      {streamModal && (
+        <div className="overlay" onClick={()=>setStreamModal(null)}>
+          <div className="modal" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">▶️ Stream Details</div>
+              <button className="modal-close" onClick={()=>setStreamModal(null)}>✕</button>
+            </div>
+            {[['User',streamModal.user],['Content',streamModal.content],['IP Address',streamModal.ip],['Device',streamModal.device],['Platform',streamModal.platform],['Quality',streamModal.quality],['Progress',`${streamModal.progress}%`],['Transcoding',streamModal.transcoding?'Yes':'No (Direct Play)'],['Bandwidth',`${streamModal.bandwidth} KB/s`],['State',streamModal.state]].map(([l,v],i)=>(
+              <div key={i} className="info-row">
+                <span className="info-label">{l}</span>
+                <span className="info-val">{v||'Unknown'}</span>
+              </div>
+            ))}
+            <button className="btn btn-primary" style={{width:'100%',marginTop:'1rem',background:'linear-gradient(135deg,#ef4444,#dc2626)'}} onClick={()=>{stopStream(streamModal.sessionId);setStreamModal(null);}}>⏹️ Stop Stream</button>
+          </div>
+        </div>
+      )}
+
+      {/* ============ UNWATCHED REPORT MODAL ============ */}
+      {unwatchedModal && (
+        <div className="overlay" onClick={()=>setUnwatchedModal(false)}>
+          <div className="modal wide" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">📊 Unwatched Report</div>
+              <button className="modal-close" onClick={()=>setUnwatchedModal(false)}>✕</button>
+            </div>
+            <div className="form-row">
+              <label className="form-label">Library</label>
+              <select className="form-select" value={uwLib} onChange={e=>setUwLib(e.target.value)}>
+                <option value="">Select library...</option>
+                {libraries.map(l=><option key={l.key} value={l.key}>{l.title}</option>)}
+              </select>
+            </div>
+            <button className="btn btn-primary" onClick={genUnwatched} disabled={uwLoading} style={{marginBottom:'1.25rem'}}>
+              {uwLoading?'Generating...':'Generate Report'}
+            </button>
+            {uwData && (
+              <div>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'.75rem'}}>
+                  <span style={{fontWeight:600}}>{uwData.totalItems} unwatched items • {fmtBytes(uwData.totalSize)}</span>
+                  <button className="btn-sm btn-outline" onClick={exportCSV}>📥 Export CSV</button>
+                </div>
+                <div style={{maxHeight:'400px',overflowY:'auto'}}>
+                  {uwData.items.slice(0,50).map((item,i)=>(
+                    <div key={i} style={{display:'flex',justifyContent:'space-between',padding:'.65rem',background:'rgba(15,23,42,.5)',borderRadius:'7px',marginBottom:'.4rem',fontSize:'.85rem'}}>
+                      <div>
+                        <div style={{fontWeight:600}}>{item.title}</div>
+                        <div style={{color:'#94a3b8',fontSize:'.75rem',marginTop:'.2rem'}}>Added: {item.added} • Last watched: {item.lastWatched}</div>
+                      </div>
+                      <div style={{color:'#94a3b8',textAlign:'right',flexShrink:0}}>
+                        <div>{item.type}</div>
+                        <div style={{fontSize:'.75rem'}}>{fmtBytes(item.size)}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ============ LIVE TV CHANNEL SUCCESS + TUNER SETUP ============ */}
+      {ltvSuccess && (
+        <div className="overlay" onClick={()=>setLtvSuccess(null)}>
+          <div className="modal wide" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">Channel Created!</div>
+              <button className="modal-close" onClick={()=>setLtvSuccess(null)}>✕</button>
+            </div>
+
+            <div className="alert-box alert-success" style={{fontSize:'.95rem',marginBottom:'1.25rem'}}>
+              <strong>CH {ltvSuccess.number} - {ltvSuccess.name}</strong> is now live!
+              {ltvSuccess.programs && <span> ({ltvSuccess.programs} items, {ltvSuccess.hours}h of content)</span>}
+            </div>
+
+            <div style={{fontWeight:600,fontSize:'1.05rem',marginBottom:'.75rem'}}>Add to Plex as Live TV Tuner</div>
+            <div style={{fontSize:'.85rem',color:'#94a3b8',marginBottom:'1rem'}}>Follow these steps to watch your virtual channels inside the Plex app, just like real TV.</div>
+
+            <div style={{marginBottom:'1.5rem'}}>
+              <div className="form-label">Tuner Device URL (enter this in Plex)</div>
+              <div style={{display:'flex',gap:'.4rem',marginBottom:'1rem'}}>
+                <input className="form-input" readOnly value={`${window.location.origin}`} onClick={e=>e.target.select()} style={{fontSize:'.85rem',fontWeight:600}}/>
+                <button className="btn-sm btn-primary" style={{whiteSpace:'nowrap'}} onClick={()=>{navigator.clipboard.writeText(`${window.location.origin}`);showToast('Copied!');}}>Copy</button>
+              </div>
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'1rem'}}>
+                <div>
+                  <div className="form-label" style={{fontSize:'.75rem'}}>M3U Playlist URL (optional/manual)</div>
+                  <div style={{display:'flex',gap:'.4rem'}}>
+                    <input className="form-input" readOnly value={`${window.location.origin}/api/livetv/m3u`} onClick={e=>e.target.select()} style={{fontSize:'.75rem'}}/>
+                    <button className="btn-sm btn-outline" onClick={()=>{navigator.clipboard.writeText(`${window.location.origin}/api/livetv/m3u`);showToast('Copied!');}}>Copy</button>
+                  </div>
+                </div>
+                <div>
+                  <div className="form-label" style={{fontSize:'.75rem'}}>XMLTV Guide URL</div>
+                  <div style={{display:'flex',gap:'.4rem'}}>
+                    <input className="form-input" readOnly value={`${window.location.origin}/api/livetv/xmltv`} onClick={e=>e.target.select()} style={{fontSize:'.75rem'}}/>
+                    <button className="btn-sm btn-outline" onClick={()=>{navigator.clipboard.writeText(`${window.location.origin}/api/livetv/xmltv`);showToast('Copied!');}}>Copy</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div style={{background:'rgba(15,23,42,.5)',borderRadius:'10px',padding:'1.25rem'}}>
+              <div style={{fontWeight:600,marginBottom:'.75rem',fontSize:'.9rem'}}>Setup Steps in Plex</div>
+              <ol style={{paddingLeft:'1.5rem',fontSize:'.85rem',lineHeight:1.8,color:'#cbd5e1'}}>
+                <li><strong>Open Plex</strong> &rarr; Settings &rarr; <strong>Live TV & DVR</strong></li>
+                <li>Click <strong>"Set Up Plex DVR"</strong> or add a new device</li>
+                <li>Plex will scan for devices. If it doesn't find it automatically, click <strong>"Don't see your HDHomeRun device? Enter its network address manually"</strong></li>
+                <li>Paste the <strong>Tuner Device URL</strong> above: <code>{window.location.origin}</code></li>
+                <li>Plex will detect it as <strong>"Plex Command Center LiveTV"</strong> with your channels</li>
+                <li>For the <strong>Program Guide</strong>, select "XMLTV" and paste the XMLTV URL</li>
+                <li>Map the channels and you're done!</li>
+              </ol>
+
+              <div className="alert-box alert-info" style={{marginTop:'1rem',fontSize:'.8rem'}}>
+                <strong>Tailscale users:</strong> If Plex runs on a different machine, use your Tailscale IP instead: <code>http://100.x.x.x:3001</code>
+              </div>
+              <div className="alert-box alert-warn" style={{marginTop:'.5rem',fontSize:'.8rem'}}>
+                <strong>Note:</strong> Plex Pass is required for Live TV & DVR features. The URLs stay the same as you add more channels.
+              </div>
+            </div>
+
+            <div style={{marginTop:'1.25rem',display:'flex',gap:'.75rem',justifyContent:'flex-end'}}>
+              <button className="btn btn-outline" onClick={()=>setLtvSuccess(null)}>Close</button>
+              <button className="btn btn-primary" onClick={()=>{setLtvSuccess(null);setLtvView('nowplaying');}}>View Now Playing</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ============ LIVE TV AUTO BUILD MODAL ============ */}
+      {ltvAutoBuild && (
+        <div className="overlay" onClick={()=>setLtvAutoBuild(false)}>
+          <div className="modal xl" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">Auto Build Channel</div>
+              <button className="modal-close" onClick={()=>setLtvAutoBuild(false)}>✕</button>
+            </div>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'1.5rem'}}>
+              {/* Left: Settings */}
+              <div>
+                <div style={{fontWeight:600,marginBottom:'1rem',fontSize:'.95rem'}}>Channel Settings</div>
+                <div className="form-row">
+                  <label className="form-label">Genre *</label>
+                  <select className="form-select" value={ltvAB.genre} onChange={e=>setLtvAB(p=>({...p,genre:e.target.value}))}>
+                    {ltvGenres.map(g=><option key={g} value={g}>{g}</option>)}
+                  </select>
+                </div>
+                <div className="form-row">
+                  <label className="form-label">Genre Match Mode</label>
+                  <div className="toggle" style={{width:'100%'}}>
+                    <button className={`toggle-opt ${ltvAB.genre_mode==='primary'?'active':''}`} style={{flex:1}} onClick={()=>setLtvAB(p=>({...p,genre_mode:'primary'}))}>Primary Genre Only</button>
+                    <button className={`toggle-opt ${ltvAB.genre_mode==='any'?'active':''}`} style={{flex:1}} onClick={()=>setLtvAB(p=>({...p,genre_mode:'any'}))}>Any Match</button>
+                  </div>
+                  <div style={{fontSize:'.7rem',color:'#94a3b8',marginTop:'.3rem'}}>
+                    {ltvAB.genre_mode==='primary'
+                      ? 'Only includes content where this is the main genre (e.g. Friends = "Comedy,Romance" matches, The Boys = "Action,Comedy" does not)'
+                      : 'Includes any content tagged with this genre, even as secondary'}
+                  </div>
+                </div>
+                <div className="form-row">
+                  <label className="form-label">Exclude Genres</label>
+                  <div style={{display:'flex',flexWrap:'wrap',gap:'.4rem'}}>
+                    {['Animation','Anime','Action','Horror','Sci-Fi & Fantasy','Science Fiction','Documentary'].map(g=>(
+                      <button key={g} className={`btn-sm ${ltvAB.exclude_genres.includes(g)?'btn-decline':'btn-outline'}`}
+                        style={{fontSize:'.7rem'}}
+                        onClick={()=>setLtvAB(p=>({...p,exclude_genres:p.exclude_genres.includes(g)?p.exclude_genres.filter(x=>x!==g):[...p.exclude_genres,g]}))}>
+                        {ltvAB.exclude_genres.includes(g)?'✕ ':''}{g}
+                      </button>
+                    ))}
+                  </div>
+                  <div style={{fontSize:'.7rem',color:'#94a3b8',marginTop:'.3rem'}}>Click to exclude content also tagged with these genres</div>
+                </div>
+                <div className="form-row">
+                  <label className="form-label">Library</label>
+                  <select className="form-select" value={ltvAB.library_key} onChange={e=>setLtvAB(p=>({...p,library_key:e.target.value}))}>
+                    <option value="">All Libraries</option>
+                    {libraries.map(l=><option key={l.key} value={l.key}>{l.title} ({l.type})</option>)}
+                  </select>
+                </div>
+                <div className="form-row">
+                  <label className="form-label">Content Type</label>
+                  <select className="form-select" value={ltvAB.content_type} onChange={e=>setLtvAB(p=>({...p,content_type:e.target.value}))}>
+                    <option value="all">All (Movies + TV)</option>
+                    <option value="episode">TV Episodes Only</option>
+                    <option value="movie">Movies Only</option>
+                  </select>
+                </div>
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'.75rem'}}>
+                  <div className="form-row">
+                    <label className="form-label">Year From</label>
+                    <input className="form-input" type="number" placeholder="Any" value={ltvAB.year_from} onChange={e=>setLtvAB(p=>({...p,year_from:e.target.value}))}/>
+                  </div>
+                  <div className="form-row">
+                    <label className="form-label">Year To</label>
+                    <input className="form-input" type="number" placeholder="Any" value={ltvAB.year_to} onChange={e=>setLtvAB(p=>({...p,year_to:e.target.value}))}/>
+                  </div>
+                </div>
+                <div className="form-row">
+                  <label className="form-label">Channel Number</label>
+                  <input className="form-input" type="number" placeholder="Auto (next available)" value={ltvAB.start_number} onChange={e=>setLtvAB(p=>({...p,start_number:e.target.value}))}/>
+                </div>
+                <div className="form-row" style={{display:'flex',alignItems:'center',gap:'.75rem'}}>
+                  <label className="form-label" style={{marginBottom:0}}>Shuffle Order</label>
+                  <button className={`btn-sm ${ltvAB.shuffle?'btn-approve':'btn-outline'}`} onClick={()=>setLtvAB(p=>({...p,shuffle:!p.shuffle}))}>
+                    {ltvAB.shuffle?'Shuffled':'In Order'}
+                  </button>
+                </div>
+                <div style={{display:'flex',gap:'.75rem',marginTop:'1.25rem'}}>
+                  <button className="btn btn-primary" onClick={ltvPreviewAutoBuild} disabled={ltvABLoading}>
+                    {ltvABLoading?'Loading...':'Preview'}
+                  </button>
+                  {ltvABPreview && ltvABPreview.totalPrograms > 0 && (
+                    <button className="btn btn-primary" style={{background:'linear-gradient(135deg,#10b981,#059669)'}} onClick={ltvRunAutoBuild} disabled={ltvABLoading}>
+                      Build Channel
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Right: Preview */}
+              <div>
+                <div style={{fontWeight:600,marginBottom:'1rem',fontSize:'.95rem'}}>Preview</div>
+                {!ltvABPreview ? (
+                  <div className="empty" style={{padding:'2rem'}}>Click "Preview" to see what content matches your filters</div>
+                ) : ltvABPreview.totalPrograms === 0 ? (
+                  <div className="alert-box alert-warn">No content found matching those filters. Try a different genre or remove year filters.</div>
+                ) : (
+                  <div>
+                    {/* Stats */}
+                    <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:'.75rem',marginBottom:'1rem'}}>
+                      <div style={{padding:'.75rem',background:'rgba(15,23,42,.5)',borderRadius:'8px',textAlign:'center'}}>
+                        <div style={{fontSize:'1.4rem',fontWeight:700,color:'#60a5fa'}}>{ltvABPreview.totalPrograms}</div>
+                        <div style={{fontSize:'.7rem',color:'#94a3b8'}}>Total Items</div>
+                      </div>
+                      <div style={{padding:'.75rem',background:'rgba(15,23,42,.5)',borderRadius:'8px',textAlign:'center'}}>
+                        <div style={{fontSize:'1.4rem',fontWeight:700,color:'#a78bfa'}}>{ltvABPreview.totalHours}h</div>
+                        <div style={{fontSize:'.7rem',color:'#94a3b8'}}>Total Runtime</div>
+                      </div>
+                      <div style={{padding:'.75rem',background:'rgba(15,23,42,.5)',borderRadius:'8px',textAlign:'center'}}>
+                        <div style={{fontSize:'1.4rem',fontWeight:700,color:'#34d399'}}>{ltvABPreview.shows.length}</div>
+                        <div style={{fontSize:'.7rem',color:'#94a3b8'}}>TV Shows</div>
+                      </div>
+                    </div>
+
+                    {/* Shows breakdown */}
+                    {ltvABPreview.shows.length > 0 && (
+                      <div style={{marginBottom:'1rem'}}>
+                        <div style={{fontSize:'.8rem',fontWeight:600,marginBottom:'.5rem',color:'#cbd5e1'}}>Shows Found</div>
+                        <div style={{maxHeight:'200px',overflowY:'auto'}}>
+                          {ltvABPreview.shows.map((s,i) => (
+                            <div key={i} style={{display:'flex',justifyContent:'space-between',padding:'.4rem .6rem',background:i%2===0?'rgba(15,23,42,.3)':'transparent',borderRadius:'4px',fontSize:'.8rem'}}>
+                              <span>{s.name}</span>
+                              <span style={{color:'#94a3b8'}}>{s.episodes} eps</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Sample content */}
+                    <div>
+                      <div style={{fontSize:'.8rem',fontWeight:600,marginBottom:'.5rem',color:'#cbd5e1'}}>Sample Content</div>
+                      <div style={{maxHeight:'180px',overflowY:'auto'}}>
+                        {ltvABPreview.sample.map((s,i) => (
+                          <div key={i} style={{padding:'.35rem .6rem',fontSize:'.75rem',borderBottom:'1px solid rgba(100,116,139,.1)'}}>
+                            <span style={{fontWeight:500}}>{s.title}</span>
+                            {s.showTitle && <span style={{color:'#a78bfa'}}> - {s.showTitle}</span>}
+                            <span style={{color:'#94a3b8'}}> ({s.duration})</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ============ LIVE TV CHANNEL CREATE MODAL ============ */}
+      {ltvChannelModal==='new' && (
+        <div className="overlay" onClick={()=>setLtvChannelModal(null)}>
+          <div className="modal wide" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">New Channel</div>
+              <button className="modal-close" onClick={()=>setLtvChannelModal(null)}>✕</button>
+            </div>
+            <div className="form-row">
+              <label className="form-label">Channel Number *</label>
+              <input className="form-input" type="number" placeholder="101" value={ltvNewCh.number} onChange={e=>setLtvNewCh(p=>({...p,number:e.target.value}))}/>
+            </div>
+            <div className="form-row">
+              <label className="form-label">Channel Name *</label>
+              <input className="form-input" placeholder="Action Movies" value={ltvNewCh.name} onChange={e=>setLtvNewCh(p=>({...p,name:e.target.value}))}/>
+            </div>
+            <div className="form-row">
+              <label className="form-label">Source Type</label>
+              <select className="form-select" value={ltvNewCh.source_type} onChange={e=>setLtvNewCh(p=>({...p,source_type:e.target.value,source_value:''}))}>
+                <option value="genre">Genre</option>
+                <option value="library">Library</option>
+                <option value="manual">Manual (All Content)</option>
+              </select>
+            </div>
+            <div className="form-row">
+              <label className="form-label">Source Value * {ltvNewCh.source_type==='genre'?'(select a genre)':ltvNewCh.source_type==='library'?'(select a library)':'(type "all")'}</label>
+              {ltvNewCh.source_type==='genre' ? (
+                <select className="form-select" value={ltvNewCh.source_value} onChange={e=>setLtvNewCh(p=>({...p,source_value:e.target.value}))}>
+                  <option value="">-- Select Genre --</option>
+                  {ltvGenres.map(g=><option key={g} value={g}>{g}</option>)}
+                </select>
+              ) : ltvNewCh.source_type==='library' ? (
+                <select className="form-select" value={ltvNewCh.source_value} onChange={e=>setLtvNewCh(p=>({...p,source_value:e.target.value,library_key:e.target.value}))}>
+                  <option value="">-- Select Library --</option>
+                  {libraries.map(l=><option key={l.key} value={l.key}>{l.title} ({l.type})</option>)}
+                </select>
+              ) : (
+                <input className="form-input" placeholder="all" value={ltvNewCh.source_value} onChange={e=>setLtvNewCh(p=>({...p,source_value:e.target.value}))}/>
+              )}
+            </div>
+            <div className="form-row" style={{display:'flex',alignItems:'center',gap:'.75rem'}}>
+              <label className="form-label" style={{marginBottom:0}}>Shuffle playlist</label>
+              <button className={`btn-sm ${ltvNewCh.shuffle?'btn-approve':'btn-outline'}`} onClick={()=>setLtvNewCh(p=>({...p,shuffle:!p.shuffle}))}>
+                {ltvNewCh.shuffle?'Yes':'No'}
+              </button>
+            </div>
+            <div style={{display:'flex',gap:'.75rem',marginTop:'1.5rem'}}>
+              <button className="btn btn-primary" onClick={ltvCreateChannel}>Create Channel</button>
+              <button className="btn btn-outline" onClick={()=>setLtvChannelModal(null)}>Cancel</button>
+            </div>
+            {ltvGenres.length===0 && (
+              <div className="alert-box alert-warn" style={{marginTop:'1rem'}}>No genres found. Click "Scan Libraries" on the Live TV page first.</div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ============ LIVE TV SCHEDULE RULES MODAL ============ */}
+      {ltvRuleModal && (
+        <div className="overlay" onClick={()=>setLtvRuleModal(null)}>
+          <div className="modal wide" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">Schedule Rules - Channel #{ltvRuleModal}</div>
+              <button className="modal-close" onClick={()=>setLtvRuleModal(null)}>✕</button>
+            </div>
+            {(() => {
+              const ch = ltvChannels.find(c=>c.id===ltvRuleModal);
+              const rules = ch?.rules || [];
+              return (
+                <div>
+                  {rules.length > 0 && (
+                    <div style={{marginBottom:'1.5rem'}}>
+                      <div style={{fontWeight:600,marginBottom:'.5rem'}}>Active Rules</div>
+                      {rules.map(r=>(
+                        <div key={r.id} className="stream-card" style={{display:'flex',alignItems:'center',gap:'1rem'}}>
+                          <div style={{flex:1}}>
+                            <div style={{fontWeight:500,fontSize:'.85rem'}}>{r.name}</div>
+                            <div style={{fontSize:'.7rem',color:'#94a3b8'}}>
+                              {r.rule_type} | Boost: {r.genre_boost} +{r.boost_pct}%
+                              {r.start_month && ` | Months ${r.start_month}-${r.end_month}`}
+                            </div>
+                          </div>
+                          <button className="btn-sm btn-delete" onClick={()=>ltvDeleteRule(r.id)}>Delete</button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <div style={{fontWeight:600,marginBottom:'.75rem'}}>Add New Rule</div>
+                  <div className="form-row">
+                    <label className="form-label">Rule Name</label>
+                    <input className="form-input" placeholder="October Horror Boost" value={ltvNewRule.name} onChange={e=>setLtvNewRule(p=>({...p,name:e.target.value}))}/>
+                  </div>
+                  <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'1rem'}}>
+                    <div className="form-row">
+                      <label className="form-label">Start Month (1-12)</label>
+                      <input className="form-input" type="number" min="1" max="12" value={ltvNewRule.start_month} onChange={e=>setLtvNewRule(p=>({...p,start_month:parseInt(e.target.value)}))}/>
+                    </div>
+                    <div className="form-row">
+                      <label className="form-label">End Month (1-12)</label>
+                      <input className="form-input" type="number" min="1" max="12" value={ltvNewRule.end_month} onChange={e=>setLtvNewRule(p=>({...p,end_month:parseInt(e.target.value)}))}/>
+                    </div>
+                  </div>
+                  <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'1rem'}}>
+                    <div className="form-row">
+                      <label className="form-label">Genre to Boost</label>
+                      <select className="form-select" value={ltvNewRule.genre_boost} onChange={e=>setLtvNewRule(p=>({...p,genre_boost:e.target.value}))}>
+                        <option value="">-- Select --</option>
+                        {ltvGenres.map(g=><option key={g} value={g}>{g}</option>)}
+                      </select>
+                    </div>
+                    <div className="form-row">
+                      <label className="form-label">Boost Percentage (%)</label>
+                      <input className="form-input" type="number" min="5" max="100" value={ltvNewRule.boost_pct} onChange={e=>setLtvNewRule(p=>({...p,boost_pct:parseInt(e.target.value)}))}/>
+                    </div>
+                  </div>
+                  <button className="btn btn-primary" onClick={()=>ltvAddRule(ltvRuleModal)}>Add Rule</button>
+                </div>
+              );
+            })()}
+          </div>
+        </div>
+      )}
+
+      {/* ============ WIDGET SETTINGS MODAL ============ */}
+      {/* YouTube Download Modal */}
+      {ytModal && (
+        <div className="overlay" onClick={()=>setYtModal(false)}>
+          <div className="modal wide" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">Download Filler from YouTube</div>
+              <button className="modal-close" onClick={()=>setYtModal(false)}>x</button>
+            </div>
+
+            <div className="form-row">
+              <label className="form-label">YouTube URL</label>
+              <div style={{display:'flex',gap:'.5rem'}}>
+                <input className="form-input" value={ytUrl} onChange={e=>setYtUrl(e.target.value)} placeholder="https://www.youtube.com/watch?v=..." style={{flex:1}}/>
+                <button className="btn btn-primary" onClick={ytCheckInfo} disabled={ytInfoLoading || !ytUrl}>
+                  {ytInfoLoading ? 'Checking...' : 'Check'}
+                </button>
+              </div>
+            </div>
+
+            {ytInfo && !ytInfo.error && (
+              <div>
+                <div className="card" style={{marginBottom:'1.25rem'}}>
+                  <div style={{display:'flex',gap:'1rem'}}>
+                    {ytInfo.thumbnail && <img src={ytInfo.thumbnail} style={{width:'160px',height:'90px',borderRadius:'8px',objectFit:'cover'}} alt=""/>}
+                    <div>
+                      <div style={{fontWeight:600,fontSize:'1rem',marginBottom:'.3rem'}}>{ytInfo.title}</div>
+                      <div style={{fontSize:'.8rem',color:'#94a3b8'}}>
+                        {ytInfo.uploader} | Duration: {fmt(ytInfo.duration)}
+                      </div>
+                      {ytInfo.description && <div style={{fontSize:'.75rem',color:'#64748b',marginTop:'.3rem'}}>{ytInfo.description}</div>}
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'1rem',marginBottom:'1.25rem'}}>
+                  <div className="form-row" style={{marginBottom:0}}>
+                    <label className="form-label">Quality</label>
+                    <select className="form-select" value={ytQuality} onChange={e=>setYtQuality(e.target.value)}>
+                      <option value="360p">360p (~{ytInfo.estimates?.['360p'] ? fmtBytes(ytInfo.estimates['360p']) : '50 MB/hr'})</option>
+                      <option value="480p">480p (~{ytInfo.estimates?.['480p'] ? fmtBytes(ytInfo.estimates['480p']) : '100 MB/hr'})</option>
+                      <option value="720p">720p (~{ytInfo.estimates?.['720p'] ? fmtBytes(ytInfo.estimates['720p']) : '250 MB/hr'})</option>
+                      <option value="1080p">1080p (~{ytInfo.estimates?.['1080p'] ? fmtBytes(ytInfo.estimates['1080p']) : '500 MB/hr'})</option>
+                    </select>
+                  </div>
+                  {ytDiskSpace && (
+                    <div style={{padding:'.5rem'}}>
+                      <div className="form-label">Disk Space</div>
+                      <div style={{fontSize:'.85rem'}}>{fmtBytes(ytDiskSpace.available)} available</div>
+                      <div style={{fontSize:'.75rem',color:'#94a3b8'}}>Fillers using: {ytDiskSpace.fillersFormatted}</div>
+                      {ytInfo.estimates?.[ytQuality] && ytInfo.estimates[ytQuality] > ytDiskSpace.available && (
+                        <div className="alert-box alert-error" style={{marginTop:'.5rem',padding:'.4rem .6rem',fontSize:'.75rem'}}>Not enough space! Try a lower quality.</div>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                <div className="form-row">
+                  <label className="form-label">Assign to Channels (optional)</label>
+                  <div style={{display:'flex',gap:'.5rem',flexWrap:'wrap'}}>
+                    {ltvChannels.map(ch => (
+                      <label key={ch.id} style={{display:'flex',alignItems:'center',gap:'.3rem',fontSize:'.8rem',cursor:'pointer',padding:'.3rem .6rem',background:ytSelectedChannels.includes(ch.id)?'rgba(59,130,246,.2)':'rgba(15,23,42,.4)',border:'1px solid',borderColor:ytSelectedChannels.includes(ch.id)?'rgba(59,130,246,.4)':'rgba(100,116,139,.2)',borderRadius:'6px'}}>
+                        <input type="checkbox" checked={ytSelectedChannels.includes(ch.id)} onChange={e=>{
+                          setYtSelectedChannels(prev=>e.target.checked?[...prev,ch.id]:prev.filter(x=>x!==ch.id));
+                        }} style={{accentColor:'#3b82f6'}}/>
+                        CH {ch.number} - {ch.name}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+
+                <button className="btn btn-primary" style={{width:'100%',padding:'.75rem',marginTop:'.5rem'}} onClick={ytStartDownload}>
+                  Download ({ytQuality})
+                </button>
+              </div>
+            )}
+
+            {ytInfo?.error && (
+              <div className="alert-box alert-error">{ytInfo.error}</div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {widgetSettings && (
+        <div className="overlay" onClick={()=>setWidgetSettings(false)}>
+          <div className="modal" onClick={e=>e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">⚙️ Customize Dashboard</div>
+              <button className="modal-close" onClick={()=>setWidgetSettings(false)}>✕</button>
+            </div>
+            {WIDGET_LIST.map(w=>(
+              <div key={w.id} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'.9rem',background:'rgba(15,23,42,.4)',borderRadius:'8px',marginBottom:'.5rem'}}>
+                <span style={{fontWeight:500}}>{w.name}</span>
+                <button className={`btn-sm ${widgets.includes(w.id)?'btn-approve':'btn-outline'}`}
+                  onClick={()=>{
+                    setWidgets(prev=>{
+                      const next=prev.includes(w.id)?prev.filter(x=>x!==w.id):[...prev,w.id];
+                      localStorage.setItem('widgets_v252',JSON.stringify(next));
+                      return next;
+                    });
+                  }}>
+                  {widgets.includes(w.id)?'✓ Enabled':'Disabled'}
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const WIDGET_LIST = [
+  {id:'serverStatus',name:'Server Status'},
+  {id:'activeStreams',name:'Active Streams'},
+  {id:'systemAlerts',name:'System Alerts'},
+  {id:'topUser',name:'Top User'},
+  {id:'resources',name:'System Resources'},
+  {id:'jellyseerr',name:'Recent Requests'},
+  {id:'collections',name:'Collections'}
+];
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
