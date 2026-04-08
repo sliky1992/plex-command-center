@@ -585,7 +585,7 @@
     // ---- Init ----
     async function init() {
       const settings = await electronAPI.getSettings();
-      if (settings.serverUrl && settings.sessionToken) {
+      if (settings.serverUrl && (settings.sessionToken || settings.savedUser)) {
         state.serverUrl = settings.serverUrl;
         state.sessionToken = settings.sessionToken;
         state.volume = settings.volume || 80;
@@ -593,11 +593,31 @@
         state.alwaysOnTop = settings.alwaysOnTop || false;
         video.volume = state.volume / 100;
         document.getElementById('volumeSlider').value = state.volume;
-        // Verify session is still valid
-        try {
-          const r = await authFetch(`${state.serverUrl}/api/auth/me`, { signal: AbortSignal.timeout(5000) });
-          if (!r.ok) { showSetup(); return; }
-        } catch(e) { showSetup(); return; }
+        // Verify session is still valid, auto-re-login if expired
+        let sessionOk = false;
+        if (state.sessionToken) {
+          try {
+            const r = await authFetch(`${state.serverUrl}/api/auth/me`, { signal: AbortSignal.timeout(5000) });
+            if (r.ok) sessionOk = true;
+          } catch(e) {}
+        }
+        if (!sessionOk && settings.savedUser && settings.savedPass) {
+          // Auto-re-login with saved credentials
+          try {
+            const loginRes = await fetch(`${state.serverUrl}/api/auth/login`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ username: settings.savedUser, password: settings.savedPass }),
+              signal: AbortSignal.timeout(5000)
+            });
+            const loginData = await loginRes.json();
+            if (loginRes.ok && loginData.token) {
+              state.sessionToken = loginData.token;
+              await electronAPI.saveSettings({ ...settings, sessionToken: loginData.token });
+              sessionOk = true;
+            }
+          } catch(e) {}
+        }
+        if (!sessionOk) { showSetup(); return; }
         showMain();
         await syncChannels();
         // Auto-tune to last channel
@@ -676,12 +696,13 @@
 
         state.serverUrl = url;
         state.sessionToken = token;
-        await electronAPI.saveSettings({ ...await electronAPI.getSettings(), serverUrl: url, sessionToken: token });
+        await electronAPI.saveSettings({ ...await electronAPI.getSettings(), serverUrl: url, sessionToken: token, savedUser: username, savedPass: password });
         statusEl.innerHTML = '<span class="setup-success">Connected! Loading channels...</span>';
         showMain();
         await syncChannels();
       } catch (e) {
-        statusEl.innerHTML = `<span class="setup-error">Failed to connect: ${e.message}</span>`;
+        console.error('Connection error:', e);
+        statusEl.innerHTML = `<span class="setup-error">Failed to connect: ${e.message || e}</span>`;
       }
       btn.disabled = false;
     }

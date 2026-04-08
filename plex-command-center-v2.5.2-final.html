@@ -2422,17 +2422,18 @@ function App() {
                   <div>
                     {ltvFillers.map(f => (
                       <div key={f.id} className="stream-card" style={{display:'flex',alignItems:'center',gap:'1rem'}}>
-                        <div style={{width:'40px',height:'40px',borderRadius:'8px',background:f.verified?'rgba(52,211,153,.2)':'rgba(139,92,246,.2)',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0,fontSize:'1.2rem',position:'relative'}}>
-                          {f.type==='trailer'?'🎬':f.type==='bumper'?'📺':f.type==='preroll'?'🎞️':'📢'}
+                        <div style={{width:'40px',height:'40px',borderRadius:'8px',background:f.type==='youtube'?'rgba(239,68,68,.2)':f.verified?'rgba(52,211,153,.2)':'rgba(139,92,246,.2)',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0,fontSize:'1.2rem',position:'relative'}}>
+                          {f.type==='youtube'?'▶️':f.type==='trailer'?'🎬':f.type==='bumper'?'📺':f.type==='preroll'?'🎞️':'📢'}
                           {f.verified ? <span style={{position:'absolute',bottom:'-2px',right:'-2px',fontSize:'.55rem',background:'#059669',borderRadius:'50%',width:'14px',height:'14px',display:'flex',alignItems:'center',justifyContent:'center',color:'#fff'}}>✓</span> : null}
                         </div>
                         <div style={{flex:1}}>
                           <div style={{fontWeight:500,fontSize:'.85rem'}}>{f.name}</div>
                           <div style={{fontSize:'.7rem',color:'#94a3b8'}}>
-                            {f.type} | {fmt(Math.floor(f.duration_ms/1000))}
+                            {f.type==='youtube' ? <span style={{color:'#f87171'}}>YouTube</span> : f.type} | {fmt(Math.floor(f.duration_ms/1000))}
+                            {f.local_path && <span style={{color:'#34d399'}}> | Local file</span>}
                             {f.genre && ` | ${f.genre.split(',').slice(0,2).join(', ')}`}
                             {f.content_type && ` | ${f.content_type}`}
-                            {!f.verified && <span style={{color:'#f59e0b'}}> | unverified</span>}
+                            {!f.verified && !f.local_path && <span style={{color:'#f59e0b'}}> | unverified</span>}
                           </div>
                           {f.assignedChannels && f.assignedChannels.length > 0 && (
                             <div style={{fontSize:'.65rem',color:'#60a5fa',marginTop:'.15rem'}}>
@@ -3763,7 +3764,7 @@ function App() {
                             {isAssigned?'✓':''}
                           </span>
                           <div style={{fontSize:'1rem',flexShrink:0}}>
-                            {f.type==='trailer'?'🎬':f.type==='bumper'?'📺':f.type==='preroll'?'🎞️':'📢'}
+                            {f.type==='youtube'?'▶️':f.type==='trailer'?'🎬':f.type==='bumper'?'📺':f.type==='preroll'?'🎞️':'📢'}
                           </div>
                           <div style={{flex:1,minWidth:0}}>
                             <div style={{fontSize:'.8rem',fontWeight:500,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{f.name}</div>

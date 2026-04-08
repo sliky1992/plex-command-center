@@ -13,7 +13,7 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(cors());
+app.use(cors({ origin: true, credentials: true, allowedHeaders: ['Content-Type', 'X-PCC-Token', 'Authorization'] }));
 app.use(express.json({ limit: '10mb' }));
 
 // Global request logger for debugging Plex connectivity
