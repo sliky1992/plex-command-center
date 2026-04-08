@@ -275,13 +275,14 @@ function App() {
 
   // YouTube filler download state
   const [ytModal, setYtModal] = useState(false);
-  const [ytUrl, setYtUrl] = useState('');
-  const [ytInfo, setYtInfo] = useState(null);
-  const [ytInfoLoading, setYtInfoLoading] = useState(false);
+  const [ytScanResults, setYtScanResults] = useState([]);
+  const [ytScanLoading, setYtScanLoading] = useState(false);
+  const [ytScanChannel, setYtScanChannel] = useState('');
+  const [ytSelected, setYtSelected] = useState(new Set());
   const [ytQuality, setYtQuality] = useState('480p');
   const [ytDownloads, setYtDownloads] = useState([]);
   const [ytDiskSpace, setYtDiskSpace] = useState(null);
-  const [ytSelectedChannels, setYtSelectedChannels] = useState([]);
+  const [ytManualUrl, setYtManualUrl] = useState('');
 
   const [tab, setTab] = useState('dashboard');
   const [status, setStatus] = useState(null);
@@ -495,22 +496,47 @@ function App() {
   const doUnblock = async (id) => { await fetch(`/api/security/block/${id}`,{method:'DELETE'}); showToast('Unblocked'); loadSecBlocked(); };
 
   // YouTube filler functions
-  const ytCheckInfo = async () => {
-    if(!ytUrl)return; setYtInfoLoading(true); setYtInfo(null);
+  const ytScanTrailers = async () => {
+    setYtScanLoading(true); setYtScanResults([]); setYtSelected(new Set());
     try {
-      const r = await fetch(`/api/livetv/fillers/yt-info?url=${encodeURIComponent(ytUrl)}`).then(x=>x.json());
-      setYtInfo(r);
-      const ds = await fetch('/api/livetv/fillers/disk-space').then(x=>x.json()).catch(()=>null);
-      setYtDiskSpace(ds);
-    } catch(e) { showToast('Failed to fetch video info','error'); }
-    setYtInfoLoading(false);
+      const r = await fetch('/api/livetv/fillers/yt-scan', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ channelId: ytScanChannel || undefined, limit: 20 })
+      }).then(x=>x.json());
+      setYtScanResults(r.results || []);
+      setYtDiskSpace(r.diskSpace);
+      if (r.results?.length === 0) showToast('No new trailers found (all already downloaded or no programs found)', 'warn');
+    } catch(e) { showToast('Scan failed','error'); }
+    setYtScanLoading(false);
   };
-  const ytStartDownload = async () => {
-    const r = await fetch('/api/livetv/fillers/yt-download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:ytUrl,quality:ytQuality,channelIds:ytSelectedChannels})}).then(x=>x.json());
-    if(r.success){showToast('Download started');setYtModal(false);setYtUrl('');setYtInfo(null);setYtSelectedChannels([]);ytLoadDownloads();}
+  const ytToggleSelect = (idx) => {
+    setYtSelected(prev => { const n = new Set(prev); if(n.has(idx)) n.delete(idx); else n.add(idx); return n; });
+  };
+  const ytSelectAll = () => {
+    if (ytSelected.size === ytScanResults.length) setYtSelected(new Set());
+    else setYtSelected(new Set(ytScanResults.map((_,i) => i)));
+  };
+  const ytDownloadSelected = async () => {
+    const items = [...ytSelected].map(i => ytScanResults[i]).filter(Boolean);
+    if (items.length === 0) return showToast('Select trailers to download','warn');
+    const channelIds = ytScanChannel ? [parseInt(ytScanChannel)] : [];
+    const r = await fetch('/api/livetv/fillers/yt-download-batch', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ items, quality: ytQuality, channelIds })
+    }).then(x=>x.json());
+    if (r.success) { showToast(`Downloading ${r.count} trailers`); setYtSelected(new Set()); ytLoadDownloads(); }
     else showToast(r.error||'Failed','error');
   };
-  const ytLoadDownloads = async () => { const r = await fetch('/api/livetv/fillers/yt-downloads').then(x=>x.json()).catch(()=>[]); setYtDownloads(r); };
+  const ytDownloadManual = async () => {
+    if (!ytManualUrl) return;
+    const r = await fetch('/api/livetv/fillers/yt-download', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ url: ytManualUrl, quality: ytQuality })
+    }).then(x=>x.json());
+    if (r.success) { showToast('Download started'); setYtManualUrl(''); ytLoadDownloads(); }
+    else showToast(r.error||'Failed','error');
+  };
+  const ytLoadDownloads = async () => { const r = await fetch('/api/livetv/fillers/yt-downloads').then(x=>x.json()).catch(()=>[]); setYtDownloads(Array.isArray(r)?r:[]); };
   const ytCancelDownload = async (id) => { await fetch(`/api/livetv/fillers/yt-downloads/${id}`,{method:'DELETE'}); ytLoadDownloads(); loadLiveTv(); };
 
   const safeFetch = async (url, fallback) => {
@@ -2349,7 +2375,7 @@ function App() {
                     {ltvFillers.filter(f=>f.verified).length > 0 && <span style={{marginLeft:'.5rem',color:'#34d399'}}>({ltvFillers.filter(f=>f.verified).length} verified)</span>}
                   </div>
                   <div style={{display:'flex',gap:'.5rem'}}>
-                    <button className="btn btn-primary" onClick={()=>{setYtModal(true);ytLoadDownloads();}}>Download from YouTube</button>
+                    <button className="btn btn-primary" onClick={()=>{setYtModal(true);ytLoadDownloads();setYtScanResults([]);}}>Scan YouTube Trailers</button>
                     <button className="btn btn-primary" onClick={ltvScanTrailers}>Scan Trailers from Plex</button>
                   </div>
                 </div>
@@ -4068,69 +4094,85 @@ function App() {
       )}
 
       {/* ============ WIDGET SETTINGS MODAL ============ */}
-      {/* YouTube Download Modal */}
+      {/* YouTube Trailer Scanner Modal */}
       {ytModal && (
         <div className="overlay" onClick={()=>setYtModal(false)}>
-          <div className="modal wide" onClick={e=>e.stopPropagation()}>
+          <div className="modal xl" onClick={e=>e.stopPropagation()}>
             <div className="modal-head">
-              <div className="modal-title">Download Filler from YouTube</div>
+              <div className="modal-title">YouTube Trailer Scanner</div>
               <button className="modal-close" onClick={()=>setYtModal(false)}>x</button>
             </div>
-            <div className="form-row">
-              <label className="form-label">YouTube URL</label>
-              <div style={{display:'flex',gap:'.5rem'}}>
-                <input className="form-input" value={ytUrl} onChange={e=>setYtUrl(e.target.value)} placeholder="https://www.youtube.com/watch?v=..." style={{flex:1}}/>
-                <button className="btn btn-primary" onClick={ytCheckInfo} disabled={ytInfoLoading||!ytUrl}>{ytInfoLoading?'Checking...':'Check'}</button>
+
+            {/* Scan controls */}
+            <div style={{display:'flex',gap:'.75rem',alignItems:'flex-end',marginBottom:'1.25rem',flexWrap:'wrap'}}>
+              <div style={{flex:1,minWidth:'200px'}}>
+                <label className="form-label">Scan programs from</label>
+                <select className="form-select" value={ytScanChannel} onChange={e=>setYtScanChannel(e.target.value)}>
+                  <option value="">All channels</option>
+                  {ltvChannels.map(ch=><option key={ch.id} value={ch.id}>CH {ch.number} - {ch.name}</option>)}
+                </select>
               </div>
-            </div>
-            {ytInfo && !ytInfo.error && (
               <div>
-                <div className="card" style={{marginBottom:'1.25rem'}}>
-                  <div style={{display:'flex',gap:'1rem'}}>
-                    {ytInfo.thumbnail && <img src={ytInfo.thumbnail} style={{width:'160px',height:'90px',borderRadius:'8px',objectFit:'cover'}} alt=""/>}
-                    <div>
-                      <div style={{fontWeight:600,fontSize:'1rem',marginBottom:'.3rem'}}>{ytInfo.title}</div>
-                      <div style={{fontSize:'.8rem',color:'#94a3b8'}}>{ytInfo.uploader} | Duration: {fmt(ytInfo.duration)}</div>
-                      {ytInfo.description && <div style={{fontSize:'.75rem',color:'#64748b',marginTop:'.3rem'}}>{ytInfo.description}</div>}
-                    </div>
-                  </div>
-                </div>
-                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'1rem',marginBottom:'1.25rem'}}>
-                  <div className="form-row" style={{marginBottom:0}}>
-                    <label className="form-label">Quality</label>
-                    <select className="form-select" value={ytQuality} onChange={e=>setYtQuality(e.target.value)}>
-                      <option value="360p">360p (~{ytInfo.estimates?.['360p']?fmtBytes(ytInfo.estimates['360p']):'small'})</option>
-                      <option value="480p">480p (~{ytInfo.estimates?.['480p']?fmtBytes(ytInfo.estimates['480p']):'medium'})</option>
-                      <option value="720p">720p (~{ytInfo.estimates?.['720p']?fmtBytes(ytInfo.estimates['720p']):'large'})</option>
-                      <option value="1080p">1080p (~{ytInfo.estimates?.['1080p']?fmtBytes(ytInfo.estimates['1080p']):'largest'})</option>
-                    </select>
-                  </div>
-                  {ytDiskSpace && (
-                    <div style={{padding:'.5rem'}}>
-                      <div className="form-label">Disk Space</div>
-                      <div style={{fontSize:'.85rem'}}>{fmtBytes(ytDiskSpace.available)} available</div>
-                      <div style={{fontSize:'.75rem',color:'#94a3b8'}}>Fillers using: {ytDiskSpace.fillersFormatted}</div>
-                      {ytInfo.estimates?.[ytQuality]&&ytInfo.estimates[ytQuality]>ytDiskSpace.available&&(
-                        <div className="alert-box alert-error" style={{marginTop:'.5rem',padding:'.4rem .6rem',fontSize:'.75rem'}}>Not enough space! Try lower quality.</div>
-                      )}
-                    </div>
-                  )}
-                </div>
-                <div className="form-row">
-                  <label className="form-label">Assign to Channels (optional)</label>
-                  <div style={{display:'flex',gap:'.5rem',flexWrap:'wrap'}}>
-                    {ltvChannels.map(ch=>(
-                      <label key={ch.id} style={{display:'flex',alignItems:'center',gap:'.3rem',fontSize:'.8rem',cursor:'pointer',padding:'.3rem .6rem',background:ytSelectedChannels.includes(ch.id)?'rgba(59,130,246,.2)':'rgba(15,23,42,.4)',border:'1px solid',borderColor:ytSelectedChannels.includes(ch.id)?'rgba(59,130,246,.4)':'rgba(100,116,139,.2)',borderRadius:'6px'}}>
-                        <input type="checkbox" checked={ytSelectedChannels.includes(ch.id)} onChange={e=>setYtSelectedChannels(prev=>e.target.checked?[...prev,ch.id]:prev.filter(x=>x!==ch.id))} style={{accentColor:'#3b82f6'}}/>
-                        CH {ch.number} - {ch.name}
-                      </label>
-                    ))}
-                  </div>
-                </div>
-                <button className="btn btn-primary" style={{width:'100%',padding:'.75rem',marginTop:'.5rem'}} onClick={ytStartDownload}>Download ({ytQuality})</button>
+                <label className="form-label">Download quality</label>
+                <select className="form-select" value={ytQuality} onChange={e=>setYtQuality(e.target.value)}>
+                  <option value="360p">360p (smallest)</option>
+                  <option value="480p">480p (recommended)</option>
+                  <option value="720p">720p (large)</option>
+                  <option value="1080p">1080p (largest)</option>
+                </select>
+              </div>
+              <button className="btn btn-primary" onClick={ytScanTrailers} disabled={ytScanLoading} style={{padding:'.65rem 1.5rem'}}>
+                {ytScanLoading ? 'Scanning YouTube...' : 'Scan for Trailers'}
+              </button>
+            </div>
+
+            {ytScanLoading && (
+              <div style={{textAlign:'center',padding:'2rem'}}>
+                <div className="spinner" style={{marginBottom:'1rem'}}></div>
+                <p style={{color:'#94a3b8',fontSize:'.85rem'}}>Searching YouTube for trailers matching your library content... This may take a minute.</p>
               </div>
             )}
-            {ytInfo?.error && <div className="alert-box alert-error">{ytInfo.error}</div>}
+
+            {/* Scan results */}
+            {ytScanResults.length > 0 && (
+              <div>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'.75rem'}}>
+                  <div style={{fontSize:'.85rem',color:'#94a3b8'}}>
+                    Found {ytScanResults.length} trailers {ytSelected.size > 0 && <span style={{color:'#60a5fa'}}>({ytSelected.size} selected)</span>}
+                    {ytDiskSpace && <span> — {fmtBytes(ytDiskSpace.available)} disk space available</span>}
+                  </div>
+                  <div style={{display:'flex',gap:'.5rem'}}>
+                    <button className="btn-sm btn-outline" onClick={ytSelectAll}>{ytSelected.size===ytScanResults.length?'Deselect All':'Select All'}</button>
+                    <button className="btn btn-primary" onClick={ytDownloadSelected} disabled={ytSelected.size===0}>
+                      Download {ytSelected.size > 0 ? `(${ytSelected.size})` : ''}
+                    </button>
+                  </div>
+                </div>
+                <div style={{maxHeight:'400px',overflowY:'auto'}}>
+                  {ytScanResults.map((r, i) => (
+                    <div key={i} className="stream-card" style={{display:'flex',alignItems:'center',gap:'.75rem',cursor:'pointer',borderColor:ytSelected.has(i)?'rgba(59,130,246,.4)':'rgba(100,116,139,.2)'}} onClick={()=>ytToggleSelect(i)}>
+                      <input type="checkbox" checked={ytSelected.has(i)} onChange={()=>ytToggleSelect(i)} style={{accentColor:'#3b82f6',flexShrink:0}} onClick={e=>e.stopPropagation()}/>
+                      {r.thumbnail && <img src={r.thumbnail} style={{width:'120px',height:'68px',borderRadius:'6px',objectFit:'cover',flexShrink:0}} alt=""/>}
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontWeight:600,fontSize:'.85rem',marginBottom:'.2rem'}}>{r.programTitle} {r.programYear ? `(${r.programYear})` : ''}</div>
+                        <div style={{fontSize:'.75rem',color:'#94a3b8',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{r.ytTitle}</div>
+                        <div style={{fontSize:'.7rem',color:'#64748b',marginTop:'.15rem'}}>{r.uploader} | {fmt(r.duration)}</div>
+                      </div>
+                      <span className={`status-badge ${r.programType==='movie'?'status-available':'status-approved'}`}>{r.programType==='movie'?'Movie':'TV'}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Manual URL fallback */}
+            <div style={{marginTop:'1.5rem',paddingTop:'1rem',borderTop:'1px solid rgba(100,116,139,.2)'}}>
+              <div style={{fontSize:'.8rem',color:'#64748b',marginBottom:'.5rem'}}>Or paste a YouTube URL manually:</div>
+              <div style={{display:'flex',gap:'.5rem'}}>
+                <input className="form-input" value={ytManualUrl} onChange={e=>setYtManualUrl(e.target.value)} placeholder="https://www.youtube.com/watch?v=..." style={{flex:1}}/>
+                <button className="btn btn-primary" onClick={ytDownloadManual} disabled={!ytManualUrl}>Download</button>
+              </div>
+            </div>
           </div>
         </div>
       )}

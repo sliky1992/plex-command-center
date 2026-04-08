@@ -5030,6 +5030,75 @@ app.get('/api/livetv/fillers/disk-space', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// Scan channel programs and search YouTube for trailers
+app.post('/api/livetv/fillers/yt-scan', async (req, res) => {
+  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
+  const { channelId, limit } = req.body;
+  const maxResults = Math.min(limit || 20, 50);
+
+  // Get unique titles from channel programs (or all programs if no channel specified)
+  let programs;
+  if (channelId) {
+    programs = db.prepare(`
+      SELECT DISTINCT p.title, p.show_title, p.type, p.year FROM channel_programming cp
+      JOIN programs p ON cp.program_id = p.id
+      WHERE cp.channel_id = ? AND cp.program_id IS NOT NULL
+      ORDER BY p.title LIMIT ?
+    `).all(channelId, maxResults);
+  } else {
+    programs = db.prepare('SELECT DISTINCT title, show_title, type, year FROM programs ORDER BY title LIMIT ?').all(maxResults);
+  }
+
+  // Get already-downloaded filler names to skip
+  const existingFillers = new Set(db.prepare('SELECT name FROM fillers').all().map(f => f.name.toLowerCase()));
+
+  const { execSync } = require('child_process');
+  const results = [];
+
+  for (const prog of programs) {
+    const searchTitle = prog.type === 'episode' ? (prog.show_title || prog.title) : prog.title;
+    if (!searchTitle) continue;
+
+    // Skip if we already have a trailer for this
+    const lowerTitle = searchTitle.toLowerCase();
+    if (existingFillers.has(lowerTitle + ' - trailer') || existingFillers.has(searchTitle + ' - Trailer')) continue;
+
+    const searchQuery = `${searchTitle} ${prog.year || ''} official trailer`.trim();
+    try {
+      const json = execSync(
+        `yt-dlp "ytsearch1:${searchQuery.replace(/"/g, '\\"')}" --dump-json --no-download --no-playlist 2>/dev/null`,
+        { timeout: 15000, maxBuffer: 5 * 1024 * 1024 }
+      ).toString().trim();
+      if (!json) continue;
+      const info = JSON.parse(json);
+      if (info.duration > 600) continue; // skip videos longer than 10 minutes
+      results.push({
+        programTitle: searchTitle,
+        programType: prog.type,
+        programYear: prog.year,
+        ytTitle: info.title,
+        ytUrl: info.webpage_url || `https://www.youtube.com/watch?v=${info.id}`,
+        ytId: info.id,
+        duration: info.duration,
+        thumbnail: info.thumbnail,
+        uploader: info.uploader,
+        alreadyHave: false
+      });
+    } catch(e) { /* skip failed searches */ }
+  }
+
+  // Also get disk space
+  let diskSpace = null;
+  try {
+    const disks = await si.fsSize();
+    const main = disks.find(d => d.mount === '/') || disks[0];
+    diskSpace = { available: main?.available || 0 };
+  } catch(e) {}
+
+  res.json({ results, total: programs.length, searched: results.length, diskSpace });
+});
+
+// Manual URL info lookup (kept for manual paste option)
 app.get('/api/livetv/fillers/yt-info', async (req, res) => {
   if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
   const { url } = req.query;
@@ -5038,19 +5107,9 @@ app.get('/api/livetv/fillers/yt-info', async (req, res) => {
     const { execSync } = require('child_process');
     const json = execSync(`yt-dlp --dump-json --no-download "${url.replace(/"/g, '')}"`, { timeout: 30000, maxBuffer: 5 * 1024 * 1024 }).toString();
     const info = JSON.parse(json);
-    // Estimate sizes for each quality
-    const qualities = ['360p', '480p', '720p', '1080p'];
-    const estimates = {};
-    for (const q of qualities) {
-      const height = parseInt(q);
-      const matchingFormats = (info.formats || []).filter(f => f.height && f.height <= height && f.vcodec !== 'none');
-      const best = matchingFormats.sort((a,b) => (b.filesize || b.filesize_approx || 0) - (a.filesize || a.filesize_approx || 0))[0];
-      estimates[q] = best ? (best.filesize || best.filesize_approx || Math.round(info.duration * height * 0.15)) : Math.round(info.duration * height * 0.15);
-    }
     res.json({
       title: info.title, duration: info.duration, thumbnail: info.thumbnail,
-      uploader: info.uploader, description: info.description?.substring(0, 200),
-      estimates
+      uploader: info.uploader, ytUrl: info.webpage_url || url, ytId: info.id
     });
   } catch(e) {
     res.status(500).json({ error: 'Failed to fetch video info: ' + (e.stderr?.toString()?.substring(0, 200) || e.message) });
@@ -5062,17 +5121,14 @@ app.get('/api/livetv/fillers/yt-downloads', (req, res) => {
   res.json(db.prepare('SELECT * FROM yt_downloads ORDER BY created_at DESC LIMIT 50').all());
 });
 
-app.post('/api/livetv/fillers/yt-download', (req, res) => {
-  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
-  const { url, quality, channelIds } = req.body;
-  if (!url) return res.status(400).json({ error: 'url required' });
+// Start a single YouTube download
+function startYtDownload(url, quality, channelIds, fillerName) {
   const q = quality || '480p';
   const height = parseInt(q) || 480;
 
-  const result = db.prepare('INSERT INTO yt_downloads (url, quality) VALUES (?, ?)').run(url, q);
+  const result = db.prepare('INSERT INTO yt_downloads (url, quality, title) VALUES (?, ?, ?)').run(url, q, fillerName || null);
   const dlId = result.lastInsertRowid;
 
-  // Start download in background
   const fillerDir = path.join(__dirname, 'data', 'fillers');
   if (!require('fs').existsSync(fillerDir)) require('fs').mkdirSync(fillerDir, { recursive: true });
 
@@ -5087,34 +5143,20 @@ app.post('/api/livetv/fillers/yt-download', (req, res) => {
 
   const proc = spawn('yt-dlp', args);
   activeDownloads.set(dlId, proc);
-  let lastTitle = '';
 
   proc.stdout.on('data', (data) => {
     const line = data.toString();
-    // Parse progress: [download]  45.3% of ~50.0MiB
     const match = line.match(/\[download\]\s+([\d.]+)%/);
-    if (match) {
-      db.prepare('UPDATE yt_downloads SET progress = ?, status = ? WHERE id = ?').run(Math.round(parseFloat(match[1])), 'downloading', dlId);
-    }
-    // Parse destination: [download] Destination: /path/to/file.mp4
+    if (match) db.prepare('UPDATE yt_downloads SET progress = ?, status = ? WHERE id = ?').run(Math.round(parseFloat(match[1])), 'downloading', dlId);
     const destMatch = line.match(/\[download\] Destination: (.+)/);
-    if (destMatch) {
-      db.prepare('UPDATE yt_downloads SET file_path = ? WHERE id = ?').run(destMatch[1].trim(), dlId);
-    }
-    // Parse merge: [Merger] Merging formats into "..."
+    if (destMatch) db.prepare('UPDATE yt_downloads SET file_path = ? WHERE id = ?').run(destMatch[1].trim(), dlId);
     const mergeMatch = line.match(/Merging formats into "(.+)"/);
-    if (mergeMatch) {
-      db.prepare('UPDATE yt_downloads SET file_path = ?, status = ? WHERE id = ?').run(mergeMatch[1].trim(), 'processing', dlId);
-    }
+    if (mergeMatch) db.prepare('UPDATE yt_downloads SET file_path = ?, status = ? WHERE id = ?').run(mergeMatch[1].trim(), 'processing', dlId);
   });
 
   proc.stderr.on('data', (data) => {
-    const line = data.toString();
-    // yt-dlp sometimes outputs progress to stderr too
-    const match = line.match(/\[download\]\s+([\d.]+)%/);
-    if (match) {
-      db.prepare('UPDATE yt_downloads SET progress = ?, status = ? WHERE id = ?').run(Math.round(parseFloat(match[1])), 'downloading', dlId);
-    }
+    const match = data.toString().match(/\[download\]\s+([\d.]+)%/);
+    if (match) db.prepare('UPDATE yt_downloads SET progress = ?, status = ? WHERE id = ?').run(Math.round(parseFloat(match[1])), 'downloading', dlId);
   });
 
   proc.on('close', (code) => {
@@ -5122,25 +5164,22 @@ app.post('/api/livetv/fillers/yt-download', (req, res) => {
     if (code === 0) {
       const dl = db.prepare('SELECT * FROM yt_downloads WHERE id = ?').get(dlId);
       const filePath = dl?.file_path;
-      let fileSize = 0, durationMs = 0, title = 'YouTube Filler';
+      let fileSize = 0, durationMs = 0, title = fillerName || 'YouTube Filler';
 
       if (filePath && require('fs').existsSync(filePath)) {
         fileSize = require('fs').statSync(filePath).size;
-        // Get duration with ffprobe
         try {
           const { execSync } = require('child_process');
           const dur = execSync(`ffprobe -v quiet -show_entries format=duration -of csv=p=0 "${filePath}"`, { timeout: 10000 }).toString().trim();
           durationMs = Math.round(parseFloat(dur) * 1000);
         } catch(e) {}
-        title = path.basename(filePath, path.extname(filePath));
+        if (!fillerName) title = path.basename(filePath, path.extname(filePath));
       }
 
-      // Create filler record
       const fillerResult = db.prepare('INSERT INTO fillers (name, type, duration_ms, local_path, enabled, verified) VALUES (?,?,?,?,1,1)')
         .run(title, 'youtube', durationMs, filePath);
       const fillerId = fillerResult.lastInsertRowid;
 
-      // Assign to channels if requested
       if (channelIds && Array.isArray(channelIds)) {
         const ins = db.prepare('INSERT OR IGNORE INTO channel_fillers (channel_id, filler_id) VALUES (?,?)');
         for (const cid of channelIds) ins.run(cid, fillerId);
@@ -5148,25 +5187,37 @@ app.post('/api/livetv/fillers/yt-download', (req, res) => {
 
       db.prepare('UPDATE yt_downloads SET status=?, progress=100, file_size_bytes=?, duration_ms=?, title=?, filler_id=?, completed_at=datetime(?) WHERE id=?')
         .run('done', fileSize, durationMs, title, fillerId, new Date().toISOString(), dlId);
-
       console.log(`[YT-DL] Download complete: ${title} (${(fileSize/1048576).toFixed(1)} MB, ${Math.round(durationMs/1000)}s)`);
     } else {
       db.prepare('UPDATE yt_downloads SET status=?, error_msg=? WHERE id=?').run('error', `yt-dlp exited with code ${code}`, dlId);
     }
   });
 
-  // Get title from yt-dlp info
-  try {
-    const { execSync } = require('child_process');
-    const titleJson = execSync(`yt-dlp --dump-json --no-download "${url.replace(/"/g, '')}" 2>/dev/null | head -c 10000`, { timeout: 15000 });
-    const parsed = JSON.parse(titleJson.toString());
-    if (parsed.title) {
-      db.prepare('UPDATE yt_downloads SET title = ?, status = ? WHERE id = ?').run(parsed.title, 'downloading', dlId);
-    }
-  } catch(e) {}
-
   db.prepare('UPDATE yt_downloads SET status = ? WHERE id = ?').run('downloading', dlId);
+  return dlId;
+}
+
+// Download single URL
+app.post('/api/livetv/fillers/yt-download', (req, res) => {
+  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
+  const { url, quality, channelIds, title } = req.body;
+  if (!url) return res.status(400).json({ error: 'url required' });
+  const dlId = startYtDownload(url, quality, channelIds, title);
   res.json({ success: true, id: dlId });
+});
+
+// Download batch of trailers (from scan results)
+app.post('/api/livetv/fillers/yt-download-batch', (req, res) => {
+  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
+  const { items, quality, channelIds } = req.body;
+  if (!items || !Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items array required' });
+  const ids = [];
+  for (const item of items) {
+    const fillerName = `${item.programTitle} - Trailer`;
+    const dlId = startYtDownload(item.ytUrl, quality, channelIds, fillerName);
+    ids.push(dlId);
+  }
+  res.json({ success: true, count: ids.length, ids });
 });
 
 app.delete('/api/livetv/fillers/yt-downloads/:id', (req, res) => {
