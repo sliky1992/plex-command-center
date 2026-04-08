@@ -24,6 +24,9 @@ hotpatch-v2.5.2.sh
 # Desktop app build artifacts
 PlexLiveTV-win64.zip
 
+# Local override with real credentials
+docker-compose.override.yml
+
 # OS files
 .DS_Store
 Thumbs.db
