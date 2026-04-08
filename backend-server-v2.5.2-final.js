@@ -1479,7 +1479,7 @@ const AUTH_EXEMPT = new Set([
   '/api/auth/login', '/api/auth/login/plex', '/api/health'
 ]);
 const AUTH_EXEMPT_PREFIXES = [
-  '/api/livetv/stream/', '/api/livetv/m3u', '/api/livetv/xmltv'
+  '/api/livetv/stream/', '/api/livetv/m3u', '/api/livetv/xmltv', '/api/livetv/logos/'
 ];
 const TUNER_PATHS = new Set([
   '/discover.json', '/lineup.json', '/lineup_status.json', '/lineup.post', '/device.xml'
@@ -1521,7 +1521,7 @@ app.post('/api/auth/login', (req, res) => {
   pccDb.prepare('UPDATE users SET last_login = datetime(?) WHERE id = ?').run(new Date().toISOString(), user.id);
   const session = createSession(user.id, req.ip, req.headers['user-agent']);
   res.setHeader('Set-Cookie', `pcc_session=${session.token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7*24*3600}`);
-  res.json({ success: true, user: { id: user.id, username: user.username, role: user.role, plex_thumb: user.plex_thumb } });
+  res.json({ success: true, token: session.token, user: { id: user.id, username: user.username, role: user.role, plex_thumb: user.plex_thumb } });
 });
 
 app.post('/api/auth/login/plex', async (req, res) => {

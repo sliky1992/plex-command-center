@@ -470,9 +470,11 @@
     <div class="setup">
       <div style="font-size:64px">📺</div>
       <h2>Plex LiveTV</h2>
-      <p>Enter your Plex Command Center server URL to connect and start watching live TV channels.</p>
+      <p>Enter your Plex Command Center server URL and credentials to connect.</p>
       <input type="text" class="setup-input" id="serverInput" placeholder="http://192.168.1.100:3001" />
-      <button class="setup-btn" id="connectBtn" onclick="testAndConnect()">Connect</button>
+      <input type="text" class="setup-input" id="loginUserInput" placeholder="Username" style="margin-top:8px" />
+      <input type="password" class="setup-input" id="loginPassInput" placeholder="Password" style="margin-top:8px" />
+      <button class="setup-btn" id="connectBtn" onclick="testAndConnect()">Connect & Login</button>
       <div id="setupStatus"></div>
     </div>
   </div>
@@ -565,21 +567,37 @@
       lastChannel: null,
       alwaysOnTop: false,
       mouseIdleTimeout: null,
-      logoSettings: { enabled: true, position: 'top-right', opacity: 0.7, size: 80 }
+      logoSettings: { enabled: true, position: 'top-right', opacity: 0.7, size: 80 },
+      sessionToken: null
     };
+
+    // Authenticated fetch wrapper - sends session cookie with all requests
+    function authFetch(url, opts = {}) {
+      if (state.sessionToken) {
+        opts.headers = opts.headers || {};
+        opts.headers['Cookie'] = `pcc_session=${state.sessionToken}`;
+      }
+      return fetch(url, opts);
+    }
 
     const video = document.getElementById('videoPlayer');
 
     // ---- Init ----
     async function init() {
       const settings = await electronAPI.getSettings();
-      if (settings.serverUrl) {
+      if (settings.serverUrl && settings.sessionToken) {
         state.serverUrl = settings.serverUrl;
+        state.sessionToken = settings.sessionToken;
         state.volume = settings.volume || 80;
         state.lastChannel = settings.lastChannel;
         state.alwaysOnTop = settings.alwaysOnTop || false;
         video.volume = state.volume / 100;
         document.getElementById('volumeSlider').value = state.volume;
+        // Verify session is still valid
+        try {
+          const r = await authFetch(`${state.serverUrl}/api/auth/me`, { signal: AbortSignal.timeout(5000) });
+          if (!r.ok) { showSetup(); return; }
+        } catch(e) { showSetup(); return; }
         showMain();
         await syncChannels();
         // Auto-tune to last channel
@@ -607,33 +625,63 @@
     // ---- Server Connection ----
     async function testAndConnect() {
       const url = document.getElementById('serverInput').value.trim().replace(/\/+$/, '');
-      const status = document.getElementById('setupStatus');
+      const username = document.getElementById('loginUserInput').value.trim();
+      const password = document.getElementById('loginPassInput').value;
+      const statusEl = document.getElementById('setupStatus');
       const btn = document.getElementById('connectBtn');
 
-      if (!url) { status.innerHTML = '<span class="setup-error">Enter a server URL</span>'; return; }
+      if (!url) { statusEl.innerHTML = '<span class="setup-error">Enter a server URL</span>'; return; }
+      if (!username || !password) { statusEl.innerHTML = '<span class="setup-error">Enter username and password</span>'; return; }
 
       btn.disabled = true;
-      status.innerHTML = '<span style="color:#94a3b8">Connecting...</span>';
+      statusEl.innerHTML = '<span style="color:#94a3b8">Connecting...</span>';
 
       try {
+        // Test server health first
         const r = await fetch(`${url}/api/health`, { signal: AbortSignal.timeout(5000) });
         const data = await r.json();
-        if (data.status === 'ok') {
-          if (!data.services?.livetv) {
-            status.innerHTML = '<span class="setup-error">Server connected but LiveTV is not enabled</span>';
-            btn.disabled = false;
-            return;
-          }
-          state.serverUrl = url;
-          await electronAPI.saveSettings({ ...await electronAPI.getSettings(), serverUrl: url });
-          status.innerHTML = '<span class="setup-success">Connected! Loading channels...</span>';
-          showMain();
-          await syncChannels();
-        } else {
-          status.innerHTML = '<span class="setup-error">Invalid response from server</span>';
+        if (data.status !== 'ok') {
+          statusEl.innerHTML = '<span class="setup-error">Invalid response from server</span>';
+          btn.disabled = false;
+          return;
         }
+        if (!data.services?.livetv) {
+          statusEl.innerHTML = '<span class="setup-error">Server connected but LiveTV is not enabled</span>';
+          btn.disabled = false;
+          return;
+        }
+
+        // Login
+        statusEl.innerHTML = '<span style="color:#94a3b8">Logging in...</span>';
+        const loginRes = await fetch(`${url}/api/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password }),
+          signal: AbortSignal.timeout(5000)
+        });
+        const loginData = await loginRes.json();
+        if (!loginRes.ok) {
+          statusEl.innerHTML = `<span class="setup-error">${loginData.error || 'Login failed'}</span>`;
+          btn.disabled = false;
+          return;
+        }
+
+        // Get session token from response body
+        const token = loginData.token;
+        if (!token) {
+          statusEl.innerHTML = '<span class="setup-error">Login succeeded but no session token received. Check server version.</span>';
+          btn.disabled = false;
+          return;
+        }
+
+        state.serverUrl = url;
+        state.sessionToken = token;
+        await electronAPI.saveSettings({ ...await electronAPI.getSettings(), serverUrl: url, sessionToken: token });
+        statusEl.innerHTML = '<span class="setup-success">Connected! Loading channels...</span>';
+        showMain();
+        await syncChannels();
       } catch (e) {
-        status.innerHTML = `<span class="setup-error">Failed to connect: ${e.message}</span>`;
+        statusEl.innerHTML = `<span class="setup-error">Failed to connect: ${e.message}</span>`;
       }
       btn.disabled = false;
     }
@@ -641,7 +689,7 @@
     // ---- Channel Sync ----
     async function syncChannels() {
       try {
-        const r = await fetch(`${state.serverUrl}/api/livetv/now-playing`, { signal: AbortSignal.timeout(8000) });
+        const r = await authFetch(`${state.serverUrl}/api/livetv/now-playing`, { signal: AbortSignal.timeout(8000) });
         const raw = await r.json();
         // Map now-playing response to flat channel objects
         const data = raw.map(item => ({
@@ -675,7 +723,7 @@
 
         // Load logo settings
         try {
-          const ls = await fetch(`${state.serverUrl}/api/livetv/logo-settings`, { signal: AbortSignal.timeout(5000) });
+          const ls = await authFetch(`${state.serverUrl}/api/livetv/logo-settings`, { signal: AbortSignal.timeout(5000) });
           const lsData = await ls.json();
           if (lsData && lsData.enabled !== undefined) state.logoSettings = lsData;
           updateChannelLogo();
@@ -736,7 +784,7 @@
     // ---- Guide ----
     async function loadGuide() {
       try {
-        const r = await fetch(`${state.serverUrl}/api/livetv/guide?hours=6`, { signal: AbortSignal.timeout(10000) });
+        const r = await authFetch(`${state.serverUrl}/api/livetv/guide?hours=6`, { signal: AbortSignal.timeout(10000) });
         state.guideData = await r.json();
         if (state.sidebarTab === 'guide') renderGuide();
       } catch (e) {}
@@ -833,7 +881,7 @@
 
       // Use the watch API (same as web UI) for Plex direct play / Plex transcoding
       try {
-        const watchData = await fetch(`${state.serverUrl}/api/livetv/watch/${ch.id}?client=desktop`).then(r => r.json());
+        const watchData = await authFetch(`${state.serverUrl}/api/livetv/watch/${ch.id}?client=desktop`).then(r => r.json());
         if (watchData.offAir) {
           // Channel is off air - show off-air state instead of playing
           video.style.display = 'none';
@@ -849,6 +897,22 @@
           }
           emptyEl.innerHTML = `<div style="text-align:center"><p style="font-size:48px;margin-bottom:8px">📡</p><p style="font-size:18px;color:#f87171;font-weight:700">Off Air</p><p style="color:#94a3b8;font-size:13px">${escHtml(ch.name)}</p>${resumeStr}</div>`;
           emptyEl.style.display = 'flex';
+          return;
+        }
+        if (watchData.noFiller) {
+          video.style.display = 'none';
+          document.getElementById('reconnecting').style.display = 'none';
+          const emptyEl = document.getElementById('emptyPlayer');
+          let nextStr = '';
+          if (watchData.nextProgram) {
+            const startsIn = Math.ceil((watchData.nextProgram.startsInMs || 0) / 60000);
+            nextStr = `<p style="color:#a78bfa;font-size:15px;margin-top:12px">Next: ${escHtml(watchData.nextProgram.showTitle || watchData.nextProgram.title)}</p><p style="color:#94a3b8;font-size:13px">Starts in ~${startsIn} min</p>`;
+          }
+          emptyEl.innerHTML = `<div style="text-align:center"><p style="font-size:48px;margin-bottom:8px">⏳</p><p style="font-size:16px;color:#fbbf24;font-weight:600">Filler Unavailable</p>${nextStr}</div>`;
+          emptyEl.style.display = 'flex';
+          // Auto-retry after the gap
+          const retryMs = Math.min(watchData.nextProgram?.startsInMs || 30000, 60000);
+          setTimeout(() => tuneChannel(ch), retryMs);
           return;
         }
         if (watchData.error) throw new Error(watchData.error);
@@ -888,7 +952,7 @@
         // Heartbeat to keep watch session alive
         state._heartbeat = setInterval(() => {
           if (state._watchId) {
-            fetch(`${state.serverUrl}/api/livetv/watch/heartbeat`, {
+            authFetch(`${state.serverUrl}/api/livetv/watch/heartbeat`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ watchId: state._watchId })
@@ -996,7 +1060,7 @@
       }
       // Stop watch session
       if (state._watchId && state.serverUrl) {
-        fetch(`${state.serverUrl}/api/livetv/watch/stop`, {
+        authFetch(`${state.serverUrl}/api/livetv/watch/stop`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ watchId: state._watchId, sessionId: state._sessionId })
