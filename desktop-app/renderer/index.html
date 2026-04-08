@@ -864,7 +864,7 @@
 
       state.currentChannel = ch;
       state.lastChannel = ch.id;
-      electronAPI.saveSettings({ serverUrl: state.serverUrl, volume: state.volume, lastChannel: ch.id, alwaysOnTop: state.alwaysOnTop });
+      electronAPI.getSettings().then(s => electronAPI.saveSettings({ ...s, serverUrl: state.serverUrl, volume: state.volume, lastChannel: ch.id, alwaysOnTop: state.alwaysOnTop }));
 
       document.getElementById('emptyPlayer').style.display = 'none';
       video.style.display = 'block';
@@ -1193,7 +1193,7 @@
       state.muted = false;
       video.volume = state.volume / 100;
       document.getElementById('muteBtn').textContent = state.volume === 0 ? '🔇' : '🔊';
-      electronAPI.saveSettings({ serverUrl: state.serverUrl, volume: state.volume, lastChannel: state.lastChannel, alwaysOnTop: state.alwaysOnTop });
+      electronAPI.getSettings().then(s => electronAPI.saveSettings({ ...s, serverUrl: state.serverUrl, volume: state.volume, lastChannel: state.lastChannel, alwaysOnTop: state.alwaysOnTop }));
     }
 
     function toggleSidebar() {
