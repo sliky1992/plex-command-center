@@ -1495,7 +1495,7 @@ function requireAuth(req, res, next) {
   if (!req.path.startsWith('/api/')) return next();
 
   const cookies = parseCookies(req);
-  const token = cookies.pcc_session;
+  const token = cookies.pcc_session || req.headers['x-pcc-token'];
   const user = getSessionUser(token);
   if (!user) return res.status(401).json({ error: 'Authentication required' });
   req.user = user;

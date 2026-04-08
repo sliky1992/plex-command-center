@@ -571,11 +571,11 @@
       sessionToken: null
     };
 
-    // Authenticated fetch wrapper - sends session cookie with all requests
+    // Authenticated fetch wrapper - sends session token via header
     function authFetch(url, opts = {}) {
       if (state.sessionToken) {
         opts.headers = opts.headers || {};
-        opts.headers['Cookie'] = `pcc_session=${state.sessionToken}`;
+        opts.headers['X-PCC-Token'] = state.sessionToken;
       }
       return fetch(url, opts);
     }
