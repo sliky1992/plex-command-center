@@ -889,7 +889,7 @@ function App() {
     if (ls && ls.enabled !== undefined) setLtvLogoSettings(ls);
   };
   const loadLtvGuide = async () => {
-    const g = await fetch('/api/livetv/guide?hours=24').then(r=>r.json()).catch(()=>[]);
+    const g = await fetch('/api/livetv/guide?hours=48').then(r=>r.json()).catch(()=>[]);
     setLtvGuide(g);
     // Auto-scroll to "now" after guide loads
     setTimeout(() => {
@@ -2245,7 +2245,7 @@ function App() {
                             {np.channel.name}
                           </div>
                           <span style={{fontSize:'.7rem',color:'#94a3b8'}}>
-                            {isOffAir ? <span style={{background:'rgba(239,68,68,.2)',color:'#f87171',padding:'.1rem .4rem',borderRadius:'4px',border:'1px solid rgba(239,68,68,.3)'}}>Off Air</span> : np.channel.category}
+                            {isOffAir ? <span style={{background:'rgba(239,68,68,.2)',color:'#f87171',padding:'.1rem .4rem',borderRadius:'4px',border:'1px solid rgba(239,68,68,.3)'}}>Off Air</span> : (() => { const c = np.channel.category; if (!c) return ''; if (typeof c === 'string' && c.startsWith('{')) { try { return JSON.parse(c).genre || ''; } catch(e) { return ''; } } return c; })()}
                           </span>
                         </div>
                         {isOffAir ? (
@@ -2324,7 +2324,9 @@ function App() {
                       <div style={{display:'flex',gap:'.4rem',alignItems:'center'}}>
                         {/* Category filter */}
                         {(() => {
-                          const cats = ['all', ...new Set(ltvGuide.map(g=>g.channel.category).filter(Boolean))];
+                          // Coerce any legacy/bad data: if `category` is a JSON-shaped string, pull the genre out.
+                          const cleanCat = c => { if (!c) return ''; if (typeof c === 'string' && c.startsWith('{')) { try { return JSON.parse(c).genre || ''; } catch(e) { return ''; } } return c; };
+                          const cats = ['all', ...new Set(ltvGuide.map(g=>cleanCat(g.channel.category)).filter(Boolean))];
                           return cats.map(c => (
                             <button key={c} className={`btn-sm ${ltvGuideFilter===c?'btn-primary':'btn-outline'}`} style={{fontSize:'.7rem',padding:'.2rem .5rem'}}
                               onClick={()=>setLtvGuideFilter(c)}>
@@ -2355,7 +2357,7 @@ function App() {
                     {(() => {
                       const now = Date.now();
                       const guideStart = now - 1800000;
-                      const guideEnd = now + 24*3600000;
+                      const guideEnd = now + 48*3600000;
                       const totalMs = guideEnd - guideStart;
                       const totalHours = totalMs / 3600000;
                       const gridWidth = totalHours * ltvGuideZoom; // pixel width of the timeline
@@ -2369,7 +2371,23 @@ function App() {
                         if (t >= guideStart) hourMarkers.push(t);
                       }
 
-                      const filteredGuide = (ltvGuideFilter === 'all' ? ltvGuide : ltvGuide.filter(g => g.channel.category === ltvGuideFilter)).map(g => {
+                      // Day boundaries inside the visible range, so the EPG can show a date strip
+                      // above the time markers (Today / Tomorrow / weekday names with date).
+                      const dayMarkers = [];
+                      const todayStart = new Date(); todayStart.setHours(0,0,0,0);
+                      const firstDay = new Date(guideStart); firstDay.setHours(0,0,0,0);
+                      for (let d = firstDay.getTime(); d < guideEnd; d += 86400000) {
+                        // Label placed where this day's content actually starts visible in the grid.
+                        const labelAt = Math.max(d, guideStart);
+                        const dayDate = new Date(d);
+                        const diffDays = Math.round((d - todayStart.getTime()) / 86400000);
+                        const label = diffDays === 0 ? 'Today' : diffDays === 1 ? 'Tomorrow'
+                          : dayDate.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+                        dayMarkers.push({ at: labelAt, label });
+                      }
+
+                      const cleanCat2 = c => { if (!c) return ''; if (typeof c === 'string' && c.startsWith('{')) { try { return JSON.parse(c).genre || ''; } catch(e) { return ''; } } return c; };
+                      const filteredGuide = (ltvGuideFilter === 'all' ? ltvGuide : ltvGuide.filter(g => cleanCat2(g.channel.category) === ltvGuideFilter)).map(g => {
                         // Merge fillers into adjacent programs so they don't clutter the EPG
                         const merged = [];
                         for (let i = 0; i < g.programs.length; i++) {
@@ -2414,8 +2432,24 @@ function App() {
                           <div ref={ltvGuideScrollRef} style={{overflowX:'auto',overflowY:'auto',maxHeight:'calc(100vh - 250px)',position:'relative'}}
                             onScroll={()=>setLtvGuideHover(null)}>
                             <div style={{display:'flex',flexDirection:'column',minWidth:channelLabelW+gridWidth+'px'}}>
+                              {/* Sticky date strip (Today / Tomorrow / Wed May 13) above time markers */}
+                              <div style={{display:'flex',position:'sticky',top:0,zIndex:22,background:'#0a0e27'}}>
+                                <div style={{width:channelLabelW+'px',flexShrink:0,background:'#0a0e27'}}/>
+                                <div style={{position:'relative',width:gridWidth+'px',height:'22px',borderBottom:'1px solid rgba(100,116,139,.15)'}}>
+                                  {dayMarkers.map(d => {
+                                    const leftPx = ((d.at - guideStart) / 3600000) * ltvGuideZoom;
+                                    return (
+                                      <div key={d.at} style={{position:'absolute',left:leftPx+'px',height:'100%',
+                                        borderLeft:'1px solid rgba(100,116,139,.3)',display:'flex',alignItems:'center',paddingLeft:'8px'}}>
+                                        <span style={{fontSize:'.75rem',fontWeight:600,color:'#cbd5e1'}}>{d.label}</span>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+
                               {/* Sticky time header */}
-                              <div style={{display:'flex',position:'sticky',top:0,zIndex:20,background:'#0a0e27'}}>
+                              <div style={{display:'flex',position:'sticky',top:'22px',zIndex:20,background:'#0a0e27'}}>
                                 <div style={{width:channelLabelW+'px',flexShrink:0,background:'#0a0e27',zIndex:21,borderBottom:'1px solid rgba(100,116,139,.3)'}}/>
                                 <div style={{position:'relative',width:gridWidth+'px',height:'32px',borderBottom:'1px solid rgba(100,116,139,.3)'}}>
                                   {hourMarkers.map(t => {

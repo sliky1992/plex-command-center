@@ -472,7 +472,7 @@
       <h2>Plex LiveTV</h2>
       <p>Enter your Plex Command Center server URL and credentials to connect.</p>
       <input type="text" class="setup-input" id="serverInput" placeholder="http://192.168.1.100:3001 (LAN / primary)" />
-      <input type="text" class="setup-input" id="fallbackInput" placeholder="http://100.x.x.x:3001 (Tailscale / fallback, optional)" style="margin-top:8px" />
+      <input type="text" class="setup-input" id="fallbackInput" placeholder="Tailscale URL (optional — auto-discovered after 1st connect)" style="margin-top:8px" />
       <input type="text" class="setup-input" id="loginUserInput" placeholder="Username" style="margin-top:8px" />
       <input type="password" class="setup-input" id="loginPassInput" placeholder="Password" style="margin-top:8px" />
       <label style="display:flex;align-items:center;gap:6px;margin-top:10px;font-size:13px;color:#cbd5e1;cursor:pointer;user-select:none">
@@ -595,16 +595,32 @@
       return url;
     }
 
-    // Smart resolver: tries primary URL first; if it doesn't respond inside the short timeout,
-    // falls back to the secondary URL. Returns whichever responds, or null if both fail.
-    // Backend can't do this for us — only the *client* knows which network it's on, so the
-    // probe has to run client-side. The user enters a LAN URL + Tailscale URL once; we pick.
-    async function resolveBestServerUrl(primary, fallback) {
-      if (primary) {
-        try { return await probeServerUrl(primary); } catch(e) { /* fall through */ }
-      }
-      if (fallback && fallback !== primary) {
-        try { return await probeServerUrl(fallback); } catch(e) { /* fall through */ }
+    // Ask the server for its known LAN + Tailscale URLs (env-derived). Used to auto-populate
+    // the fallback once the user has connected the first time, so they don't have to enter
+    // both URLs by hand. Returns null on any failure — we tolerate older servers without it.
+    async function discoverServerEndpoints(url) {
+      try {
+        const r = await fetch(`${url}/api/server-info`, { signal: AbortSignal.timeout(3000) });
+        if (!r.ok) return null;
+        const j = await r.json();
+        return { lanUrl: j.lanUrl || null, tailscaleUrl: j.tailscaleUrl || null };
+      } catch(e) { return null; }
+    }
+
+    // Smart resolver: probes the configured URLs in order (primary → manual fallback →
+    // auto-discovered tailscale), returning the first one that responds. Backend can't do
+    // this for us — only the *client* knows which network it's on. The user normally enters
+    // only the LAN URL; after the first successful connect, the tailscale URL is auto-cached
+    // from /api/server-info so off-LAN launches "just work".
+    async function resolveBestServerUrl(settings) {
+      const candidates = [];
+      const seen = new Set();
+      const add = (u) => { if (u && !seen.has(u)) { seen.add(u); candidates.push(u); } };
+      add(settings.serverUrl);
+      add(settings.fallbackUrl);
+      add(settings.discoveredTailscaleUrl);
+      for (const url of candidates) {
+        try { return await probeServerUrl(url); } catch(e) { /* try next */ }
       }
       return null;
     }
@@ -615,9 +631,10 @@
     async function init() {
       const settings = await electronAPI.getSettings();
       if (settings.serverUrl && (settings.sessionToken || settings.savedUser)) {
-        // Pick whichever of the two configured URLs is reachable from this network. Primary
-        // (typically LAN) is tried first; on timeout we fall back to the secondary (Tailscale).
-        const best = await resolveBestServerUrl(settings.serverUrl, settings.fallbackUrl);
+        // Pick whichever known URL is reachable from this network. Primary (typically LAN) is
+        // tried first; on timeout we fall back to the manual fallback, then to the auto-cached
+        // tailscale URL from a prior /api/server-info response.
+        const best = await resolveBestServerUrl(settings);
         if (!best) {
           // Neither URL responds — show setup so the user can re-check / re-enter.
           showSetup();
@@ -657,6 +674,19 @@
           } catch(e) {}
         }
         if (!sessionOk) { showSetup(); return; }
+        // Refresh the cached server endpoints so a later env change (e.g. tailscale IP added)
+        // is picked up automatically. Best-effort; we already have a working session.
+        try {
+          const eps = await discoverServerEndpoints(state.serverUrl);
+          if (eps) {
+            await electronAPI.saveSettings({
+              ...settings,
+              sessionToken: state.sessionToken,
+              discoveredLanUrl: eps.lanUrl || '',
+              discoveredTailscaleUrl: eps.tailscaleUrl || ''
+            });
+          }
+        } catch(e) {}
         showMain();
         await syncChannels();
         // Auto-tune to last channel
@@ -708,9 +738,9 @@
       statusEl.innerHTML = '<span style="color:#94a3b8">Connecting...</span>';
 
       try {
-        // Probe both URLs (primary then fallback). Whichever responds becomes the active one.
+        // Probe configured URLs in order; whichever responds becomes the active one.
         statusEl.innerHTML = '<span style="color:#94a3b8">Probing server(s)...</span>';
-        const url = await resolveBestServerUrl(primaryUrl, fallbackUrl);
+        const url = await resolveBestServerUrl({ serverUrl: primaryUrl, fallbackUrl });
         if (!url) {
           statusEl.innerHTML = '<span class="setup-error">No server responded. Check the URL(s) and that the container is running.</span>';
           btn.disabled = false;
@@ -751,6 +781,10 @@
 
         state.serverUrl = url;
         state.sessionToken = token;
+        // Ask the server for its known endpoints so future launches can auto-fall-back to
+        // tailscale without the user typing a second URL. Best-effort: older servers without
+        // /api/server-info just return null and we proceed.
+        const endpoints = await discoverServerEndpoints(url);
         // Persist: always save URLs (so we can probe them next launch), only save credentials
         // when the user opted in. When "remember" is off, clear any previously-saved password.
         const prev = await electronAPI.getSettings();
@@ -761,6 +795,10 @@
           sessionToken: token,
           remember
         };
+        if (endpoints) {
+          toSave.discoveredLanUrl = endpoints.lanUrl || '';
+          toSave.discoveredTailscaleUrl = endpoints.tailscaleUrl || '';
+        }
         if (remember) {
           toSave.savedUser = username;
           toSave.savedPass = password;

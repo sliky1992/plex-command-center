@@ -1641,6 +1641,10 @@ function parseCookies(req) {
 // Auth routes (no auth required)
 const AUTH_EXEMPT = new Set([
   '/api/auth/login', '/api/auth/login/plex', '/api/health',
+  // server-info is fetched by the TV app *before* it has a session token, so it can learn the
+  // tailscale URL to use as automatic fallback when the LAN URL becomes unreachable. The payload
+  // is env-derived and only useful to clients that already know one valid URL to reach us.
+  '/api/server-info',
   // Telegram webhook authenticates via per-install secret in the URL/header, not session.
   '/api/security/telegram-webhook'
 ]);
@@ -3287,11 +3291,26 @@ if (LIVETV_ENABLED) {
 
   // Daily auto-rebuild — keeps the schedule fresh and applies the rerun filter. Runs every hour
   // and rebuilds any channel whose last_rebuilt_at is more than 24h old. Hourly polling is light
-  // (a single SELECT) and is restart-safe: state lives in the DB, not in memory.
-  setInterval(() => {
+  // (a single SELECT) and is restart-safe: state lives in the DB, not in memory. Each tick also
+  // runs a full Plex library scan if the last one was more than 24h ago — without this, Plex
+  // re-indexing leaves stale rating keys in `programs` that cause stream 404s.
+  setInterval(async () => {
     try {
       const enabled = db.prepare("SELECT value FROM livetv_settings WHERE key='auto_rebuild_enabled'").get();
       if (enabled && enabled.value === '0') return;
+
+      const lastScan = db.prepare("SELECT value FROM livetv_settings WHERE key='last_library_scan_at'").get();
+      const scanStale = !lastScan || !lastScan.value ||
+        (Date.now() - new Date(lastScan.value + 'Z').getTime()) > 24 * 60 * 60 * 1000;
+      if (scanStale) {
+        try {
+          console.log('[LiveTV] Auto-scan: refreshing Plex library…');
+          const r = await scanPlexLibraries();
+          db.prepare("INSERT OR REPLACE INTO livetv_settings (key, value) VALUES ('last_library_scan_at', datetime('now'))").run();
+          console.log(`[LiveTV] Auto-scan complete: +${r.added} ~${r.updated} total=${r.total}`);
+        } catch(e) { console.warn('[LiveTV] auto-scan failed:', e.message); }
+      }
+
       const stale = db.prepare("SELECT id, name FROM channels WHERE enabled = 1 AND (last_rebuilt_at IS NULL OR last_rebuilt_at < datetime('now', '-24 hours'))").all();
       if (stale.length === 0) return;
       console.log(`[LiveTV] Auto-rebuild: ${stale.length} channel(s) stale, rebuilding…`);
@@ -3389,6 +3408,22 @@ function getCurrentProgram(channelId, now) {
   };
 }
 
+// Pick a specific playlist slot by position (instead of by wall-clock as getCurrentProgram does).
+// Used by the stream loop to advance past a broken segment without waiting for wall-clock to catch
+// up — a single 404'd movie was previously enough to lock the stream in a 5-second retry loop.
+function getProgramAtPosition(channelId, posIdx) {
+  const data = getPlaylistData(channelId);
+  if (!data || data.cycleDuration === 0 || !data.playlist.length) return null;
+  const len = data.playlist.length;
+  const idx = ((posIdx % len) + len) % len;
+  const item = data.playlist[idx];
+  return {
+    item, offsetMs: 0, remainingMs: item.duration_ms,
+    positionIndex: idx, nextIndex: (idx + 1) % len,
+    cyclePosition: data.prefixSums[idx] || 0, cycleDuration: data.cycleDuration
+  };
+}
+
 // Find the next non-filler program in the playlist from current position
 function getNextRealProgram(channelId) {
   const data = getPlaylistData(channelId);
@@ -3417,27 +3452,31 @@ function slugify(text) {
 }
 
 // --- Library Scanner ---
-app.post('/api/livetv/scan', async (req, res) => {
-  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
-  try {
-    const libRes = await axios.get(`${config.plex.url}/library/sections`, {
-      params: { 'X-Plex-Token': config.plex.token },
-      headers: { Accept: 'application/json' }, timeout: 10000
-    });
-    const libraries = libRes.data.MediaContainer.Directory || [];
-    let added = 0, updated = 0;
+// Walk every Plex library and upsert each item into the `programs` table. Returns counts.
+// Extracted from the /api/livetv/scan endpoint so the auto-rebuild cron can call it too.
+// Also prunes orphan rows: anything whose `updated_at` is older than this scan's start
+// time wasn't touched by an upsert, meaning Plex no longer has that rating key. Those rows
+// get deleted, along with any channel_programming entries pointing to them.
+async function scanPlexLibraries() {
+  const scanStartedAt = db.prepare("SELECT datetime('now') as ts").get().ts;
+  const libRes = await axios.get(`${config.plex.url}/library/sections`, {
+    params: { 'X-Plex-Token': config.plex.token },
+    headers: { Accept: 'application/json' }, timeout: 10000
+  });
+  const libraries = libRes.data.MediaContainer.Directory || [];
+  let added = 0, updated = 0;
 
-    const upsert = db.prepare(`
-      INSERT INTO programs (plex_rating_key, title, type, show_title, season_num, episode_num,
-        duration_ms, genre, year, thumb, art, content_rating, library_key, file_path, plex_key, added_at, updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'))
-      ON CONFLICT(plex_rating_key) DO UPDATE SET
-        title=excluded.title, duration_ms=excluded.duration_ms, genre=excluded.genre,
-        year=excluded.year, thumb=excluded.thumb, art=excluded.art, content_rating=excluded.content_rating,
-        file_path=excluded.file_path, added_at=COALESCE(programs.added_at, excluded.added_at), updated_at=datetime('now')
-    `);
+  const upsert = db.prepare(`
+    INSERT INTO programs (plex_rating_key, title, type, show_title, season_num, episode_num,
+      duration_ms, genre, year, thumb, art, content_rating, library_key, file_path, plex_key, added_at, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'))
+    ON CONFLICT(plex_rating_key) DO UPDATE SET
+      title=excluded.title, duration_ms=excluded.duration_ms, genre=excluded.genre,
+      year=excluded.year, thumb=excluded.thumb, art=excluded.art, content_rating=excluded.content_rating,
+      file_path=excluded.file_path, added_at=COALESCE(programs.added_at, excluded.added_at), updated_at=datetime('now')
+  `);
 
-    for (const lib of libraries) {
+  for (const lib of libraries) {
       if (lib.type !== 'movie' && lib.type !== 'show') continue;
       console.log(`LiveTV scanning library: ${lib.title} (${lib.type})`);
 
@@ -3492,9 +3531,25 @@ app.post('/api/livetv/scan', async (req, res) => {
       }
     }
 
-    const total = db.prepare('SELECT COUNT(*) as cnt FROM programs').get().cnt;
-    console.log(`LiveTV scan complete: ${added} added, ${updated} updated, ${total} total`);
-    res.json({ success: true, added, updated, total });
+  // Prune orphans: any program row whose updated_at is older than this scan started wasn't
+  // touched, so Plex no longer has that rating key. Also nuke channel_programming entries
+  // referencing the deleted program rows — next channel rebuild refills them naturally.
+  const pruned = db.prepare("DELETE FROM programs WHERE updated_at < ?").run(scanStartedAt).changes;
+  let prunedSchedule = 0;
+  if (pruned > 0) {
+    prunedSchedule = db.prepare("DELETE FROM channel_programming WHERE program_id IS NOT NULL AND program_id NOT IN (SELECT id FROM programs)").run().changes;
+  }
+  const total = db.prepare('SELECT COUNT(*) as cnt FROM programs').get().cnt;
+  console.log(`LiveTV scan complete: ${added} added, ${updated} updated, ${pruned} pruned (${prunedSchedule} schedule rows), ${total} total`);
+  return { added, updated, pruned, prunedSchedule, total };
+}
+
+app.post('/api/livetv/scan', async (req, res) => {
+  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
+  try {
+    const result = await scanPlexLibraries();
+    db.prepare("INSERT OR REPLACE INTO livetv_settings (key, value) VALUES ('last_library_scan_at', datetime('now'))").run();
+    res.json({ success: true, ...result });
   } catch (error) {
     console.error('LiveTV scan error:', error.message);
     res.status(500).json({ error: error.message });
@@ -4983,6 +5038,7 @@ app.get('/api/livetv/channels/:id/guide', (req, res) => {
 
 // --- HDHomeRun Emulation (matching ErsatzTV/Tunarr implementation) ---
 const HDHR_DEVICE_ID = '12345678';
+const HDHR_TUNER_COUNT = Math.max(1, Number(process.env.HDHR_TUNER_COUNT) || 4);
 
 function hdhrDiscover(req) {
   const baseUrl = getBaseUrl(req);
@@ -4996,7 +5052,7 @@ function hdhrDiscover(req) {
     DeviceAuth: '',
     BaseURL: baseUrl,
     LineupURL: `${baseUrl}/lineup.json`,
-    TunerCount: 2
+    TunerCount: HDHR_TUNER_COUNT
   };
 }
 
@@ -5040,6 +5096,91 @@ function pickPlexSubtitleStreamId(media, langCode) {
     }
   }
   return null;
+}
+
+// --- OpenSubtitles fallback ---
+// When Plex has no native sub track in the requested language, we query opensubtitles.com,
+// download a match once, and cache it on disk. Activated only when OPENSUBTITLES_API_KEY,
+// OPENSUBTITLES_USERNAME, and OPENSUBTITLES_PASSWORD env vars are set; otherwise no-op.
+// API docs: https://opensubtitles.stoplight.io/docs/opensubtitles-api/
+const OPENSUBTITLES_API = 'https://api.opensubtitles.com/api/v1';
+const SUBS_CACHE_DIR = '/app/data/subs';
+const OS_USER_AGENT = 'PlexCommandCenter v3.0';
+let _osTokenCache = { token: null, expiresAt: 0 };
+
+// OpenSubtitles uses ISO 639-1 (2-letter); Plex uses 639-2 (3-letter). Map the common ones.
+function osLangCode(code) {
+  const map = { eng:'en', heb:'he', spa:'es', fre:'fr', fra:'fr', ger:'de', deu:'de', ita:'it',
+                por:'pt', rus:'ru', jpn:'ja', chi:'zh', zho:'zh', ara:'ar', nld:'nl', dut:'nl',
+                swe:'sv', nor:'no', dan:'da', fin:'fi', pol:'pl', tur:'tr', kor:'ko' };
+  const c = String(code || '').toLowerCase();
+  return map[c] || c.slice(0, 2);
+}
+
+async function osLogin() {
+  if (_osTokenCache.token && _osTokenCache.expiresAt > Date.now()) return _osTokenCache.token;
+  const { OPENSUBTITLES_API_KEY: apiKey, OPENSUBTITLES_USERNAME: u, OPENSUBTITLES_PASSWORD: p } = process.env;
+  if (!apiKey || !u || !p) return null;
+  const r = await axios.post(`${OPENSUBTITLES_API}/login`, { username: u, password: p },
+    { headers: { 'Api-Key': apiKey, 'Content-Type': 'application/json', 'User-Agent': OS_USER_AGENT }, timeout: 10000 });
+  _osTokenCache = { token: r.data.token, expiresAt: Date.now() + 23 * 3600 * 1000 };
+  return _osTokenCache.token;
+}
+
+async function osSearch(program, langCode) {
+  const apiKey = process.env.OPENSUBTITLES_API_KEY;
+  if (!apiKey) return null;
+  const params = { languages: osLangCode(langCode), query: program.show_title || program.title };
+  if (program.type === 'episode') {
+    params.type = 'episode';
+    if (program.season_num) params.season_number = program.season_num;
+    if (program.episode_num) params.episode_number = program.episode_num;
+  } else {
+    params.type = 'movie';
+    if (program.year) params.year = program.year;
+  }
+  const r = await axios.get(`${OPENSUBTITLES_API}/subtitles`, {
+    params, headers: { 'Api-Key': apiKey, 'User-Agent': OS_USER_AGENT, Accept: 'application/json' },
+    timeout: 10000
+  });
+  const data = r.data?.data || [];
+  if (!data.length) return null;
+  data.sort((a, b) => (b.attributes?.ratings || 0) - (a.attributes?.ratings || 0));
+  return data[0]?.attributes?.files?.[0]?.file_id || null;
+}
+
+async function osDownload(fileId, destPath) {
+  const apiKey = process.env.OPENSUBTITLES_API_KEY;
+  const token = await osLogin();
+  if (!apiKey || !token) return false;
+  const r = await axios.post(`${OPENSUBTITLES_API}/download`, { file_id: fileId },
+    { headers: { 'Api-Key': apiKey, 'Authorization': `Bearer ${token}`, 'User-Agent': OS_USER_AGENT, 'Content-Type': 'application/json' }, timeout: 10000 });
+  if (!r.data?.link) return false;
+  const fileRes = await axios.get(r.data.link, { responseType: 'arraybuffer', timeout: 15000 });
+  await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+  await fs.promises.writeFile(destPath, Buffer.from(fileRes.data));
+  console.log(`[OpenSubtitles] cached -> ${destPath} (${fileRes.data.length}b, quota remaining today: ${r.data.remaining})`);
+  return true;
+}
+
+async function findOpenSubtitlesSubtitle(rkey, langCode) {
+  if (!process.env.OPENSUBTITLES_API_KEY) return null;
+  const destPath = `${SUBS_CACHE_DIR}/${rkey}.${osLangCode(langCode)}.srt`;
+  if (fs.existsSync(destPath)) return { kind: 'external', url: destPath, codec: 'srt' };
+  const program = db.prepare('SELECT * FROM programs WHERE plex_rating_key = ?').get(String(rkey));
+  if (!program) return null;
+  try {
+    const fileId = await osSearch(program, langCode);
+    if (!fileId) {
+      console.log(`[OpenSubtitles] no match: "${program.show_title || program.title}" S${program.season_num || '?'}E${program.episode_num || '?'} lang=${osLangCode(langCode)}`);
+      return null;
+    }
+    const ok = await osDownload(fileId, destPath);
+    return ok ? { kind: 'external', url: destPath, codec: 'srt' } : null;
+  } catch (e) {
+    console.warn(`[OpenSubtitles] fetch failed for rk=${rkey}:`, e.response?.status || e.message);
+    return null;
+  }
 }
 
 const _subtitleProbeCache = new Map();
@@ -5116,6 +5257,12 @@ async function findPlexSubtitleStream(rkey, fileUrl, langCode) {
         if (result) break;
       }
     } catch(e) { /* ignore — fall through with result=null */ }
+  }
+
+  // 3) Final fallback: OpenSubtitles (only if env keys configured). Caches SRT to disk so
+  // re-airs of the same episode are instant.
+  if (!result) {
+    result = await findOpenSubtitlesSubtitle(rkey, langCode);
   }
 
   _subtitleProbeCache.set(cacheKey, { found: result, expiresAt: Date.now() + SUBTITLE_PROBE_TTL_MS });
@@ -5518,6 +5665,13 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
     console.log(`[LiveTV] Client disconnected after ${Date.now() - streamStart}ms, ${totalBytesSent} bytes total`);
   });
 
+  // When a segment fails (e.g. Plex 404 from a stale rating key), we set this to the failed
+  // slot's `nextIndex` so the next iteration jumps forward by playlist position instead of
+  // re-picking the same broken slot by wall-clock. Reset on every wall-clock pick.
+  let forceFromPosition = null;
+  let consecutiveFailures = 0;
+  const MAX_CONSECUTIVE_FAILURES = 20;
+
   // Stream programs continuously until client disconnects or channel goes off air
   const streamNextProgram = async () => {
     if (clientDisconnected || res.writableEnded) return;
@@ -5528,7 +5682,14 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
       return;
     }
 
-    const prog = getCurrentProgram(channelId);
+    let prog;
+    if (forceFromPosition !== null) {
+      prog = getProgramAtPosition(channelId, forceFromPosition);
+      forceFromPosition = null;
+    } else {
+      prog = getCurrentProgram(channelId);
+      consecutiveFailures = 0;
+    }
     if (!prog) {
       console.log(`[LiveTV] No more programming for ch=${ch.number}, ending stream`);
       if (!res.writableEnded) res.end();
@@ -5577,8 +5738,26 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
     }
 
     if (!progRkey) {
-      console.log(`[LiveTV] No playable content for ch=${ch.number}, ending stream`);
-      if (!res.writableEnded) res.end();
+      // No Plex rating key AND no local file — typically an empty filler stub. Treat it as a
+      // failed segment so we advance by playlist position. Ending the stream here used to make
+      // the channel go dark whenever wall-clock landed on such an item.
+      const title = prog.item.filler_name || prog.item.prog_title || 'Unknown';
+      consecutiveFailures++;
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        console.error(`[LiveTV] ${MAX_CONSECUTIVE_FAILURES} consecutive empty slots on ch=${ch.number}, ending stream`);
+        if (!res.writableEnded) res.end();
+        return;
+      }
+      console.log(`[LiveTV] Empty slot "${title}" at pos ${prog.positionIndex} (#${consecutiveFailures}), advancing to position ${prog.nextIndex}`);
+      forceFromPosition = prog.nextIndex;
+      if (!clientDisconnected && !res.writableEnded) {
+        setTimeout(() => streamNextProgram().catch(e => {
+          console.error('[LiveTV] streamNextProgram error:', e.message);
+          if (!res.writableEnded) res.end();
+        }), 50);
+      } else {
+        if (!res.writableEnded) res.end();
+      }
       return;
     }
 
@@ -5724,17 +5903,29 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
       streamNextProgram().catch(e => console.error('[LiveTV] streamNextProgram error:', e.message));
     } catch (error) {
       console.error('[LiveTV] Stream segment error:', error.message);
-      // Don't end the stream on a single segment error - skip to next program
       const title = prog?.item?.prog_title || prog?.item?.filler_name || 'Unknown';
-      console.log(`[LiveTV] Skipping failed segment "${title}", advancing to next program`);
-      // Wait the remaining duration virtually so the clock advances past this broken item
-      const skipMs = Math.min(prog?.remainingMs || 5000, 5000);
-      await new Promise(r => setTimeout(r, skipMs));
+      consecutiveFailures++;
+      // Hard cap: if too many slots in a row are broken (e.g. whole playlist stale), give up so
+      // we don't loop forever pummeling Plex with metadata lookups.
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        console.error(`[LiveTV] ${MAX_CONSECUTIVE_FAILURES} consecutive failed segments on ch=${ch.number}, ending stream`);
+        if (!res.writableEnded) res.end();
+        return;
+      }
+      // Advance by playlist *position*, not wall-clock. A single 404 used to lock us in a 5s
+      // retry loop because the wall-clock barely moved — same slot, same 404, forever.
+      const nextIdx = (prog && typeof prog.nextIndex === 'number') ? prog.nextIndex : null;
+      console.log(`[LiveTV] Skipping failed segment "${title}" (#${consecutiveFailures}), advancing to position ${nextIdx}`);
+      if (nextIdx !== null) forceFromPosition = nextIdx;
       if (!clientDisconnected && !res.writableEnded) {
-        streamNextProgram().catch(e => {
-          console.error('[LiveTV] streamNextProgram error:', e.message);
-          if (!res.writableEnded) res.end();
-        });
+        // Tiny delay so we don't tight-loop if the next slot also 404s; the counter cap above
+        // bounds total time anyway.
+        setTimeout(() => {
+          streamNextProgram().catch(e => {
+            console.error('[LiveTV] streamNextProgram error:', e.message);
+            if (!res.writableEnded) res.end();
+          });
+        }, 100);
       } else {
         if (!res.writableEnded) res.end();
       }
@@ -6023,8 +6214,10 @@ app.get('/api/livetv/fillers/yt-downloads', (req, res) => {
   res.json(db.prepare('SELECT * FROM yt_downloads ORDER BY created_at DESC LIMIT 50').all());
 });
 
-// Start a single YouTube download
-function startYtDownload(url, quality, channelIds, fillerName) {
+// Start a single YouTube download. `meta` is an optional { genre, content_type } pair that gets
+// stored on the resulting filler row so the legacy genre-match fallback in buildChannelPlaylist
+// can pick it up across channels.
+function startYtDownload(url, quality, channelIds, fillerName, meta) {
   const q = quality || '480p';
   const height = parseInt(q) || 480;
 
@@ -6045,6 +6238,9 @@ function startYtDownload(url, quality, channelIds, fillerName) {
 
   const proc = spawn('yt-dlp', args);
   activeDownloads.set(dlId, proc);
+  // Keep the tail of stderr so a failure stores a useful reason in error_msg instead of just
+  // "exit code 1". Plain progress lines get filtered out so we keep only the meaningful chatter.
+  let stderrTail = '';
 
   proc.on('error', (err) => {
     console.error(`[YT-DL] spawn error for download ${dlId}:`, err.message);
@@ -6063,8 +6259,14 @@ function startYtDownload(url, quality, channelIds, fillerName) {
   });
 
   proc.stderr.on('data', (data) => {
-    const match = data.toString().match(/\[download\]\s+([\d.]+)%/);
+    const chunk = data.toString();
+    const match = chunk.match(/\[download\]\s+([\d.]+)%/);
     if (match) db.prepare('UPDATE yt_downloads SET progress = ?, status = ? WHERE id = ?').run(Math.round(parseFloat(match[1])), 'downloading', dlId);
+    // Accumulate everything except plain [download] progress lines for diagnostics.
+    for (const line of chunk.split('\n')) {
+      if (!line.trim() || /^\[download\]\s+\d/.test(line)) continue;
+      stderrTail = (stderrTail + line + '\n').slice(-1000);
+    }
   });
 
   proc.on('close', (code) => {
@@ -6089,8 +6291,8 @@ function startYtDownload(url, quality, channelIds, fillerName) {
         if (!fillerName) title = path.basename(filePath, path.extname(filePath));
       }
 
-      const fillerResult = db.prepare('INSERT INTO fillers (name, type, duration_ms, local_path, enabled, verified) VALUES (?,?,?,?,1,1)')
-        .run(title, 'youtube', durationMs, filePath);
+      const fillerResult = db.prepare('INSERT INTO fillers (name, type, duration_ms, local_path, enabled, verified, genre, content_type) VALUES (?,?,?,?,1,1,?,?)')
+        .run(title, 'youtube', durationMs, filePath, meta?.genre || null, meta?.content_type || null);
       const fillerId = fillerResult.lastInsertRowid;
 
       if (channelIds && Array.isArray(channelIds)) {
@@ -6102,7 +6304,9 @@ function startYtDownload(url, quality, channelIds, fillerName) {
         .run('done', fileSize, durationMs, title, fillerId, new Date().toISOString(), dlId);
       console.log(`[YT-DL] Download complete: ${title} (${(fileSize/1048576).toFixed(1)} MB, ${Math.round(durationMs/1000)}s)`);
     } else {
-      db.prepare('UPDATE yt_downloads SET status=?, error_msg=? WHERE id=?').run('error', `yt-dlp exited with code ${code}`, dlId);
+      const reason = stderrTail.trim() || `yt-dlp exited with code ${code}`;
+      db.prepare('UPDATE yt_downloads SET status=?, error_msg=? WHERE id=?').run('error', reason.slice(0, 800), dlId);
+      console.warn(`[YT-DL] Download ${dlId} failed (code=${code}): ${reason.split('\n').pop()}`);
     }
   });
 
@@ -6131,6 +6335,57 @@ app.post('/api/livetv/fillers/yt-download-batch', (req, res) => {
     ids.push(dlId);
   }
   res.json({ success: true, count: ids.length, ids });
+});
+
+// Auto-fetch fillers from YouTube for a channel based on its genre + content type. Uses
+// yt-dlp's `ytsearchN:<query>` to grab the top N candidates, filters out anything over 5 min
+// (we want short trailers/teasers, not full episodes), and enqueues a download for each.
+// Body: { channel_id, count?, quality?, query? } — query overrides the auto-generated string.
+app.post('/api/livetv/fillers/auto-fetch', async (req, res) => {
+  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
+  const { channel_id, count = 10, quality = '480p', query: customQuery } = req.body || {};
+  if (!channel_id) return res.status(400).json({ error: 'channel_id required' });
+  const channel = db.prepare('SELECT * FROM channels WHERE id = ?').get(channel_id);
+  if (!channel) return res.status(404).json({ error: 'channel not found' });
+
+  // Derive genre + content_type from the channel's source_value JSON.
+  let genre = null, contentType = null;
+  try {
+    const sv = JSON.parse(channel.source_value || '{}');
+    genre = sv.genre || null;
+    contentType = sv.content_type || null;
+  } catch(e) {}
+
+  const noun = contentType === 'episode' ? 'tv show' : (contentType === 'movie' ? 'movie' : '');
+  const query = customQuery || `${genre || channel.name} ${noun} trailer`.trim();
+  const n = Math.max(1, Math.min(50, parseInt(count) || 10));
+
+  try {
+    // yt-dlp --dump-json gives one JSON line per result; --flat-playlist keeps it light (no per-video extraction).
+    const search = spawnSync('yt-dlp',
+      ['--dump-json', '--flat-playlist', '--no-warnings', `ytsearch${n * 2}:${query}`],
+      { timeout: 60000, maxBuffer: 8 * 1024 * 1024 });
+    if (search.status !== 0) {
+      return res.status(500).json({ error: 'yt-dlp search failed', detail: (search.stderr || '').toString().slice(0, 400) });
+    }
+    const candidates = (search.stdout || '').toString().split('\n').filter(Boolean).map(l => {
+      try { return JSON.parse(l); } catch(e) { return null; }
+    }).filter(Boolean);
+
+    // Drop anything obviously too long (>5 min) — flat-playlist gives duration in seconds.
+    const usable = candidates.filter(c => !c.duration || c.duration <= 300).slice(0, n);
+    const enqueued = [];
+    for (const c of usable) {
+      const url = c.webpage_url || (c.id ? `https://www.youtube.com/watch?v=${c.id}` : null);
+      if (!url) continue;
+      const name = `${genre || channel.name} - ${c.title || 'Trailer'}`.slice(0, 200);
+      const dlId = startYtDownload(url, quality, [channel_id], name, { genre, content_type: contentType });
+      enqueued.push({ id: dlId, url, title: c.title, duration: c.duration });
+    }
+    res.json({ success: true, query, totalFound: candidates.length, enqueued });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.delete('/api/livetv/fillers/yt-downloads/:id', (req, res) => {
@@ -6741,6 +6996,24 @@ app.post('/api/tools/edit-date-added', (req, res) => {
   res.json({
     success: false,
     message: 'Date Added Editor requires Plex API PUT access to /library/metadata/{ratingKey} with addedAt parameter. This is disabled by default as it modifies library metadata directly. Enable it in settings if you understand the risks.'
+  });
+});
+
+// Server discovery for clients that want automatic LAN/tailscale failover. The TV app caches
+// `tailscaleUrl` after a successful LAN connect, then uses it as a fallback on later launches
+// when the LAN URL stops responding (e.g. user is off the home network).
+//
+// Env precedence (must describe THIS Command Center container, not the Plex server):
+//   PCC_LAN_URL          — full URL for LAN reach, e.g. http://192.168.1.12:3001
+//   PCC_TAILSCALE_URL    — full URL for tailscale reach, e.g. http://100.70.252.122:3001
+//   LIVETV_BASE_URL      — already used by tuner endpoints; falls back as tailscaleUrl
+// LOCAL_IP / TAILSCALE_IP are intentionally NOT used here — in some setups those describe
+// the Plex server (a different machine) and would mislead clients to download from there.
+app.get('/api/server-info', (req, res) => {
+  res.json({
+    lanUrl: process.env.PCC_LAN_URL || null,
+    tailscaleUrl: process.env.PCC_TAILSCALE_URL || process.env.LIVETV_BASE_URL || null,
+    hostname: require('os').hostname()
   });
 });
 
