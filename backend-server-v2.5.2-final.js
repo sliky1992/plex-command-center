@@ -1683,6 +1683,13 @@ function requireAuth(req, res, next) {
     if (!checkTunerKey(req)) return res.status(401).json({ error: 'Tuner key required' });
     return next();
   }
+  // Loopback bypass — the auto-collection cron calls /api/plex/collections/suggestions over
+  // HTTP against its own process. Loopback (127.0.0.1 / ::1) traffic can only come from inside
+  // the container's own network namespace, so it's safe to trust. Without this bypass the auth
+  // middleware introduced in 3.1.0 broke the internal cron.
+  if (req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1') {
+    if (req.path.startsWith('/api/')) return next();
+  }
   // Skip auth for static files / non-API
   if (!req.path.startsWith('/api/')) return next();
 
@@ -5047,37 +5054,70 @@ function _bumpProbeCache() {
 }
 
 // findPlexSubtitleStream: ffprobes the Plex media URL for subtitle streams whose language tag
-// matches `langCode` (3-letter ISO 639-2). Returns { relIdx, codec } or null.
-// `relIdx` is the index *among subtitle streams only* — that's what ffmpeg's `subtitles` filter
-// expects via its `si=` parameter.
-function findPlexSubtitleStream(rkey, fileUrl, langCode) {
+// matches `langCode`. Returns one of:
+//   { kind: 'embedded', relIdx, codec }   — embedded sub at the given subtitle-relative index
+//   { kind: 'external', url, codec }      — external sidecar (e.g. .srt) reachable as a URL
+//   null                                   — no match
+// We try ffprobe first (cheap, no extra HTTP) and fall back to Plex metadata when ffprobe sees
+// nothing — that covers the common AVI-with-sidecar-SRT case where the video file itself has
+// no embedded sub tracks but Plex knows about a companion .srt in the same folder.
+async function findPlexSubtitleStream(rkey, fileUrl, langCode) {
   if (!langCode) return null;
   const cacheKey = _subtitleProbeKey(rkey, langCode);
   const cached = _subtitleProbeCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return cached.found;
-  const r = spawnSync('ffprobe', [
-    '-v', 'error',
-    '-select_streams', 's',
-    '-show_entries', 'stream=index,codec_name:stream_tags=language',
-    '-of', 'json',
-    fileUrl
-  ], { timeout: 10000, maxBuffer: 2 * 1024 * 1024 });
+
   let result = null;
+  const target = String(langCode).toLowerCase();
+
+  // 1) ffprobe of the video URL — finds EMBEDDED subs only.
+  const r = spawnSync('ffprobe', [
+    '-v', 'error', '-select_streams', 's',
+    '-show_entries', 'stream=index,codec_name:stream_tags=language',
+    '-of', 'json', fileUrl
+  ], { timeout: 10000, maxBuffer: 2 * 1024 * 1024 });
   if (!r.error && r.status === 0) {
     try {
       const parsed = JSON.parse((r.stdout || '').toString());
       const streams = Array.isArray(parsed.streams) ? parsed.streams : [];
-      const target = langCode.toLowerCase();
       for (let i = 0; i < streams.length; i++) {
         const s = streams[i];
         const lang = (s.tags && (s.tags.language || s.tags.LANGUAGE)) || '';
         if (String(lang).toLowerCase() === target) {
-          result = { relIdx: i, codec: s.codec_name || 'unknown' };
+          result = { kind: 'embedded', relIdx: i, codec: s.codec_name || 'unknown' };
           break;
         }
       }
     } catch(e) { /* ignore parse errors */ }
   }
+
+  // 2) Fallback: Plex metadata. Catches external sidecar SRTs that ffprobe of the video can't see.
+  if (!result) {
+    try {
+      const metaRes = await axios.get(`${config.plex.url}/library/metadata/${rkey}`, {
+        params: { 'X-Plex-Token': config.plex.token },
+        headers: { Accept: 'application/json' }, timeout: 5000
+      });
+      const media = metaRes.data?.MediaContainer?.Metadata?.[0]?.Media?.[0];
+      for (const part of (media?.Part || [])) {
+        for (const s of (part.Stream || [])) {
+          if (s.streamType !== 3) continue;
+          const lang = (s.languageCode || s.language || '').toLowerCase();
+          if (lang !== target && !lang.startsWith(target) && !target.startsWith(lang)) continue;
+          // External streams have a `key` like `/library/streams/<id>`; embedded ones don't.
+          // For embedded matches we still need ffmpeg's si= index, but since ffprobe didn't find
+          // one above, treating it as external+key won't make matters worse.
+          if (s.key) {
+            const url = `${config.plex.url}${s.key}?X-Plex-Token=${config.plex.token}`;
+            result = { kind: 'external', url, codec: (s.codec || s.format || 'srt').toLowerCase() };
+            break;
+          }
+        }
+        if (result) break;
+      }
+    } catch(e) { /* ignore — fall through with result=null */ }
+  }
+
   _subtitleProbeCache.set(cacheKey, { found: result, expiresAt: Date.now() + SUBTITLE_PROBE_TTL_MS });
   _bumpProbeCache();
   return result;
@@ -5090,24 +5130,26 @@ const TEXT_SUB_CODECS = new Set(['mov_text', 'subrip', 'srt', 'ass', 'ssa', 'web
 const BITMAP_SUB_CODECS = new Set(['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'pgssub']);
 
 // Build the ffmpeg burn-in arguments for a given matched subtitle stream. Returns:
-//   { vfPrefix: ['-vf', 'subtitles=...'], forceTranscode: true } if burnable
+//   { vfArgs: ['-vf', 'subtitles=...'], forceTranscode: true } if burnable
 //   null otherwise
 function buildSubtitleBurnArgs(fileUrl, sub) {
   if (!sub) return null;
   if (BITMAP_SUB_CODECS.has(sub.codec)) {
-    // Could overlay these via filter_complex, but the filter syntax is fragile and the codec
-    // mapping varies across ffmpeg builds — defer until a clear need surfaces.
     console.log(`[LiveTV] Subtitle stream is bitmap (${sub.codec}); skipping burn-in.`);
     return null;
   }
   if (!TEXT_SUB_CODECS.has(sub.codec)) {
-    // Unknown codec — try anyway; ffmpeg may handle it. If not, the caller already swallows
-    // ffmpeg failures and the stream just plays without subs.
     console.log(`[LiveTV] Subtitle stream codec '${sub.codec}' isn't in the known-text list; trying burn-in anyway.`);
   }
-  // Filter graph value is a single arg: spawn does no shell expansion. Inside the filter parser,
-  // we wrap the URL in single quotes; Plex URLs never contain single quotes so this is safe.
-  const filterValue = `subtitles='${fileUrl}':si=${sub.relIdx}`;
+  // ffmpeg's `subtitles` filter takes a file/URL and optional stream index. For embedded we use
+  // `si=<rel>` to select the Nth subtitle stream of the input. For external (sidecar SRTs Plex
+  // serves at /library/streams/<id>) the file is single-track so no si= is needed.
+  let filterValue;
+  if (sub.kind === 'external') {
+    filterValue = `subtitles='${sub.url}'`;
+  } else {
+    filterValue = `subtitles='${fileUrl}':si=${sub.relIdx}`;
+  }
   return { vfArgs: ['-vf', filterValue], forceTranscode: true };
 }
 
@@ -5126,15 +5168,18 @@ app.get('/lineup_status.json', (req, res) => {
 
 app.get('/lineup.json', (req, res) => {
   if (!LIVETV_ENABLED) return res.json([]);
+  // Plex DVR caches the lineup and re-fetches infrequently. If we omit off-air channels here,
+  // they vanish from the DVR's channel list entirely until the next refresh — a channel that
+  // only airs evenings would never show up unless the user happened to scan at the right hour.
+  // We list every enabled channel; the /api/livetv/stream/<id>.ts endpoint already plays an
+  // off-air screen for channels outside their schedule, so tuning still does something sensible.
   const channels = db.prepare('SELECT * FROM channels WHERE enabled = 1 ORDER BY number').all();
   const baseUrl = getBaseUrl(req);
-  const lineup = channels
-    .filter(ch => isChannelEffectivelyOnAir(ch.id))
-    .map(ch => ({
-      GuideNumber: String(ch.number),
-      GuideName: ch.name,
-      URL: `${baseUrl}/api/livetv/stream/${ch.id}.ts`
-    }));
+  const lineup = channels.map(ch => ({
+    GuideNumber: String(ch.number),
+    GuideName: ch.name,
+    URL: `${baseUrl}/api/livetv/stream/${ch.id}.ts`
+  }));
   res.json(lineup);
 });
 
@@ -5576,7 +5621,7 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
       const subSettings = readSubtitleSettings();
       let burnArgs = null;
       if (subSettings.language && subSettings.mode === 'burn') {
-        const sub = findPlexSubtitleStream(progRkey, fileUrl, subSettings.language);
+        const sub = await findPlexSubtitleStream(progRkey, fileUrl, subSettings.language);
         if (sub) {
           burnArgs = buildSubtitleBurnArgs(fileUrl, sub);
           if (burnArgs) console.log(`[LiveTV] Burning ${subSettings.language} subtitle (codec=${sub.codec}, si=${sub.relIdx})`);

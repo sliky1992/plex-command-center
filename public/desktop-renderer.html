@@ -471,10 +471,15 @@
       <div style="font-size:64px">📺</div>
       <h2>Plex LiveTV</h2>
       <p>Enter your Plex Command Center server URL and credentials to connect.</p>
-      <input type="text" class="setup-input" id="serverInput" placeholder="http://192.168.1.100:3001" />
+      <input type="text" class="setup-input" id="serverInput" placeholder="http://192.168.1.100:3001 (LAN / primary)" />
+      <input type="text" class="setup-input" id="fallbackInput" placeholder="http://100.x.x.x:3001 (Tailscale / fallback, optional)" style="margin-top:8px" />
       <input type="text" class="setup-input" id="loginUserInput" placeholder="Username" style="margin-top:8px" />
       <input type="password" class="setup-input" id="loginPassInput" placeholder="Password" style="margin-top:8px" />
-      <button class="setup-btn" id="connectBtn" onclick="testAndConnect()">Connect & Login</button>
+      <label style="display:flex;align-items:center;gap:6px;margin-top:10px;font-size:13px;color:#cbd5e1;cursor:pointer;user-select:none">
+        <input type="checkbox" id="rememberMeInput" checked style="margin:0;cursor:pointer" />
+        Remember me on this device
+      </label>
+      <button class="setup-btn" id="connectBtn" onclick="testAndConnect()">Connect &amp; Login</button>
       <div id="setupStatus"></div>
     </div>
   </div>
@@ -580,13 +585,47 @@
       return fetch(url, opts);
     }
 
+    // Probe a single base URL with /api/health and a short timeout. Resolves with the URL on
+    // success, throws on failure. Used by resolveBestServerUrl() to race primary vs fallback.
+    async function probeServerUrl(url, timeoutMs = 2500) {
+      const r = await fetch(`${url}/api/health`, { signal: AbortSignal.timeout(timeoutMs) });
+      if (!r.ok) throw new Error(`probe ${url} -> ${r.status}`);
+      const data = await r.json().catch(() => ({}));
+      if (data.status !== 'ok') throw new Error(`probe ${url} -> not ok`);
+      return url;
+    }
+
+    // Smart resolver: tries primary URL first; if it doesn't respond inside the short timeout,
+    // falls back to the secondary URL. Returns whichever responds, or null if both fail.
+    // Backend can't do this for us — only the *client* knows which network it's on, so the
+    // probe has to run client-side. The user enters a LAN URL + Tailscale URL once; we pick.
+    async function resolveBestServerUrl(primary, fallback) {
+      if (primary) {
+        try { return await probeServerUrl(primary); } catch(e) { /* fall through */ }
+      }
+      if (fallback && fallback !== primary) {
+        try { return await probeServerUrl(fallback); } catch(e) { /* fall through */ }
+      }
+      return null;
+    }
+
     const video = document.getElementById('videoPlayer');
 
     // ---- Init ----
     async function init() {
       const settings = await electronAPI.getSettings();
       if (settings.serverUrl && (settings.sessionToken || settings.savedUser)) {
-        state.serverUrl = settings.serverUrl;
+        // Pick whichever of the two configured URLs is reachable from this network. Primary
+        // (typically LAN) is tried first; on timeout we fall back to the secondary (Tailscale).
+        const best = await resolveBestServerUrl(settings.serverUrl, settings.fallbackUrl);
+        if (!best) {
+          // Neither URL responds — show setup so the user can re-check / re-enter.
+          showSetup();
+          document.getElementById('setupStatus').innerHTML =
+            '<span class="setup-error">Saved server(s) unreachable. Verify URLs and try again.</span>';
+          return;
+        }
+        state.serverUrl = best;
         state.sessionToken = settings.sessionToken;
         state.volume = settings.volume || 80;
         state.lastChannel = settings.lastChannel;
@@ -630,10 +669,20 @@
       }
     }
 
-    function showSetup() {
+    async function showSetup() {
       document.getElementById('setupScreen').style.display = 'flex';
       document.getElementById('mainApp').style.display = 'none';
-      document.getElementById('serverInput').value = state.serverUrl || '';
+      // Pre-fill from saved settings so the user doesn't lose their config when they re-open setup.
+      try {
+        const s = await electronAPI.getSettings();
+        document.getElementById('serverInput').value = state.serverUrl || s.serverUrl || '';
+        document.getElementById('fallbackInput').value = s.fallbackUrl || '';
+        document.getElementById('rememberMeInput').checked = s.remember !== false;
+        if (s.remember !== false && s.savedUser) {
+          document.getElementById('loginUserInput').value = s.savedUser;
+          if (s.savedPass) document.getElementById('loginPassInput').value = s.savedPass;
+        }
+      } catch(e) {}
     }
 
     function showMain() {
@@ -644,27 +693,33 @@
 
     // ---- Server Connection ----
     async function testAndConnect() {
-      const url = document.getElementById('serverInput').value.trim().replace(/\/+$/, '');
+      const primaryUrl = document.getElementById('serverInput').value.trim().replace(/\/+$/, '');
+      const fallbackUrl = document.getElementById('fallbackInput').value.trim().replace(/\/+$/, '');
       const username = document.getElementById('loginUserInput').value.trim();
       const password = document.getElementById('loginPassInput').value;
+      const remember = document.getElementById('rememberMeInput').checked;
       const statusEl = document.getElementById('setupStatus');
       const btn = document.getElementById('connectBtn');
 
-      if (!url) { statusEl.innerHTML = '<span class="setup-error">Enter a server URL</span>'; return; }
+      if (!primaryUrl) { statusEl.innerHTML = '<span class="setup-error">Enter a server URL</span>'; return; }
       if (!username || !password) { statusEl.innerHTML = '<span class="setup-error">Enter username and password</span>'; return; }
 
       btn.disabled = true;
       statusEl.innerHTML = '<span style="color:#94a3b8">Connecting...</span>';
 
       try {
-        // Test server health first
-        const r = await fetch(`${url}/api/health`, { signal: AbortSignal.timeout(5000) });
-        const data = await r.json();
-        if (data.status !== 'ok') {
-          statusEl.innerHTML = '<span class="setup-error">Invalid response from server</span>';
+        // Probe both URLs (primary then fallback). Whichever responds becomes the active one.
+        statusEl.innerHTML = '<span style="color:#94a3b8">Probing server(s)...</span>';
+        const url = await resolveBestServerUrl(primaryUrl, fallbackUrl);
+        if (!url) {
+          statusEl.innerHTML = '<span class="setup-error">No server responded. Check the URL(s) and that the container is running.</span>';
           btn.disabled = false;
           return;
         }
+
+        // Confirm LiveTV is enabled on the responder
+        const r = await fetch(`${url}/api/health`, { signal: AbortSignal.timeout(5000) });
+        const data = await r.json();
         if (!data.services?.livetv) {
           statusEl.innerHTML = '<span class="setup-error">Server connected but LiveTV is not enabled</span>';
           btn.disabled = false;
@@ -672,7 +727,7 @@
         }
 
         // Login
-        statusEl.innerHTML = '<span style="color:#94a3b8">Logging in...</span>';
+        statusEl.innerHTML = `<span style="color:#94a3b8">Logging in via ${url === primaryUrl ? 'primary' : 'fallback'}...</span>`;
         const loginRes = await fetch(`${url}/api/auth/login`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -696,7 +751,24 @@
 
         state.serverUrl = url;
         state.sessionToken = token;
-        await electronAPI.saveSettings({ ...await electronAPI.getSettings(), serverUrl: url, sessionToken: token, savedUser: username, savedPass: password });
+        // Persist: always save URLs (so we can probe them next launch), only save credentials
+        // when the user opted in. When "remember" is off, clear any previously-saved password.
+        const prev = await electronAPI.getSettings();
+        const toSave = {
+          ...prev,
+          serverUrl: primaryUrl,
+          fallbackUrl: fallbackUrl || '',
+          sessionToken: token,
+          remember
+        };
+        if (remember) {
+          toSave.savedUser = username;
+          toSave.savedPass = password;
+        } else {
+          toSave.savedUser = '';
+          toSave.savedPass = '';
+        }
+        await electronAPI.saveSettings(toSave);
         statusEl.innerHTML = '<span class="setup-success">Connected! Loading channels...</span>';
         showMain();
         await syncChannels();
