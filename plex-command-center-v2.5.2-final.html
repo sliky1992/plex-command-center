@@ -273,6 +273,22 @@ function App() {
   const [blockModal, setBlockModal] = useState(null);
   const [blockReason, setBlockReason] = useState('');
 
+  // Regional security + alerts state
+  const [regSettings, setRegSettings] = useState({enabled:false, allowed_countries:[], action:'alert_only', telegram_chat_id:'', telegram_bot_token_set:false, telegram_webhook_secret_set:false});
+  const [regCountriesText, setRegCountriesText] = useState('');
+  const [regTelegramBotToken, setRegTelegramBotToken] = useState('');
+  const [regTelegramSecret, setRegTelegramSecret] = useState('');
+  const [regAlerts, setRegAlerts] = useState([]);
+  const [regAlertsFilter, setRegAlertsFilter] = useState('pending');
+  const [regWhitelist, setRegWhitelist] = useState([]);
+  const [regWhitelistIp, setRegWhitelistIp] = useState('');
+  const [regWhitelistReason, setRegWhitelistReason] = useState('');
+  const [regSaving, setRegSaving] = useState(false);
+
+  // LiveTV subtitle settings
+  const [subSettings, setSubSettings] = useState({language:'', mode:'burn'});
+  const [subSaving, setSubSaving] = useState(false);
+
   // YouTube filler download state
   const [ytModal, setYtModal] = useState(false);
   const [ytScanResults, setYtScanResults] = useState([]);
@@ -494,6 +510,71 @@ function App() {
     setBlockModal(null); setBlockReason(''); showToast('Blocked'); loadSecLive(); loadSecBlocked();
   };
   const doUnblock = async (id) => { await fetch(`/api/security/block/${id}`,{method:'DELETE'}); showToast('Unblocked'); loadSecBlocked(); };
+
+  // Regional security functions
+  const loadRegSettings = async () => {
+    const r = await fetch('/api/security/regional-settings').then(x=>x.json()).catch(()=>null);
+    if (!r || r.error) return;
+    setRegSettings(r);
+    setRegCountriesText((r.allowed_countries||[]).join(', '));
+  };
+  const loadRegAlerts = async () => {
+    const q = regAlertsFilter ? `?decision=${regAlertsFilter}` : '';
+    const r = await fetch(`/api/security/alerts${q}`).then(x=>x.json()).catch(()=>[]);
+    setRegAlerts(Array.isArray(r)?r:[]);
+  };
+  const loadRegWhitelist = async () => {
+    const r = await fetch('/api/security/regional-whitelist').then(x=>x.json()).catch(()=>[]);
+    setRegWhitelist(Array.isArray(r)?r:[]);
+  };
+  const saveRegSettings = async () => {
+    setRegSaving(true);
+    const body = {
+      enabled: !!regSettings.enabled,
+      allowed_countries: regCountriesText.split(',').map(s=>s.trim()).filter(Boolean),
+      action: regSettings.action || 'alert_only'
+    };
+    if (regTelegramBotToken) body.telegram_bot_token = regTelegramBotToken;
+    if (regSettings.telegram_chat_id !== undefined) body.telegram_chat_id = regSettings.telegram_chat_id || '';
+    if (regTelegramSecret) body.telegram_webhook_secret = regTelegramSecret;
+    const r = await fetch('/api/security/regional-settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    setRegSaving(false);
+    if (r.ok) { showToast('Saved'); setRegTelegramBotToken(''); setRegTelegramSecret(''); loadRegSettings(); }
+    else { const d = await r.json().catch(()=>({})); showToast(d.error||'Save failed','error'); }
+  };
+  const testTelegram = async () => {
+    const r = await fetch('/api/security/regional-settings/test-telegram',{method:'POST'});
+    const d = await r.json().catch(()=>({}));
+    if (r.ok) showToast('Telegram test sent'); else showToast(d.error||'Test failed','error');
+  };
+  const addRegWhitelist = async () => {
+    if (!regWhitelistIp.trim()) return;
+    const r = await fetch('/api/security/regional-whitelist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip_address:regWhitelistIp.trim(), reason:regWhitelistReason.trim()||null})});
+    if (r.ok) { setRegWhitelistIp(''); setRegWhitelistReason(''); showToast('Added'); loadRegWhitelist(); }
+    else { const d = await r.json().catch(()=>({})); showToast(d.error||'Failed','error'); }
+  };
+  const removeRegWhitelist = async (id) => {
+    await fetch(`/api/security/regional-whitelist/${id}`,{method:'DELETE'});
+    loadRegWhitelist();
+  };
+  const resolveRegAlert = async (uuid, decision) => {
+    const r = await fetch(`/api/security/alerts/${uuid}/resolve`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({decision})});
+    if (r.ok) { showToast(`Alert ${decision==='allow'?'allowed':'blocked'}`); loadRegAlerts(); }
+    else { const d = await r.json().catch(()=>({})); showToast(d.error||'Failed','error'); }
+  };
+
+  // LiveTV subtitle functions
+  const loadSubSettings = async () => {
+    const r = await fetch('/api/livetv/subtitle-settings').then(x=>x.json()).catch(()=>null);
+    if (r && !r.error) setSubSettings(r);
+  };
+  const saveSubSettings = async () => {
+    setSubSaving(true);
+    const r = await fetch('/api/livetv/subtitle-settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(subSettings)});
+    setSubSaving(false);
+    const d = await r.json().catch(()=>({}));
+    if (r.ok) showToast('Subtitle settings saved'); else showToast(d.error||'Save failed','error');
+  };
 
   // YouTube filler functions
   const ytScanTrailers = async () => {
@@ -1351,8 +1432,8 @@ function App() {
             <button className={`nav-btn ${tab==='history'?'active':''}`} onClick={()=>{setTab('history');loadHistory();}}>Watch History</button>
             <button className={`nav-btn ${tab==='system'?'active':''}`} onClick={()=>setTab('system')}>System</button>
             <button className={`nav-btn ${tab==='tools'?'active':''}`} onClick={()=>setTab('tools')}>Tools</button>
-            {currentUser?.role==='admin' && <button className={`nav-btn ${tab==='security'?'active':''}`} onClick={()=>{setTab('security');loadSecLive();loadSecBlocked();}}>Security</button>}
-            {currentUser?.role==='admin' && <button className={`nav-btn ${tab==='admin'?'active':''}`} onClick={()=>{setTab('admin');loadAdminUsers();}}>Admin</button>}
+            {currentUser?.role==='admin' && <button className={`nav-btn ${tab==='security'?'active':''}`} onClick={()=>{setTab('security');loadSecLive();loadSecBlocked();loadRegSettings();loadRegAlerts();loadRegWhitelist();}}>Security</button>}
+            {currentUser?.role==='admin' && <button className={`nav-btn ${tab==='admin'?'active':''}`} onClick={()=>{setTab('admin');loadAdminUsers();loadSubSettings();}}>Admin</button>}
             <button className={`nav-btn ${tab==='livetv'?'active':''}`} onClick={()=>setTab('livetv')}>Live TV</button>
             <div style={{display:'flex',alignItems:'center',gap:'.5rem',marginLeft:'.5rem',paddingLeft:'.75rem',borderLeft:'1px solid rgba(100,116,139,.2)'}}>
               {currentUser?.plex_thumb ? <img src={currentUser.plex_thumb} style={{width:28,height:28,borderRadius:'50%'}}/> : <div className="avatar" style={{width:28,height:28,fontSize:'.7rem'}}>{currentUser?.username?.[0]?.toUpperCase()}</div>}
@@ -1365,7 +1446,7 @@ function App() {
             {[['dashboard','Dashboard'],['streams','Active Streams'],['users','Top Users'],['history','Watch History'],['system','System'],['tools','Tools'],['livetv','Live TV']].map(([k,l])=>(
               <button key={k} className={`nav-btn ${tab===k?'active':''}`} onClick={()=>{setTab(k);setMenuOpen(false);if(k==='history')loadHistory();}}>{l}</button>
             ))}
-            {currentUser?.role==='admin' && <button className={`nav-btn ${tab==='security'?'active':''}`} onClick={()=>{setTab('security');setMenuOpen(false);loadSecLive();loadSecBlocked();}}>Security</button>}
+            {currentUser?.role==='admin' && <button className={`nav-btn ${tab==='security'?'active':''}`} onClick={()=>{setTab('security');setMenuOpen(false);loadSecLive();loadSecBlocked();loadRegSettings();loadRegAlerts();loadRegWhitelist();}}>Security</button>}
             {currentUser?.role==='admin' && <button className={`nav-btn ${tab==='admin'?'active':''}`} onClick={()=>{setTab('admin');setMenuOpen(false);loadAdminUsers();}}>Admin</button>}
             <button className="btn-sm btn-outline" onClick={doLogout} style={{margin:'.5rem'}}>Logout</button>
           </div>
@@ -1832,6 +1913,9 @@ function App() {
               <button className={`toggle-opt ${secView==='live'?'active':''}`} onClick={()=>{setSecView('live');loadSecLive();}}>Live Connections</button>
               <button className={`toggle-opt ${secView==='history'?'active':''}`} onClick={()=>{setSecView('history');loadSecHistory();}}>Connection History</button>
               <button className={`toggle-opt ${secView==='blocked'?'active':''}`} onClick={()=>{setSecView('blocked');loadSecBlocked();}}>Blocked ({secBlocked.length})</button>
+              <button className={`toggle-opt ${secView==='regional'?'active':''}`} onClick={()=>{setSecView('regional');loadRegSettings();loadRegAlerts();}}>Geofence</button>
+              <button className={`toggle-opt ${secView==='alerts'?'active':''}`} onClick={()=>{setSecView('alerts');loadRegAlerts();}}>Alerts</button>
+              <button className={`toggle-opt ${secView==='whitelist'?'active':''}`} onClick={()=>{setSecView('whitelist');loadRegWhitelist();}}>Whitelist ({regWhitelist.length})</button>
             </div>
             {secView==='live' && (
               <div>
@@ -1914,6 +1998,128 @@ function App() {
                 )}
               </div>
             )}
+            {secView==='regional' && (
+              <div className="stream-card" style={{padding:'1.25rem'}}>
+                <div style={{fontWeight:600,fontSize:'1rem',marginBottom:'.75rem'}}>Geo Restriction</div>
+                <div style={{fontSize:'.8rem',color:'#94a3b8',marginBottom:'1rem'}}>Alert (or auto-terminate) any Plex stream that originates from a country not in the allowlist. "Local" covers LAN/private IPs.</div>
+                <div className="form-row" style={{display:'flex',alignItems:'center',gap:'.6rem',marginBottom:'1rem'}}>
+                  <input type="checkbox" id="reg-enabled" checked={!!regSettings.enabled} onChange={e=>setRegSettings({...regSettings,enabled:e.target.checked})}/>
+                  <label htmlFor="reg-enabled" style={{fontWeight:600}}>Enable geo restriction</label>
+                </div>
+                <div className="form-row" style={{marginBottom:'1rem'}}>
+                  <label className="form-label">Allowed countries (comma-separated)</label>
+                  <input className="form-input" value={regCountriesText} onChange={e=>setRegCountriesText(e.target.value)} placeholder="Israel, United States, Local"/>
+                </div>
+                <div className="form-row" style={{marginBottom:'1rem'}}>
+                  <label className="form-label">Action on violation</label>
+                  <select className="form-select" value={regSettings.action||'alert_only'} onChange={e=>setRegSettings({...regSettings,action:e.target.value})}>
+                    <option value="alert_only">Alert only (decide via Telegram or UI)</option>
+                    <option value="auto_terminate">Auto-terminate the session</option>
+                  </select>
+                </div>
+                <div style={{fontWeight:600,fontSize:'.9rem',margin:'1.5rem 0 .5rem'}}>Telegram alerts</div>
+                <div className="form-row" style={{marginBottom:'.75rem'}}>
+                  <label className="form-label">Bot token {regSettings.telegram_bot_token_set?<span style={{color:'#22c55e',fontSize:'.75rem'}}>(currently set — leave blank to keep)</span>:<span style={{color:'#94a3b8',fontSize:'.75rem'}}>(not set)</span>}</label>
+                  <input className="form-input" type="password" value={regTelegramBotToken} onChange={e=>setRegTelegramBotToken(e.target.value)} placeholder="123456:ABC-..."/>
+                </div>
+                <div className="form-row" style={{marginBottom:'.75rem'}}>
+                  <label className="form-label">Chat ID</label>
+                  <input className="form-input" value={regSettings.telegram_chat_id||''} onChange={e=>setRegSettings({...regSettings,telegram_chat_id:e.target.value})} placeholder="-100..."/>
+                </div>
+                <div className="form-row" style={{marginBottom:'1rem'}}>
+                  <label className="form-label">Webhook secret {regSettings.telegram_webhook_secret_set?<span style={{color:'#22c55e',fontSize:'.75rem'}}>(currently set — leave blank to keep)</span>:<span style={{color:'#94a3b8',fontSize:'.75rem'}}>(not set, optional)</span>}</label>
+                  <input className="form-input" type="password" value={regTelegramSecret} onChange={e=>setRegTelegramSecret(e.target.value)} placeholder="random secret string"/>
+                </div>
+                <div style={{display:'flex',gap:'.5rem'}}>
+                  <button className="btn btn-primary" disabled={regSaving} onClick={saveRegSettings}>{regSaving?'Saving...':'Save'}</button>
+                  <button className="btn btn-outline" onClick={testTelegram} disabled={!regSettings.telegram_bot_token_set || !regSettings.telegram_chat_id}>Test Telegram</button>
+                </div>
+
+                <div style={{borderTop:'1px solid #1f2937',marginTop:'1.5rem',paddingTop:'1.25rem'}}>
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'.75rem'}}>
+                    <div style={{fontWeight:600,fontSize:'1rem'}}>Geo events history</div>
+                    <button className="btn-sm btn-outline" onClick={loadRegAlerts}>Refresh</button>
+                  </div>
+                  <div style={{fontSize:'.8rem',color:'#94a3b8',marginBottom:'.75rem'}}>Last 200 sessions evaluated against the country allowlist. Auto-terminated rows show as <span style={{color:'#ef4444'}}>BLOCK</span> with decided_by=<code>auto_terminate</code>.</div>
+                  {regAlerts.length===0?<div className="empty" style={{padding:'1rem'}}>No geo events recorded yet</div>:(
+                    <table className="hist-table">
+                      <thead><tr><th>When</th><th>User</th><th>From</th><th>IP</th><th>Device</th><th>Decision</th><th>By</th></tr></thead>
+                      <tbody>{regAlerts.map(a=>(
+                        <tr key={a.alert_uuid||a.id}>
+                          <td style={{whiteSpace:'nowrap'}}>{a.created_at?ago(a.created_at):''}</td>
+                          <td style={{fontWeight:600}}>{a.plex_user||'(unknown)'}</td>
+                          <td>{a.geo_country||'Unknown'}{a.geo_city?` (${a.geo_city})`:''}{a.geo_isp?<div style={{fontSize:'.7rem',color:'#64748b'}}>{a.geo_isp}</div>:null}</td>
+                          <td style={{fontFamily:'monospace',fontSize:'.8rem'}}>{a.ip_address}</td>
+                          <td style={{maxWidth:'160px',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{a.device||a.product||''}</td>
+                          <td><span className={`status-badge ${a.decision==='block'?'status-declined':a.decision==='allow'?'status-approved':'status-pending'}`}>{(a.decision||'pending').toUpperCase()}</span></td>
+                          <td style={{fontSize:'.75rem',color:'#94a3b8'}}>{a.decided_by||'—'}</td>
+                        </tr>
+                      ))}</tbody>
+                    </table>
+                  )}
+                </div>
+              </div>
+            )}
+            {secView==='alerts' && (
+              <div>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'1rem'}}>
+                  <div style={{display:'flex',gap:'.5rem'}}>
+                    {['pending','allow','block',''].map(f=>(
+                      <button key={f||'all'} className={`btn-sm ${regAlertsFilter===f?'btn-primary':'btn-outline'}`} onClick={()=>{setRegAlertsFilter(f);setTimeout(loadRegAlerts,50);}}>{f||'all'}</button>
+                    ))}
+                  </div>
+                  <button className="btn-sm btn-outline" onClick={loadRegAlerts}>Refresh</button>
+                </div>
+                {regAlerts.length===0?<div className="empty">No alerts</div>:(
+                  <div>{regAlerts.map(a=>(
+                    <div key={a.alert_uuid||a.id} className="stream-card" style={{display:'flex',alignItems:'center',gap:'1rem',padding:'.75rem 1rem'}}>
+                      <span className={`status-badge ${a.decision==='pending'?'status-pending':a.decision==='block'?'status-declined':'status-approved'}`}>{(a.decision||'pending').toUpperCase()}</span>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontWeight:600,fontSize:'.9rem'}}>{a.plex_user||'(unknown user)'} from {a.geo_country||'Unknown'} {a.geo_city?`(${a.geo_city})`:''}</div>
+                        <div style={{fontSize:'.75rem',color:'#94a3b8',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>IP {a.ip_address} • {a.device||'(no device)'} • {a.content_title||''}</div>
+                        <div style={{fontSize:'.7rem',color:'#64748b'}}>{a.created_at?ago(a.created_at):''}{a.decided_by?` • decided by ${a.decided_by}`:''}</div>
+                      </div>
+                      {a.decision==='pending' && (
+                        <div style={{display:'flex',gap:'.4rem'}}>
+                          <button className="btn-sm btn-approve" onClick={()=>resolveRegAlert(a.alert_uuid,'allow')}>Allow</button>
+                          <button className="btn-sm btn-delete" onClick={()=>resolveRegAlert(a.alert_uuid,'block')}>Block</button>
+                        </div>
+                      )}
+                    </div>
+                  ))}</div>
+                )}
+              </div>
+            )}
+            {secView==='whitelist' && (
+              <div>
+                <div className="stream-card" style={{padding:'1rem',marginBottom:'1rem'}}>
+                  <div style={{fontWeight:600,marginBottom:'.5rem'}}>Add to whitelist</div>
+                  <div style={{fontSize:'.75rem',color:'#94a3b8',marginBottom:'.75rem'}}>Whitelisted IPs bypass geo checks even if their country isn't in the allowlist.</div>
+                  <div style={{display:'flex',gap:'.5rem',alignItems:'flex-end'}}>
+                    <div style={{flex:1}}>
+                      <label className="form-label">IP address</label>
+                      <input className="form-input" value={regWhitelistIp} onChange={e=>setRegWhitelistIp(e.target.value)} placeholder="1.2.3.4"/>
+                    </div>
+                    <div style={{flex:2}}>
+                      <label className="form-label">Reason (optional)</label>
+                      <input className="form-input" value={regWhitelistReason} onChange={e=>setRegWhitelistReason(e.target.value)} placeholder="e.g. traveling abroad"/>
+                    </div>
+                    <button className="btn btn-primary" onClick={addRegWhitelist}>Add</button>
+                  </div>
+                </div>
+                {regWhitelist.length===0?<div className="empty">Whitelist is empty</div>:(
+                  <div>{regWhitelist.map(w=>(
+                    <div key={w.id} className="stream-card" style={{display:'flex',alignItems:'center',gap:'1rem',padding:'.6rem 1rem'}}>
+                      <div style={{flex:1}}>
+                        <div style={{fontWeight:600}}>{w.ip_address}</div>
+                        <div style={{fontSize:'.75rem',color:'#94a3b8'}}>{w.reason||'No reason'} — added by {w.added_by} {w.created_at?ago(w.created_at):''}</div>
+                      </div>
+                      <button className="btn-sm btn-delete" onClick={()=>removeRegWhitelist(w.id)}>Remove</button>
+                    </div>
+                  ))}</div>
+                )}
+              </div>
+            )}
           </div>
         )}
 
@@ -1961,6 +2167,23 @@ function App() {
                 </div>
               ))}</div>
             )}
+
+            <div className="page-title" style={{marginTop:'2rem'}}>Live TV Subtitles</div>
+            <div className="stream-card" style={{padding:'1.25rem'}}>
+              <div style={{fontSize:'.8rem',color:'#94a3b8',marginBottom:'1rem'}}>Burns subtitles into the Live TV transcoded stream so every client (web, desktop, Plex DVR) sees them. Leave language blank to disable.</div>
+              <div className="form-row" style={{marginBottom:'.75rem'}}>
+                <label className="form-label">Preferred language (ISO 639 code)</label>
+                <input className="form-input" value={subSettings.language||''} onChange={e=>setSubSettings({...subSettings,language:e.target.value})} placeholder="eng, heb, spa, fre, ..."/>
+              </div>
+              <div className="form-row" style={{marginBottom:'1rem'}}>
+                <label className="form-label">Mode</label>
+                <select className="form-select" value={subSettings.mode||'burn'} onChange={e=>setSubSettings({...subSettings,mode:e.target.value})}>
+                  <option value="burn">Burn-in (recommended)</option>
+                  <option value="off">Off</option>
+                </select>
+              </div>
+              <button className="btn btn-primary" disabled={subSaving} onClick={saveSubSettings}>{subSaving?'Saving...':'Save'}</button>
+            </div>
           </div>
         )}
 
@@ -4239,7 +4462,11 @@ function App() {
               </div>
             </div>
             <div style={{display:'flex',gap:'.4rem',flexShrink:0}}>
-              <button onClick={()=>ltvWatchFromStart(ltvPlayer.channelId)} title="Watch from Start" style={{background:'rgba(255,255,255,.15)',border:'none',color:'#fff',padding:'.5rem .7rem',borderRadius:'6px',cursor:'pointer',fontWeight:600,fontSize:'.85rem',backdropFilter:'blur(8px)'}}>⏮</button>
+              {ltvPlayer.fromStart ? (
+                <button onClick={()=>ltvWatch(ltvPlayer.channelId)} title="Return to Live" style={{background:'rgba(239,68,68,.7)',border:'none',color:'#fff',padding:'.5rem .7rem',borderRadius:'6px',cursor:'pointer',fontWeight:700,fontSize:'.75rem',backdropFilter:'blur(8px)',display:'flex',alignItems:'center',gap:'.3rem'}}>● LIVE</button>
+              ) : (
+                <button onClick={()=>ltvWatchFromStart(ltvPlayer.channelId)} title="Watch from Start" style={{background:'rgba(255,255,255,.15)',border:'none',color:'#fff',padding:'.5rem .7rem',borderRadius:'6px',cursor:'pointer',fontWeight:600,fontSize:'.85rem',backdropFilter:'blur(8px)'}}>⏮</button>
+              )}
               <button onClick={ltvToggleChList} title="Channel List" style={{background:ltvShowChList?'rgba(139,92,246,.8)':'rgba(255,255,255,.15)',border:'none',color:'#fff',padding:'.5rem .7rem',borderRadius:'6px',cursor:'pointer',fontWeight:600,fontSize:'.85rem',backdropFilter:'blur(8px)'}}>CH</button>
               <button onClick={ltvToggleSchedule} title="Schedule" style={{background:ltvShowSchedule?'rgba(139,92,246,.8)':'rgba(255,255,255,.15)',border:'none',color:'#fff',padding:'.5rem .7rem',borderRadius:'6px',cursor:'pointer',fontWeight:600,fontSize:'.85rem',backdropFilter:'blur(8px)'}}>Guide</button>
               <button onClick={ltvToggleFullscreen} title="Fullscreen" style={{background:'rgba(255,255,255,.15)',border:'none',color:'#fff',padding:'.5rem .7rem',borderRadius:'6px',cursor:'pointer',fontWeight:600,fontSize:'.85rem',backdropFilter:'blur(8px)'}}>

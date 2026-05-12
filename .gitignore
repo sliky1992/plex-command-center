@@ -5,6 +5,7 @@ package-lock.json
 # Data & logs (user-specific)
 data/
 logs/
+*.log
 
 # Claude settings
 .claude/
