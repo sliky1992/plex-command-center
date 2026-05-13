@@ -4776,14 +4776,21 @@ app.get('/api/livetv/watch/:channelId', async (req, res) => {
 
   // Look up media info from Plex to determine best playback method
   let streamUrl, streamType = 'direct', sessionId = null;
+  let pickedMediaIndex = '0'; // visible to transcodeParams below so we hand Plex the working entry
   try {
     const metaRes = await axios.get(`${config.plex.url}/library/metadata/${ratingKey}`, {
       params: { 'X-Plex-Token': config.plex.token },
       headers: { Accept: 'application/json' },
       timeout: 5000
     });
-    const media = metaRes.data?.MediaContainer?.Metadata?.[0]?.Media?.[0];
-    const part = media?.Part?.[0];
+    // Multi-Media fallback (same helper as the tuner pipeline). Picks the first Media whose
+    // Part URL actually serves bytes — when a file gets moved on disk, Plex keeps the orphan
+    // Media[0] pointing at the missing path and our hardcoded Media[0] used to silently 404.
+    const metadata = metaRes.data?.MediaContainer?.Metadata?.[0];
+    const picked = await pickPlayableMedia(ratingKey, metadata);
+    const media = picked?.media || metadata?.Media?.[0];
+    if (picked) pickedMediaIndex = String(picked.mediaIdx);
+    const part = picked?.part || media?.Part?.[0];
     const videoCodec = media?.videoCodec || '';
     const container = media?.container || '';
     const partKey = part?.key || '';
@@ -4864,7 +4871,7 @@ app.get('/api/livetv/watch/:channelId', async (req, res) => {
         : null;
       const transcodeParams = {
         path: `/library/metadata/${ratingKey}`,
-        mediaIndex: '0',
+        mediaIndex: pickedMediaIndex,
         partIndex: '0',
         protocol: 'http',
         fastSeek: '1',
@@ -4913,7 +4920,7 @@ app.get('/api/livetv/watch/:channelId', async (req, res) => {
     sessionId = `PCC-Watch-${Date.now()}`;
     const fallbackParams = {
       path: `/library/metadata/${ratingKey}`,
-      mediaIndex: '0',
+      mediaIndex: pickedMediaIndex,
       partIndex: '0',
       protocol: 'http',
       fastSeek: '1',
@@ -4996,12 +5003,16 @@ app.get('/api/livetv/watch/:channelId/from-start', async (req, res) => {
   // <video> can't decode those audio codecs. Forcing Plex to transcode audio to AAC fixes that.
   let streamUrl, streamType = 'transcode', sessionId = `PCC-WFS-${Date.now()}`;
   let media = null;
+  let pickedMediaIndex = '0';
   try {
     const metaRes = await axios.get(`${config.plex.url}/library/metadata/${ratingKey}`, {
       params: { 'X-Plex-Token': config.plex.token },
       headers: { Accept: 'application/json' }, timeout: 5000
     });
-    media = metaRes.data?.MediaContainer?.Metadata?.[0]?.Media?.[0];
+    const metadata = metaRes.data?.MediaContainer?.Metadata?.[0];
+    const picked = await pickPlayableMedia(ratingKey, metadata);
+    media = picked?.media || metadata?.Media?.[0];
+    if (picked) pickedMediaIndex = String(picked.mediaIdx);
   } catch(e) { /* fall through — we can still build a transcode URL without metadata */ }
 
   const subSettings = readSubtitleSettings();
@@ -5010,7 +5021,7 @@ app.get('/api/livetv/watch/:channelId/from-start', async (req, res) => {
     : null;
 
   const params = {
-    path: `/library/metadata/${ratingKey}`, mediaIndex: '0', partIndex: '0',
+    path: `/library/metadata/${ratingKey}`, mediaIndex: pickedMediaIndex, partIndex: '0',
     protocol: 'http', fastSeek: '1',
     directPlay: '0', directStream: '1', directStreamAudio: '0',
     videoQuality: '100', maxVideoBitrate: '20000',
