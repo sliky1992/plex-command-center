@@ -1583,6 +1583,11 @@ pccDb.exec("INSERT OR IGNORE INTO regional_settings (key, value) VALUES ('action
 pccDb.exec("INSERT OR IGNORE INTO regional_settings (key, value) VALUES ('telegram_bot_token', '')");
 pccDb.exec("INSERT OR IGNORE INTO regional_settings (key, value) VALUES ('telegram_chat_id', '')");
 pccDb.exec("INSERT OR IGNORE INTO regional_settings (key, value) VALUES ('telegram_webhook_secret', '')");
+// Reverse-proxy gateway config. Seed from env on first run; thereafter the UI toggles drive
+// these values. Empty target falls back to config.plex.url at start time.
+pccDb.exec(`INSERT OR IGNORE INTO regional_settings (key, value) VALUES ('gateway_enabled', '${process.env.PCC_GATEWAY_ENABLED === '1' ? '1' : '0'}')`);
+pccDb.exec(`INSERT OR IGNORE INTO regional_settings (key, value) VALUES ('gateway_port', '${parseInt(process.env.PCC_GATEWAY_PORT) || 32400}')`);
+pccDb.exec(`INSERT OR IGNORE INTO regional_settings (key, value) VALUES ('gateway_target', '${(process.env.PCC_GATEWAY_TARGET || '').replace(/'/g, "''")}')`);
 
 // Seed default admin if no users exist — flagged so the first login is forced to rotate password.
 const userCount = pccDb.prepare('SELECT COUNT(*) as cnt FROM users').get().cnt;
@@ -3246,6 +3251,15 @@ if (LIVETV_ENABLED) {
   try {
     const cols2 = db.pragma('table_info(channels)').map(c => c.name);
     if (!cols2.includes('last_rebuilt_at')) db.exec("ALTER TABLE channels ADD COLUMN last_rebuilt_at TEXT");
+    // Manual program additions — JSON array of program_ids the user explicitly added that bypass
+    // the genre filter. buildChannelPlaylist unions these with the filter results before shuffling.
+    if (!cols2.includes('included_programs')) db.exec("ALTER TABLE channels ADD COLUMN included_programs TEXT DEFAULT '[]'");
+  } catch(e) {}
+  // Plex summary (one-paragraph description) — used by the Add-Programs UI cards. Populated on
+  // scan when present; older rows stay NULL and just render without a description.
+  try {
+    const progCols2 = db.pragma('table_info(programs)').map(c => c.name);
+    if (!progCols2.includes('summary')) db.exec("ALTER TABLE programs ADD COLUMN summary TEXT");
   } catch(e) {}
 
   // Migrate: add local_path to fillers for YouTube-downloaded content
@@ -3498,12 +3512,13 @@ async function scanPlexLibraries() {
 
   const upsert = db.prepare(`
     INSERT INTO programs (plex_rating_key, title, type, show_title, season_num, episode_num,
-      duration_ms, genre, year, thumb, art, content_rating, library_key, file_path, plex_key, added_at, updated_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'))
+      duration_ms, genre, year, thumb, art, content_rating, library_key, file_path, plex_key, added_at, summary, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'))
     ON CONFLICT(plex_rating_key) DO UPDATE SET
       title=excluded.title, duration_ms=excluded.duration_ms, genre=excluded.genre,
       year=excluded.year, thumb=excluded.thumb, art=excluded.art, content_rating=excluded.content_rating,
-      file_path=excluded.file_path, added_at=COALESCE(programs.added_at, excluded.added_at), updated_at=datetime('now')
+      file_path=excluded.file_path, summary=COALESCE(excluded.summary, programs.summary),
+      added_at=COALESCE(programs.added_at, excluded.added_at), updated_at=datetime('now')
   `);
 
   for (const lib of libraries) {
@@ -3524,7 +3539,8 @@ async function scanPlexLibraries() {
             item.thumb || null, item.art || null, item.contentRating || null,
             lib.key, item.Media?.[0]?.Part?.[0]?.file || null,
             `/library/metadata/${item.ratingKey}`,
-            item.addedAt ? item.addedAt * 1000 : null
+            item.addedAt ? item.addedAt * 1000 : null,
+            item.summary || null
           );
           if (existing) updated++; else added++;
         }
@@ -3550,7 +3566,10 @@ async function scanPlexLibraries() {
                 ep.contentRating || show.contentRating || null,
                 lib.key, ep.Media?.[0]?.Part?.[0]?.file || null,
                 `/library/metadata/${ep.ratingKey}`,
-                ep.addedAt ? ep.addedAt * 1000 : null
+                ep.addedAt ? ep.addedAt * 1000 : null,
+                // Episode summaries are often empty; fall back to the show-level summary so the
+                // Add-Programs card has something to read.
+                ep.summary || show.summary || null
               );
               if (existing) updated++; else added++;
             }
@@ -3704,13 +3723,17 @@ app.put('/api/livetv/channels/:id/filters', (req, res) => {
   if (!ch) return res.status(404).json({ error: 'Channel not found' });
 
   const { genre, content_type, year_from, year_to, genre_mode, exclude_genres, library_key, shuffle, name } = req.body;
+  // Safety net: never let the channel's own primary genre live in exclude_genres. The UI hides
+  // it from the picker now, but a stale state or an older client could still send it and would
+  // silently drop every match to zero.
+  const safeExclude = Array.isArray(exclude_genres) ? exclude_genres.filter(g => g && g !== genre) : [];
   const filterData = JSON.stringify({
     genre: genre || 'Comedy',
     content_type: content_type || 'all',
     year_from: year_from || null,
     year_to: year_to || null,
     genre_mode: genre_mode || 'primary',
-    exclude_genres: exclude_genres || []
+    exclude_genres: safeExclude
   });
 
   db.prepare(`
@@ -3783,32 +3806,214 @@ app.get('/api/livetv/channels/:id/programs', (req, res) => {
 
   const excluded = ch.excluded_programs ? JSON.parse(ch.excluded_programs) : [];
 
+  // Pull in manual additions so they show up in the Content tab too — the user expects to see
+  // EVERY program that will play on this channel, regardless of how it got there. We tag each
+  // row with a `manual` flag so the UI can render a badge.
+  let manualIds = [];
+  try { const v = JSON.parse(ch.included_programs || '[]'); if (Array.isArray(v)) manualIds = v; } catch(e) {}
+  const have = new Set(programs.map(p => p.id));
+  const manualSet = new Set(manualIds);
+  const missingManual = manualIds.filter(id => !have.has(id));
+  if (missingManual.length > 0) {
+    const placeholders = missingManual.map(() => '?').join(',');
+    const extras = db.prepare(`SELECT * FROM programs WHERE id IN (${placeholders})`).all(...missingManual);
+    programs = programs.concat(extras);
+  }
+
   // Group by show for TV, list movies individually
   const shows = {};
   const movies = [];
   for (const p of programs) {
+    const isManual = manualSet.has(p.id);
     if (p.type === 'episode' && p.show_title) {
-      if (!shows[p.show_title]) shows[p.show_title] = { name: p.show_title, episodes: [], excluded: 0, total: 0 };
-      shows[p.show_title].episodes.push({ id: p.id, title: p.title, season: p.season_num, episode: p.episode_num, excluded: excluded.includes(p.id) });
+      if (!shows[p.show_title]) shows[p.show_title] = { name: p.show_title, episodes: [], excluded: 0, total: 0, hasManual: false };
+      shows[p.show_title].episodes.push({ id: p.id, title: p.title, season: p.season_num, episode: p.episode_num, excluded: excluded.includes(p.id), manual: isManual });
       shows[p.show_title].total++;
       if (excluded.includes(p.id)) shows[p.show_title].excluded++;
+      if (isManual) shows[p.show_title].hasManual = true;
     } else {
-      movies.push({ id: p.id, title: p.title, year: p.year, excluded: excluded.includes(p.id) });
+      movies.push({ id: p.id, title: p.title, year: p.year, excluded: excluded.includes(p.id), manual: isManual });
     }
   }
 
   let shuffleShows = {};
   try { shuffleShows = JSON.parse(ch.shuffle_shows || '{}'); } catch(e) {}
 
+  // Hydrate the manually-included program list so the UI can render the "Manual Additions"
+  // section with titles instead of bare IDs.
+  let includedRows = [];
+  try {
+    const ids = JSON.parse(ch.included_programs || '[]');
+    if (Array.isArray(ids) && ids.length > 0) {
+      const placeholders = ids.map(() => '?').join(',');
+      includedRows = db.prepare(
+        `SELECT id, title, type, show_title, season_num, episode_num, year, duration_ms, genre
+         FROM programs WHERE id IN (${placeholders})`
+      ).all(...ids);
+    }
+  } catch(e) {}
+
   res.json({
     shows: Object.values(shows).sort((a, b) => a.name.localeCompare(b.name)),
     movies: movies.sort((a, b) => a.title.localeCompare(b.title)),
     totalPrograms: programs.length,
     excludedCount: excluded.length,
+    includedPrograms: includedRows,
     filters: ch.source_value && ch.source_value.startsWith('{') ? JSON.parse(ch.source_value) : { genre: ch.source_value },
     shuffleShows,
     channelShuffle: !!ch.shuffle
   });
+});
+
+// Manual additions: the array of program_ids the user explicitly attached to a channel.
+// buildChannelPlaylist unions these with the filter results so they ride the same shuffle.
+app.put('/api/livetv/channels/:id/included-programs', (req, res) => {
+  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
+  const ch = db.prepare('SELECT id FROM channels WHERE id = ?').get(req.params.id);
+  if (!ch) return res.status(404).json({ error: 'Channel not found' });
+  const included = req.body?.included;
+  if (!Array.isArray(included)) return res.status(400).json({ error: 'included must be an array of program ids' });
+  // Coerce to integers and drop garbage. Cap at 500 to keep playlists sane.
+  const ids = [...new Set(included.map(x => parseInt(x, 10)).filter(n => Number.isInteger(n) && n > 0))].slice(0, 500);
+  db.prepare('UPDATE channels SET included_programs = ?, updated_at = datetime(\'now\') WHERE id = ?')
+    .run(JSON.stringify(ids), req.params.id);
+  const count = buildChannelPlaylist(parseInt(req.params.id));
+  res.json({ success: true, included: ids.length, programCount: count });
+});
+
+// Program search for the Add-Programs UI. Two modes:
+//   group=show   → one row per TV show, includes the list of all episode_ids so the UI can add
+//                  an entire show in one click. Movies are excluded in this mode.
+//   group=movie  → only movies (one row per movie).
+//   group=any    → mixed list (legacy / future use).
+// Returns Plex thumb + summary + genres + year so the cards can render covers and descriptions.
+// The Plex token is appended to thumb URLs so the browser fetches them directly from PMS.
+app.get('/api/livetv/programs/search', (req, res) => {
+  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
+  const q = (req.query.q || '').trim();
+  const group = (req.query.group || 'any').toLowerCase();
+  const libraryKey = (req.query.library_key || '').trim();
+  const limit = Math.min(100, parseInt(req.query.limit) || 25);
+  // Two-mode trigger: typed search (q>=2) OR browsing a library (library_key set). Neither
+  // → empty so the UI doesn't spam huge unfiltered list payloads on first paint.
+  if (q.length < 2 && !libraryKey) return res.json({ results: [], group });
+  const like = q ? `%${q}%` : null;
+  const startLike = q ? `${q}%` : null;
+  const plexUrl = config.plex.url || '';
+  const plexToken = config.plex.token || '';
+  const thumbUrl = (thumb) => thumb && plexUrl ? `${plexUrl}${thumb}?X-Plex-Token=${plexToken}` : null;
+
+  if (group === 'show') {
+    // Group by show_title. Pick one representative episode (prefer S01E01) for cover/year/genre.
+    let where = "duration_ms > 0 AND type = 'episode' AND show_title IS NOT NULL";
+    const params = [];
+    if (q) { where += ' AND show_title LIKE ?'; params.push(like); }
+    if (libraryKey) { where += ' AND library_key = ?'; params.push(libraryKey); }
+    const orderBy = q ? 'CASE WHEN show_title LIKE ? THEN 0 ELSE 1 END, show_title' : 'show_title';
+    if (q) params.push(startLike);
+    params.push(limit);
+    const rows = db.prepare(`
+      SELECT show_title,
+             COUNT(*) AS episode_count,
+             SUM(duration_ms) AS total_ms,
+             MIN(year) AS first_year,
+             MAX(year) AS last_year,
+             MAX(genre) AS genre,
+             MAX(content_rating) AS content_rating
+      FROM programs
+      WHERE ${where}
+      GROUP BY show_title
+      ORDER BY ${orderBy}
+      LIMIT ?
+    `).all(...params);
+    const results = rows.map(r => {
+      // Representative thumb/summary: the show's pilot if we have one, else any episode.
+      const rep = db.prepare(`
+        SELECT id, thumb, art, summary, season_num, episode_num
+        FROM programs
+        WHERE type='episode' AND show_title = ?
+        ORDER BY season_num, episode_num
+        LIMIT 1
+      `).get(r.show_title);
+      const epIds = db.prepare(`
+        SELECT id FROM programs WHERE type='episode' AND show_title = ? AND duration_ms > 0
+      `).all(r.show_title).map(x => x.id);
+      const year = r.first_year && r.last_year && r.first_year !== r.last_year
+        ? `${r.first_year}–${r.last_year}` : (r.first_year || r.last_year || null);
+      return {
+        kind: 'show',
+        title: r.show_title,
+        year, episode_count: r.episode_count,
+        total_minutes: Math.round((r.total_ms || 0) / 60000),
+        genres: (r.genre || '').split(',').map(g => g.trim()).filter(Boolean).slice(0, 4),
+        content_rating: r.content_rating,
+        cover: thumbUrl(rep?.thumb),
+        summary: rep?.summary || null,
+        episode_ids: epIds
+      };
+    });
+    return res.json({ results, group });
+  }
+
+  if (group === 'movie') {
+    let where = "duration_ms > 0 AND type = 'movie'";
+    const params = [];
+    if (q) { where += ' AND title LIKE ?'; params.push(like); }
+    if (libraryKey) { where += ' AND library_key = ?'; params.push(libraryKey); }
+    const orderBy = q ? 'CASE WHEN title LIKE ? THEN 0 ELSE 1 END, title' : 'title';
+    if (q) params.push(startLike);
+    params.push(limit);
+    const rows = db.prepare(`
+      SELECT id, title, year, duration_ms, genre, thumb, summary, content_rating
+      FROM programs
+      WHERE ${where}
+      ORDER BY ${orderBy}
+      LIMIT ?
+    `).all(...params);
+    const results = rows.map(r => ({
+      kind: 'movie',
+      id: r.id,
+      title: r.title,
+      year: r.year,
+      total_minutes: Math.round((r.duration_ms || 0) / 60000),
+      genres: (r.genre || '').split(',').map(g => g.trim()).filter(Boolean).slice(0, 4),
+      content_rating: r.content_rating,
+      cover: thumbUrl(r.thumb),
+      summary: r.summary || null
+    }));
+    return res.json({ results, group });
+  }
+
+  // Legacy / mixed mode (one row per program, including each episode individually).
+  let where = 'duration_ms > 0';
+  const params = [];
+  if (q) { where += ' AND (title LIKE ? OR show_title LIKE ?)'; params.push(like, like); }
+  if (libraryKey) { where += ' AND library_key = ?'; params.push(libraryKey); }
+  const orderBy = q ? 'CASE WHEN title LIKE ? THEN 0 ELSE 1 END, title' : 'title';
+  if (q) params.push(startLike);
+  params.push(limit);
+  const rows = db.prepare(`
+    SELECT id, plex_rating_key, title, type, show_title, season_num, episode_num,
+           duration_ms, genre, year, thumb, summary, content_rating
+    FROM programs
+    WHERE ${where}
+    ORDER BY ${orderBy}
+    LIMIT ?
+  `).all(...params);
+  const results = rows.map(r => ({
+    kind: r.type === 'episode' ? 'episode' : 'movie',
+    id: r.id,
+    title: r.type === 'episode' && r.show_title ? `${r.show_title} — ${r.title}` : r.title,
+    show_title: r.show_title,
+    season_num: r.season_num, episode_num: r.episode_num,
+    year: r.year,
+    total_minutes: Math.round((r.duration_ms || 0) / 60000),
+    genres: (r.genre || '').split(',').map(g => g.trim()).filter(Boolean).slice(0, 4),
+    content_rating: r.content_rating,
+    cover: thumbUrl(r.thumb),
+    summary: r.summary || null
+  }));
+  res.json({ results, group: 'any' });
 });
 
 app.post('/api/livetv/channels/:id/rebuild', (req, res) => {
@@ -3905,10 +4110,27 @@ function buildChannelPlaylist(channelId) {
     programs = db.prepare('SELECT * FROM programs WHERE duration_ms > 0 ORDER BY title').all();
   }
 
-  // Apply exclusions
+  // Apply exclusions, except never exclude programs the user explicitly included. The manual
+  // "Add Programs" list is the user's override of every other filter — if it's on that list
+  // it appears in the schedule, full stop.
   const excluded = channel.excluded_programs ? JSON.parse(channel.excluded_programs) : [];
-  if (excluded.length > 0) {
-    programs = programs.filter(p => !excluded.includes(p.id));
+  let includedIds = [];
+  try { const v = JSON.parse(channel.included_programs || '[]'); if (Array.isArray(v)) includedIds = v; } catch(e) {}
+  const includedSet = new Set(includedIds);
+  const effectiveExcluded = excluded.filter(id => !includedSet.has(id));
+  if (effectiveExcluded.length > 0) {
+    programs = programs.filter(p => !effectiveExcluded.includes(p.id));
+  }
+  // Manual additions union: pull rows for any included id that wasn't already returned by the
+  // filter. Skips ids that no longer exist (e.g. since-pruned programs).
+  if (includedIds.length > 0) {
+    const have = new Set(programs.map(p => p.id));
+    const missing = includedIds.filter(id => !have.has(id));
+    if (missing.length > 0) {
+      const placeholders = missing.map(() => '?').join(',');
+      const extras = db.prepare(`SELECT * FROM programs WHERE id IN (${placeholders}) AND duration_ms > 0`).all(...missing);
+      programs = programs.concat(extras);
+    }
   }
 
   // Anti-rerun: skip MOVIES that aired on this channel within the last N days. We don't apply
@@ -5759,6 +5981,10 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
       ff.stderr.on('data', () => {});
       ff.on('close', () => {
         cumulativeDurationSec += segmentDurationSec;
+        // Advance by playlist position (ffmpeg streams faster than real-time so wall-clock is
+        // ahead of the slot's natural end — wall-clock pick would land mid-way into the next).
+        consecutiveFailures = 0;
+        forceFromPosition = prog.nextIndex;
         if (!clientDisconnected && !res.writableEnded) {
           setTimeout(() => streamNextProgram().catch(e => console.error('[LiveTV] streamNextProgram error:', e.message)), 50);
         }
@@ -5928,6 +6154,14 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
 
       // Small delay to allow player to process the transition
       await new Promise(r => setTimeout(r, 50));
+
+      // Hand the next slot to streamNextProgram by playlist position, not by wall-clock.
+      // ffmpeg with -c:v copy streams MUCH faster than real-time (it remuxes the whole file in
+      // seconds), so wall-clock has typically passed the natural end of this slot by the time
+      // we get here. A wall-clock pick would land us mid-way into the *next* show. Forcing the
+      // position guarantees the next show starts at offset 0.
+      consecutiveFailures = 0; // we successfully streamed a segment — clear the failure counter
+      forceFromPosition = prog.nextIndex;
 
       // Chain to next program
       streamNextProgram().catch(e => console.error('[LiveTV] streamNextProgram error:', e.message));
@@ -7093,6 +7327,76 @@ app.get('/download/desktop-renderer', (req, res) => {
   } else res.status(404).send('Not found');
 });
 
+// --- Gateway control endpoints (admin only) ---
+app.get('/api/security/gateway', requireAdmin, (req, res) => {
+  const cfg = readGatewayConfig();
+  res.json({
+    enabled: cfg.enabled,
+    port: cfg.port,
+    target: cfg.target,
+    targetEffective: cfg.target || config.plex.url || '',
+    status: _gatewayServer ? 'running' : 'stopped',
+    lastError: _gatewayMeta.lastError,
+    geofenceEnabled: readRegionalSettings().enabled
+  });
+});
+
+app.put('/api/security/gateway', requireAdmin, (req, res) => {
+  const body = req.body || {};
+  const updates = [];
+  if (typeof body.port !== 'undefined') {
+    const p = parseInt(body.port);
+    if (!Number.isInteger(p) || p < 1 || p > 65535) return res.status(400).json({ error: 'port must be 1-65535' });
+    updates.push(['gateway_port', String(p)]);
+  }
+  if (typeof body.target !== 'undefined') {
+    const t = String(body.target).trim();
+    if (t) { try { new URL(t); } catch(e) { return res.status(400).json({ error: 'target must be a valid URL' }); } }
+    updates.push(['gateway_target', t]);
+  }
+  const set = pccDb.prepare('UPDATE regional_settings SET value = ? WHERE key = ?');
+  for (const [k, v] of updates) set.run(v, k);
+  // If currently running and config changed, restart so the new port/target takes effect.
+  let restarted = false;
+  if (_gatewayServer && updates.length > 0) {
+    stopGateway();
+    const r = startGateway();
+    restarted = true;
+    if (!r.ok) return res.status(500).json({ error: 'Restart failed: ' + r.error, restarted });
+  }
+  res.json({ success: true, restarted, config: readGatewayConfig() });
+});
+
+app.post('/api/security/gateway/start', requireAdmin, (req, res) => {
+  pccDb.prepare("UPDATE regional_settings SET value = '1' WHERE key = 'gateway_enabled'").run();
+  const r = startGateway();
+  if (!r.ok) return res.status(500).json({ error: r.error || 'start failed' });
+  res.json({ success: true, ...r });
+});
+
+app.post('/api/security/gateway/stop', requireAdmin, (req, res) => {
+  pccDb.prepare("UPDATE regional_settings SET value = '0' WHERE key = 'gateway_enabled'").run();
+  const r = stopGateway();
+  res.json({ success: r.ok, ...r });
+});
+
+// gateway_log API for the UI
+app.get('/api/security/gateway-log', (req, res) => {
+  const limit = Math.min(500, parseInt(req.query.limit) || 100);
+  const onlyDenied = req.query.denied === '1';
+  const sql = onlyDenied
+    ? 'SELECT * FROM gateway_log WHERE allowed = 0 ORDER BY created_at DESC LIMIT ?'
+    : 'SELECT * FROM gateway_log ORDER BY created_at DESC LIMIT ?';
+  res.json(pccDb.prepare(sql).all(limit));
+});
+app.get('/api/security/gateway-stats', (req, res) => {
+  res.json({
+    enabled: GATEWAY_ENABLED,
+    port: GATEWAY_PORT,
+    target: GATEWAY_TARGET,
+    totals: pccDb.prepare("SELECT SUM(CASE WHEN allowed=1 THEN 1 ELSE 0 END) AS allowed, SUM(CASE WHEN allowed=0 THEN 1 ELSE 0 END) AS denied FROM gateway_log WHERE created_at > datetime('now','-7 days')").get()
+  });
+});
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
@@ -7124,9 +7428,17 @@ app.use((err, req, res, next) => {
 //      requests aren't rate-limited; disable "Enable Relay" so clients can't bypass us.
 //   3. (Optional) Custom server access URL → http://<public_ip>:<port> so Plex tells
 //      clients to use the public endpoint (which is PCC).
-const GATEWAY_ENABLED = process.env.PCC_GATEWAY_ENABLED === '1';
-const GATEWAY_PORT = parseInt(process.env.PCC_GATEWAY_PORT) || 32400;
-const GATEWAY_TARGET = process.env.PCC_GATEWAY_TARGET || config.plex.url || '';
+// Gateway config is now DB-driven via regional_settings (toggled from the Security tab UI).
+// Env vars only seed first-run defaults; the running config lives in the DB.
+function readGatewayConfig() {
+  const rows = pccDb.prepare("SELECT key, value FROM regional_settings WHERE key LIKE 'gateway_%'").all();
+  const map = Object.fromEntries(rows.map(r => [r.key, r.value]));
+  return {
+    enabled: map.gateway_enabled === '1',
+    port: parseInt(map.gateway_port) || 32400,
+    target: map.gateway_target || config.plex.url || ''
+  };
+}
 
 async function checkGatewayAccess(ip) {
   const cleanIp = (ip || '').replace(/^::ffff:/, '');
@@ -7186,8 +7498,20 @@ function denyPageHtml(ip, country) {
 </div></body></html>`;
 }
 
-if (GATEWAY_ENABLED && GATEWAY_TARGET) {
-  const targetUrl = new URL(GATEWAY_TARGET);
+// Module-scoped handle so start/stop endpoints can flip it.
+let _gatewayServer = null;
+let _gatewayMeta = { port: 0, target: '', lastError: null };
+
+function startGateway() {
+  if (_gatewayServer) return { ok: true, alreadyRunning: true, ..._gatewayMeta };
+  const cfg = readGatewayConfig();
+  if (!cfg.target) {
+    _gatewayMeta.lastError = 'No target configured (set PMS URL in the Security tab)';
+    return { ok: false, error: _gatewayMeta.lastError };
+  }
+  let targetUrl;
+  try { targetUrl = new URL(cfg.target); }
+  catch (e) { _gatewayMeta.lastError = 'Invalid target URL: ' + e.message; return { ok: false, error: _gatewayMeta.lastError }; }
   const tHost = targetUrl.hostname;
   const tPort = Number(targetUrl.port) || (targetUrl.protocol === 'https:' ? 443 : 80);
   const isHttps = targetUrl.protocol === 'https:';
@@ -7252,30 +7576,46 @@ if (GATEWAY_ENABLED && GATEWAY_TARGET) {
     logGatewayEvent(ip, decision, 'allow-ws', req.url);
   });
 
-  gateway.listen(GATEWAY_PORT, () => {
-    console.log(`[Gateway] Plex reverse proxy listening on :${GATEWAY_PORT} → ${GATEWAY_TARGET}`);
-  });
-} else if (GATEWAY_ENABLED && !GATEWAY_TARGET) {
-  console.warn('[Gateway] PCC_GATEWAY_ENABLED=1 but no PCC_GATEWAY_TARGET / PLEX_URL configured. Gateway not started.');
+  try {
+    gateway.listen(cfg.port, () => {
+      console.log(`[Gateway] Plex reverse proxy listening on :${cfg.port} → ${cfg.target}`);
+    });
+    gateway.on('error', (err) => {
+      console.error('[Gateway] listen error:', err.message);
+      _gatewayMeta.lastError = err.message;
+      _gatewayServer = null;
+    });
+    _gatewayServer = gateway;
+    _gatewayMeta = { port: cfg.port, target: cfg.target, lastError: null };
+    return { ok: true, port: cfg.port, target: cfg.target };
+  } catch (e) {
+    _gatewayMeta.lastError = e.message;
+    return { ok: false, error: e.message };
+  }
 }
 
-// gateway_log API for the UI
-app.get('/api/security/gateway-log', (req, res) => {
-  const limit = Math.min(500, parseInt(req.query.limit) || 100);
-  const onlyDenied = req.query.denied === '1';
-  const sql = onlyDenied
-    ? 'SELECT * FROM gateway_log WHERE allowed = 0 ORDER BY created_at DESC LIMIT ?'
-    : 'SELECT * FROM gateway_log ORDER BY created_at DESC LIMIT ?';
-  res.json(pccDb.prepare(sql).all(limit));
-});
-app.get('/api/security/gateway-stats', (req, res) => {
-  res.json({
-    enabled: GATEWAY_ENABLED,
-    port: GATEWAY_PORT,
-    target: GATEWAY_TARGET,
-    totals: pccDb.prepare("SELECT SUM(CASE WHEN allowed=1 THEN 1 ELSE 0 END) AS allowed, SUM(CASE WHEN allowed=0 THEN 1 ELSE 0 END) AS denied FROM gateway_log WHERE created_at > datetime('now','-7 days')").get()
-  });
-});
+function stopGateway() {
+  if (!_gatewayServer) return { ok: true, alreadyStopped: true };
+  try {
+    _gatewayServer.close();
+    _gatewayServer = null;
+    console.log('[Gateway] stopped');
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// Auto-start on boot if DB flag is on. Settings are read here so seed values from env take
+// effect on the very first run.
+{
+  const cfg = readGatewayConfig();
+  if (cfg.enabled) {
+    const r = startGateway();
+    if (!r.ok) console.warn('[Gateway] auto-start failed:', r.error);
+  }
+}
+
 
 app.listen(PORT, () => {
   console.log(`\n╔══════════════════════════════════════════════════╗`);

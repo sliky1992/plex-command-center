@@ -275,11 +275,15 @@ function App() {
 
   // Regional security + alerts state
   const [regSettings, setRegSettings] = useState({enabled:false, allowed_countries:[], action:'alert_only', telegram_chat_id:'', telegram_bot_token_set:false, telegram_webhook_secret_set:false});
+  // Reverse-proxy gateway state (Security tab → Gateway sub-view).
+  const [gatewayState, setGatewayState] = useState({enabled:false, status:'stopped', port:32400, target:'', targetEffective:'', lastError:null, geofenceEnabled:false});
+  const [gatewaySaving, setGatewaySaving] = useState(false);
+  const [gatewayDraft, setGatewayDraft] = useState({port:32400, target:''});
   const [regCountriesText, setRegCountriesText] = useState('');
   const [regTelegramBotToken, setRegTelegramBotToken] = useState('');
   const [regTelegramSecret, setRegTelegramSecret] = useState('');
   const [regAlerts, setRegAlerts] = useState([]);
-  const [regAlertsFilter, setRegAlertsFilter] = useState('pending');
+  const [regAlertsFilter, setRegAlertsFilter] = useState(''); // '' = all; pending/allow/block also valid
   const [regWhitelist, setRegWhitelist] = useState([]);
   const [regWhitelistIp, setRegWhitelistIp] = useState('');
   const [regWhitelistReason, setRegWhitelistReason] = useState('');
@@ -382,7 +386,11 @@ function App() {
   const [ltvEditFilters, setLtvEditFilters] = useState({genre:'',content_type:'all',year_from:'',year_to:'',genre_mode:'primary',exclude_genres:[],library_key:'',shuffle:false,name:'',pad_to_minutes:0,anchor_timeslot:0,skip_watched:false});
   const [ltvEditPrograms, setLtvEditPrograms] = useState({shows:[],movies:[],totalPrograms:0,excludedCount:0});
   const [ltvEditLoading, setLtvEditLoading] = useState(false);
-  const [ltvEditTab, setLtvEditTab] = useState('filters'); // 'filters', 'content', or 'logo'
+  const [ltvEditTab, setLtvEditTab] = useState('filters'); // 'filters', 'content', 'add', 'fillers', or 'logo'
+  const [ltvAddSearch, setLtvAddSearch] = useState('');
+  const [ltvAddResults, setLtvAddResults] = useState([]);
+  const [ltvAddSearching, setLtvAddSearching] = useState(false);
+  const [ltvAddLibrary, setLtvAddLibrary] = useState(''); // '' = all libraries
   const [ltvLogoSettings, setLtvLogoSettings] = useState({enabled:true, position:'top-right', opacity:0.7, size:80});
   const [ltvLogoKey, setLtvLogoKey] = useState(Date.now());
   const [ltvNewRule, setLtvNewRule] = useState({name:'',rule_type:'seasonal',start_month:1,end_month:12,genre_boost:'',boost_pct:20,start_hour:0,end_hour:23,days_of_week:[0,1,2,3,4,5,6]});
@@ -526,6 +534,35 @@ function App() {
   const loadRegWhitelist = async () => {
     const r = await fetch('/api/security/regional-whitelist').then(x=>x.json()).catch(()=>[]);
     setRegWhitelist(Array.isArray(r)?r:[]);
+  };
+
+  // Gateway state — runtime status (running/stopped), config, and last error if any.
+  const loadGateway = async () => {
+    const r = await fetch('/api/security/gateway').then(x=>x.json()).catch(()=>null);
+    if (!r || r.error) return;
+    setGatewayState(r);
+    setGatewayDraft({port: r.port, target: r.target || ''});
+  };
+  const saveGatewayConfig = async () => {
+    setGatewaySaving(true);
+    const r = await doAction('/api/security/gateway', 'PUT', {port: parseInt(gatewayDraft.port)||32400, target: gatewayDraft.target.trim()});
+    setGatewaySaving(false);
+    if (r.success) { showToast('Gateway config saved' + (r.restarted ? ' (restarted)' : '')); loadGateway(); }
+    else showToast('Save failed: ' + (r.error || 'unknown'), 'error');
+  };
+  const startGateway = async () => {
+    setGatewaySaving(true);
+    const r = await doAction('/api/security/gateway/start', 'POST', {});
+    setGatewaySaving(false);
+    if (r.success) { showToast(`Gateway started on :${r.port}`); loadGateway(); }
+    else showToast('Start failed: ' + (r.error || 'unknown'), 'error');
+  };
+  const stopGateway = async () => {
+    setGatewaySaving(true);
+    const r = await doAction('/api/security/gateway/stop', 'POST', {});
+    setGatewaySaving(false);
+    if (r.success) { showToast('Gateway stopped'); loadGateway(); }
+    else showToast('Stop failed: ' + (r.error || 'unknown'), 'error');
   };
   const saveRegSettings = async () => {
     setRegSaving(true);
@@ -1091,6 +1128,79 @@ function App() {
       loadLiveTv(); loadLtvGuide();
     } else showToast('Failed: '+(r.error||'Unknown'),'error');
     setLtvEditLoading(false);
+  };
+
+  // Manual program additions: search, add, remove. Lives in its own tab in the edit modal
+  // because it's a per-channel override of the genre filter — different mental model from
+  // "exclude this specific item" which already had UI in the Content tab.
+  // group=show for TV channels, group=movie for movie channels, group=any otherwise.
+  const ltvAddSearchGroup = () => {
+    const ct = ltvEditFilters.content_type;
+    if (ct === 'episode') return 'show';
+    if (ct === 'movie') return 'movie';
+    return 'any';
+  };
+  // Runs whenever the search query OR library selection changes. Two triggers, one network call.
+  // Empty query AND empty library => no fetch (we don't want to dump the whole library on first
+  // render). Picking a library lets the user browse without typing.
+  const ltvRunAddSearch = async (q, libKey) => {
+    const trimmed = (q || '').trim();
+    if (trimmed.length < 2 && !libKey) { setLtvAddResults([]); return; }
+    setLtvAddSearching(true);
+    try {
+      const group = ltvAddSearchGroup();
+      const params = new URLSearchParams();
+      if (trimmed) params.set('q', trimmed);
+      params.set('group', group);
+      params.set('limit', '50');
+      if (libKey) params.set('library_key', libKey);
+      const r = await fetch(`/api/livetv/programs/search?${params.toString()}`).then(x => x.json());
+      setLtvAddResults(r.results || []);
+    } catch (e) { setLtvAddResults([]); }
+    setLtvAddSearching(false);
+  };
+  const ltvSearchAddPrograms = (q) => { setLtvAddSearch(q); ltvRunAddSearch(q, ltvAddLibrary); };
+  const ltvChangeAddLibrary = (libKey) => { setLtvAddLibrary(libKey); ltvRunAddSearch(ltvAddSearch, libKey); };
+  const ltvSaveIncluded = async (newIds) => {
+    if (!ltvEditModal) return;
+    const r = await doAction(`/api/livetv/channels/${ltvEditModal}/included-programs`, 'PUT', { included: newIds });
+    if (r.success) {
+      showToast(`Manual additions: ${r.included} (rebuilt ${r.programCount} items)`);
+      try {
+        const p = await fetch(`/api/livetv/channels/${ltvEditModal}/programs`).then(x => x.json());
+        setLtvEditPrograms(p);
+      } catch (e) {}
+      loadLiveTv(); loadLtvGuide();
+    } else {
+      showToast('Save failed: ' + (r.error || 'unknown'), 'error');
+    }
+  };
+  // Search result is either a movie (single id) or a show (array of episode_ids). The PUT body
+  // is always the full deduped include list, so we union with what's already saved.
+  const ltvAddResult = (result) => {
+    const current = (ltvEditPrograms.includedPrograms || []).map(p => p.id);
+    const toAdd = result.kind === 'show' ? (result.episode_ids || []) : [result.id];
+    const next = [...new Set([...current, ...toAdd])];
+    if (next.length === current.length) return;
+    ltvSaveIncluded(next);
+  };
+  // Group the currently-added array by show for the "Currently Added" panel.
+  const ltvIncludedGrouped = () => {
+    const list = ltvEditPrograms.includedPrograms || [];
+    const movies = list.filter(p => p.type !== 'episode');
+    const showMap = new Map();
+    for (const p of list) {
+      if (p.type !== 'episode' || !p.show_title) continue;
+      if (!showMap.has(p.show_title)) showMap.set(p.show_title, { show_title: p.show_title, episodes: [] });
+      showMap.get(p.show_title).episodes.push(p);
+    }
+    return { movies, shows: [...showMap.values()] };
+  };
+  const ltvRemoveIncluded = (programIds) => {
+    const ids = Array.isArray(programIds) ? programIds : [programIds];
+    const idSet = new Set(ids);
+    const current = (ltvEditPrograms.includedPrograms || []).map(p => p.id);
+    ltvSaveIncluded(current.filter(id => !idSet.has(id)));
   };
 
   const ltvToggleExclude = async (programId) => {
@@ -1916,6 +2026,7 @@ function App() {
               <button className={`toggle-opt ${secView==='regional'?'active':''}`} onClick={()=>{setSecView('regional');loadRegSettings();loadRegAlerts();}}>Geofence</button>
               <button className={`toggle-opt ${secView==='alerts'?'active':''}`} onClick={()=>{setSecView('alerts');loadRegAlerts();}}>Alerts</button>
               <button className={`toggle-opt ${secView==='whitelist'?'active':''}`} onClick={()=>{setSecView('whitelist');loadRegWhitelist();}}>Whitelist ({regWhitelist.length})</button>
+              <button className={`toggle-opt ${secView==='gateway'?'active':''}`} onClick={()=>{setSecView('gateway');loadGateway();}}>Gateway</button>
             </div>
             {secView==='live' && (
               <div>
@@ -2118,6 +2229,72 @@ function App() {
                     </div>
                   ))}</div>
                 )}
+              </div>
+            )}
+
+            {secView==='gateway' && (
+              <div>
+                <div className="stream-card" style={{padding:'1.25rem',marginBottom:'1rem'}}>
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'.75rem'}}>
+                    <div>
+                      <div style={{fontWeight:600,fontSize:'1rem'}}>Plex Reverse-Proxy Gateway</div>
+                      <div style={{fontSize:'.75rem',color:'#94a3b8',marginTop:'.2rem'}}>
+                        Routes inbound traffic through PCC so the geofence + deny page apply to every request — not just streaming sessions.
+                      </div>
+                    </div>
+                    <span style={{padding:'.25rem .6rem',borderRadius:'999px',fontSize:'.7rem',fontWeight:600,
+                      background: gatewayState.status==='running' ? 'rgba(34,197,94,.18)' : 'rgba(100,116,139,.18)',
+                      color: gatewayState.status==='running' ? '#4ade80' : '#94a3b8',
+                      border: '1px solid ' + (gatewayState.status==='running' ? 'rgba(34,197,94,.4)' : 'rgba(100,116,139,.4)')}}>
+                      {gatewayState.status==='running' ? '● Running' : '○ Stopped'}
+                    </span>
+                  </div>
+                  {gatewayState.lastError && (
+                    <div className="alert-box alert-error" style={{fontSize:'.8rem',marginBottom:'.75rem'}}>Last error: {gatewayState.lastError}</div>
+                  )}
+                  {!gatewayState.geofenceEnabled && (
+                    <div className="alert-box" style={{fontSize:'.8rem',marginBottom:'.75rem',background:'rgba(245,158,11,.12)',border:'1px solid rgba(245,158,11,.3)',color:'#fbbf24'}}>
+                      Geofence is currently <strong>disabled</strong>. The gateway will pass everything through without filtering. Enable geofence in the Geofence tab to actually block foreign IPs.
+                    </div>
+                  )}
+                  <div style={{display:'grid',gridTemplateColumns:'140px 1fr',gap:'.75rem',marginBottom:'.75rem'}}>
+                    <div className="form-row" style={{marginBottom:0}}>
+                      <label className="form-label">Listen port</label>
+                      <input className="form-input" type="number" min="1" max="65535"
+                        value={gatewayDraft.port} onChange={e=>setGatewayDraft({...gatewayDraft, port:e.target.value})}/>
+                    </div>
+                    <div className="form-row" style={{marginBottom:0}}>
+                      <label className="form-label">Plex Media Server URL (target)</label>
+                      <input className="form-input" type="text" placeholder="http://100.99.196.121:32400"
+                        value={gatewayDraft.target} onChange={e=>setGatewayDraft({...gatewayDraft, target:e.target.value})}/>
+                      <div style={{fontSize:'.7rem',color:'#94a3b8',marginTop:'.2rem'}}>Leave empty to use the PLEX_URL env var ({gatewayState.targetEffective || 'unset'}).</div>
+                    </div>
+                  </div>
+                  <div style={{display:'flex',gap:'.5rem',marginTop:'.5rem'}}>
+                    <button className="btn btn-outline" disabled={gatewaySaving} onClick={saveGatewayConfig}>{gatewaySaving ? 'Saving…' : 'Save config'}</button>
+                    {gatewayState.status==='running' ? (
+                      <button className="btn btn-decline" disabled={gatewaySaving} onClick={stopGateway}>{gatewaySaving ? '…' : 'Stop'}</button>
+                    ) : (
+                      <button className="btn btn-approve" disabled={gatewaySaving} onClick={startGateway}>{gatewaySaving ? '…' : 'Start'}</button>
+                    )}
+                  </div>
+                </div>
+
+                <div className="stream-card" style={{padding:'1.25rem'}}>
+                  <div style={{fontWeight:600,fontSize:'.95rem',marginBottom:'.5rem'}}>How to wire this up</div>
+                  <div style={{fontSize:'.8rem',color:'#cbd5e1',lineHeight:1.6}}>
+                    For the gateway to actually intercept public Plex traffic, you need to route external requests through PCC instead of directly to PMS:
+                    <ol style={{margin:'.5rem 0 .5rem 1.25rem',padding:0}}>
+                      <li><strong>Router port forward.</strong> Change your home router's external Plex port (usually 32400) to forward to the host running PCC on the port set above — <em>not</em> to your PMS host directly. If PCC runs at a different site, your PMS host (or a small box on the home LAN) needs to be the proxy; PCC can do it from anywhere it can reach PMS over Tailscale.</li>
+                      <li><strong>Plex Settings → Network.</strong> Disable <em>Enable Relay</em> so clients can't bypass you. Add PCC's LAN IP to <em>List of IP addresses and networks that are allowed without auth</em> so PCC's proxied requests aren't rate-limited.</li>
+                      <li><strong>Custom server access URLs.</strong> Set to <code>http://&lt;your_public_ip&gt;:&lt;port&gt;</code> so Plex tells external clients to use the public endpoint (which is now PCC).</li>
+                      <li><strong>Enable the geofence.</strong> The gateway only filters when the Geofence tab's <em>enabled</em> switch is on. Allowed countries are configured there. Otherwise it's a transparent proxy.</li>
+                    </ol>
+                    <div style={{marginTop:'.5rem',fontSize:'.75rem',color:'#94a3b8'}}>
+                      Limitation: clients connecting via Plex's <code>*.plex.direct</code> HTTPS endpoints bypass an HTTP proxy by design. To force everyone through PCC, disable HTTPS in Plex's Network settings or restrict it to LAN only.
+                    </div>
+                  </div>
+                </div>
               </div>
             )}
           </div>
@@ -3665,7 +3842,7 @@ function App() {
                 <div className="form-row">
                   <label className="form-label">Exclude Genres</label>
                   <div style={{display:'flex',flexWrap:'wrap',gap:'.4rem'}}>
-                    {['Animation','Anime','Action','Horror','Sci-Fi & Fantasy','Science Fiction','Documentary'].map(g=>(
+                    {ltvGenres.filter(g => g !== ltvAB.genre).map(g=>(
                       <button key={g} className={`btn-sm ${ltvAB.exclude_genres.includes(g)?'btn-decline':'btn-outline'}`}
                         style={{fontSize:'.7rem'}}
                         onClick={()=>setLtvAB(p=>({...p,exclude_genres:p.exclude_genres.includes(g)?p.exclude_genres.filter(x=>x!==g):[...p.exclude_genres,g]}))}>
@@ -3673,7 +3850,7 @@ function App() {
                       </button>
                     ))}
                   </div>
-                  <div style={{fontSize:'.7rem',color:'#94a3b8',marginTop:'.3rem'}}>Click to exclude content also tagged with these genres</div>
+                  <div style={{fontSize:'.7rem',color:'#94a3b8',marginTop:'.3rem'}}>Click to exclude content also tagged with these genres. Your channel's own genre ({ltvAB.genre||'—'}) is hidden because excluding it would leave zero matches.</div>
                 </div>
                 <div className="form-row">
                   <label className="form-label">Library</label>
@@ -3794,6 +3971,7 @@ function App() {
             <div style={{display:'flex',gap:'.5rem',marginBottom:'1.25rem',flexWrap:'wrap'}}>
               <button className={`btn-sm ${ltvEditTab==='filters'?'btn-primary':'btn-outline'}`} onClick={()=>setLtvEditTab('filters')}>Filters & Settings</button>
               <button className={`btn-sm ${ltvEditTab==='content'?'btn-primary':'btn-outline'}`} onClick={()=>setLtvEditTab('content')}>Content ({ltvEditPrograms.totalPrograms} items, {ltvEditPrograms.excludedCount} excluded)</button>
+              <button className={`btn-sm ${ltvEditTab==='add'?'btn-primary':'btn-outline'}`} onClick={()=>{setLtvEditTab('add');setLtvAddSearch('');setLtvAddResults([]);setLtvAddLibrary('');}}>Add Programs{(ltvEditPrograms.includedPrograms||[]).length>0?` (${(ltvEditPrograms.includedPrograms||[]).length})`:''}</button>
               <button className={`btn-sm ${ltvEditTab==='fillers'?'btn-primary':'btn-outline'}`} onClick={()=>setLtvEditTab('fillers')}>Channel Fillers</button>
               <button className={`btn-sm ${ltvEditTab==='logo'?'btn-primary':'btn-outline'}`} onClick={()=>setLtvEditTab('logo')}>Channel Logo</button>
             </div>
@@ -3828,7 +4006,7 @@ function App() {
                 <div className="form-row">
                   <label className="form-label">Exclude Genres</label>
                   <div style={{display:'flex',flexWrap:'wrap',gap:'.4rem'}}>
-                    {['Animation','Anime','Action','Horror','Sci-Fi & Fantasy','Science Fiction','Documentary','Drama','Romance','Thriller'].map(g=>(
+                    {ltvGenres.filter(g => g !== ltvEditFilters.genre).map(g=>(
                       <button key={g} className={`btn-sm ${(ltvEditFilters.exclude_genres||[]).includes(g)?'btn-decline':'btn-outline'}`}
                         style={{fontSize:'.7rem'}}
                         onClick={()=>setLtvEditFilters(p=>({...p,exclude_genres:(p.exclude_genres||[]).includes(g)?(p.exclude_genres||[]).filter(x=>x!==g):[...(p.exclude_genres||[]),g]}))}>
@@ -3836,6 +4014,7 @@ function App() {
                       </button>
                     ))}
                   </div>
+                  <div style={{fontSize:'.7rem',color:'#94a3b8',marginTop:'.3rem'}}>Your channel's own genre ({ltvEditFilters.genre||'—'}) is hidden — excluding it would leave zero matches.</div>
                 </div>
                 <div className="form-row">
                   <label className="form-label">Library</label>
@@ -3938,8 +4117,11 @@ function App() {
                                     onClick={()=>ltvToggleExcludeShow(show.name)}>
                                     {allExcl?'✕':someExcl?'~':'✓'}
                                   </span>
-                                  <span style={{fontWeight:600,fontSize:'.85rem',color:allExcl?'#94a3b8':'#e2e8f0',flex:1,cursor:'pointer'}}
-                                    onClick={()=>ltvToggleExcludeShow(show.name)}>{show.name}</span>
+                                  <span style={{fontWeight:600,fontSize:'.85rem',color:allExcl?'#94a3b8':'#e2e8f0',flex:1,cursor:'pointer',display:'flex',alignItems:'center',gap:'.4rem'}}
+                                    onClick={()=>ltvToggleExcludeShow(show.name)}>
+                                    {show.name}
+                                    {show.hasManual && <span style={{fontSize:'.6rem',padding:'.05rem .35rem',borderRadius:'4px',background:'rgba(168,85,247,.18)',color:'#c4b5fd',border:'1px solid rgba(168,85,247,.3)',fontWeight:500}}>Manual</span>}
+                                  </span>
                                   <span style={{fontSize:'.7rem',color:'#94a3b8',marginRight:'.5rem'}}>
                                     {show.excluded > 0 ? `${show.total - show.excluded}/${show.total}` : show.total} eps
                                   </span>
@@ -3987,7 +4169,10 @@ function App() {
                                 <span style={{width:'16px',height:'16px',borderRadius:'3px',border:'2px solid',borderColor:m.excluded?'#ef4444':'#34d399',background:m.excluded?'rgba(239,68,68,.2)':'rgba(52,211,153,.2)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'.65rem',flexShrink:0}}>
                                   {m.excluded?'✕':'✓'}
                                 </span>
-                                <span style={{fontSize:'.8rem',color:m.excluded?'#94a3b8':'#e2e8f0'}}>{m.title}</span>
+                                <span style={{fontSize:'.8rem',color:m.excluded?'#94a3b8':'#e2e8f0',display:'flex',alignItems:'center',gap:'.4rem'}}>
+                                  {m.title}
+                                  {m.manual && <span style={{fontSize:'.6rem',padding:'.05rem .35rem',borderRadius:'4px',background:'rgba(168,85,247,.18)',color:'#c4b5fd',border:'1px solid rgba(168,85,247,.3)',fontWeight:500}}>Manual</span>}
+                                </span>
                               </div>
                               <span style={{fontSize:'.7rem',color:'#94a3b8'}}>{m.year||''}</span>
                             </div>
@@ -4002,6 +4187,132 @@ function App() {
                 )}
               </div>
             )}
+
+            {ltvEditTab === 'add' && (() => {
+              const isShowChannel = ltvEditFilters.content_type === 'episode';
+              const isMovieChannel = ltvEditFilters.content_type === 'movie';
+              const grouped = ltvIncludedGrouped();
+              // A result is "in channel" if it's already matched by the genre filter (shown in
+              // ltvEditPrograms.shows / movies) OR every relevant program_id is in the manual
+              // includedPrograms list. We surface either case with the same V mark so the user
+              // can tell at a glance what they already have.
+              const channelShowSet = new Set((ltvEditPrograms.shows || []).map(s => s.name));
+              const channelMovieIds = new Set((ltvEditPrograms.movies || []).map(m => m.id));
+              const includedIds = new Set((ltvEditPrograms.includedPrograms || []).map(p => p.id));
+              const includedShowSet = new Set(
+                (ltvEditPrograms.includedPrograms || [])
+                  .filter(p => p.type === 'episode' && p.show_title)
+                  .map(p => p.show_title)
+              );
+              const isAdded = (r) => {
+                if (r.kind === 'show') {
+                  // In channel via filter (whole show present), or every episode already manually added.
+                  if (channelShowSet.has(r.title)) return true;
+                  if (includedShowSet.has(r.title)) return true;
+                  return (r.episode_ids || []).length > 0 && (r.episode_ids || []).every(id => includedIds.has(id));
+                }
+                return channelMovieIds.has(r.id) || includedIds.has(r.id);
+              };
+              return (
+                <div>
+                  <div style={{fontSize:'.85rem',color:'#94a3b8',marginBottom:'1rem'}}>
+                    Manually add {isShowChannel ? 'shows' : isMovieChannel ? 'movies' : 'titles'} to this channel that wouldn’t otherwise match the genre filter. Manual additions override exclude rules — if it’s on this list, it plays.
+                  </div>
+                  <div style={{display:'grid',gridTemplateColumns:'200px 1fr',gap:'.75rem',marginBottom:'1rem'}}>
+                    <div className="form-row" style={{marginBottom:0}}>
+                      <label className="form-label">Library</label>
+                      <select className="form-select" value={ltvAddLibrary} onChange={e=>ltvChangeAddLibrary(e.target.value)}>
+                        <option value="">All libraries</option>
+                        {libraries.map(l=><option key={l.key} value={l.key}>{l.title} ({l.type})</option>)}
+                      </select>
+                    </div>
+                    <div className="form-row" style={{marginBottom:0}}>
+                      <label className="form-label">Search {ltvAddLibrary ? '(or leave empty to browse)' : ''}</label>
+                      <input className="form-input" type="text"
+                        placeholder={isShowChannel ? 'Show name…' : isMovieChannel ? 'Movie title…' : 'Title or show name…'}
+                        value={ltvAddSearch} onChange={e=>ltvSearchAddPrograms(e.target.value)}/>
+                    </div>
+                  </div>
+                  {(ltvAddSearch.trim().length >= 2 || ltvAddLibrary) && (
+                    <div style={{marginBottom:'1.25rem'}}>
+                      <div style={{fontSize:'.8rem',color:'#94a3b8',marginBottom:'.5rem'}}>
+                        {ltvAddSearching ? 'Searching…' : `${ltvAddResults.length} ${isShowChannel?'show':isMovieChannel?'movie':'result'}${ltvAddResults.length===1?'':'s'}`}
+                      </div>
+                      <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill, minmax(320px, 1fr))',gap:'.75rem',maxHeight:'420px',overflowY:'auto',padding:'.25rem'}}>
+                        {ltvAddResults.length === 0 && !ltvAddSearching && (
+                          <div style={{gridColumn:'1/-1',padding:'1rem',textAlign:'center',color:'#64748b',fontSize:'.8rem'}}>No matches</div>
+                        )}
+                        {ltvAddResults.map((r,i) => {
+                          const already = isAdded(r);
+                          return (
+                            <div key={r.kind+'-'+(r.id||r.title)+'-'+i} style={{display:'flex',gap:'.6rem',background:'rgba(15,23,42,.5)',borderRadius:'10px',border:'1px solid rgba(100,116,139,.18)',padding:'.6rem',overflow:'hidden'}}>
+                              <div style={{width:'70px',height:'105px',flexShrink:0,background:'linear-gradient(135deg,#1e3a5f,#2d1f6e)',borderRadius:'6px',overflow:'hidden',display:'flex',alignItems:'center',justifyContent:'center'}}>
+                                {r.cover ? (
+                                  <img src={r.cover} style={{width:'100%',height:'100%',objectFit:'cover'}} onError={e=>{e.target.style.display='none';}}/>
+                                ) : (
+                                  <span style={{fontSize:'.65rem',color:'#64748b',padding:'.25rem',textAlign:'center'}}>No cover</span>
+                                )}
+                              </div>
+                              <div style={{flex:1,minWidth:0,display:'flex',flexDirection:'column'}}>
+                                <div style={{fontWeight:600,fontSize:'.85rem',lineHeight:1.2,marginBottom:'.15rem',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{r.title}</div>
+                                <div style={{fontSize:'.7rem',color:'#94a3b8',marginBottom:'.3rem'}}>
+                                  {r.year ? r.year : ''}
+                                  {r.kind === 'show' && r.episode_count ? ` · ${r.episode_count} eps` : ''}
+                                  {r.kind === 'movie' && r.total_minutes ? ` · ${r.total_minutes} min` : ''}
+                                  {r.content_rating ? ` · ${r.content_rating}` : ''}
+                                </div>
+                                {(r.genres||[]).length > 0 && (
+                                  <div style={{display:'flex',flexWrap:'wrap',gap:'.2rem',marginBottom:'.3rem'}}>
+                                    {r.genres.map(g => (
+                                      <span key={g} style={{fontSize:'.6rem',padding:'.1rem .35rem',borderRadius:'4px',background:'rgba(59,130,246,.15)',color:'#93c5fd',border:'1px solid rgba(59,130,246,.25)'}}>{g}</span>
+                                    ))}
+                                  </div>
+                                )}
+                                {r.summary && (
+                                  <div style={{fontSize:'.7rem',color:'#94a3b8',lineHeight:1.3,marginBottom:'.4rem',display:'-webkit-box',WebkitLineClamp:3,WebkitBoxOrient:'vertical',overflow:'hidden'}}>{r.summary}</div>
+                                )}
+                                <button className={`btn-sm ${already?'btn-outline':'btn-approve'}`} disabled={already} onClick={()=>ltvAddResult(r)} style={{marginTop:'auto',fontSize:'.7rem'}}>
+                                  {already ? '✓ In Channel' : (r.kind === 'show' ? '+ Add Show' : '+ Add Movie')}
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                  <div>
+                    <div style={{fontWeight:600,fontSize:'.9rem',marginBottom:'.5rem'}}>
+                      Currently Added ({grouped.shows.length} show{grouped.shows.length===1?'':'s'}, {grouped.movies.length} movie{grouped.movies.length===1?'':'s'})
+                    </div>
+                    {grouped.shows.length === 0 && grouped.movies.length === 0 ? (
+                      <div className="empty" style={{padding:'1rem',fontSize:'.85rem'}}>Nothing added manually yet. Search above.</div>
+                    ) : (
+                      <div style={{maxHeight:'280px',overflowY:'auto',background:'rgba(15,23,42,.3)',borderRadius:'8px',border:'1px solid rgba(100,116,139,.15)'}}>
+                        {grouped.shows.map(s => (
+                          <div key={'show-'+s.show_title} style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'.5rem .75rem',borderBottom:'1px solid rgba(100,116,139,.08)'}}>
+                            <div style={{minWidth:0,flex:1}}>
+                              <div style={{fontSize:'.85rem',fontWeight:500}}>{s.show_title}</div>
+                              <div style={{fontSize:'.7rem',color:'#94a3b8'}}>{s.episodes.length} episode{s.episodes.length===1?'':'s'}</div>
+                            </div>
+                            <button className="btn-sm btn-delete" onClick={()=>ltvRemoveIncluded(s.episodes.map(e=>e.id))} style={{flexShrink:0,marginLeft:'.5rem'}}>Remove Show</button>
+                          </div>
+                        ))}
+                        {grouped.movies.map(m => (
+                          <div key={'movie-'+m.id} style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'.5rem .75rem',borderBottom:'1px solid rgba(100,116,139,.08)'}}>
+                            <div style={{minWidth:0,flex:1}}>
+                              <div style={{fontSize:'.85rem',fontWeight:500}}>{m.title}</div>
+                              <div style={{fontSize:'.7rem',color:'#94a3b8'}}>{m.year||''}{m.genre?` · ${m.genre}`:''}</div>
+                            </div>
+                            <button className="btn-sm btn-delete" onClick={()=>ltvRemoveIncluded(m.id)} style={{flexShrink:0,marginLeft:'.5rem'}}>Remove</button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
 
             {ltvEditTab === 'fillers' && (
               <div>

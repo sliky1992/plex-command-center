@@ -1,4 +1,4 @@
-const CACHE_NAME = 'pcc-v3.0.1';
+const CACHE_NAME = 'pcc-v3.3.0';
 const PRECACHE = ['/', '/manifest.json'];
 
 self.addEventListener('install', e => {
