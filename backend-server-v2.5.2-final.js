@@ -5552,6 +5552,48 @@ function buildSubtitleBurnArgs(fileUrl, sub) {
   return { vfArgs: ['-vf', filterValue], forceTranscode: true };
 }
 
+// Plex can hold multiple Media entries per item (e.g. when a file gets moved on disk, the old
+// Media stays as an orphan pointing at the missing path). Always picking Media[0] then 404s
+// silently. This helper HEADs each Media's first Part and returns the one that responds OK,
+// caching the picked index for 30 min so we don't probe on every play.
+const _playableMediaCache = new Map();
+const PLAYABLE_MEDIA_TTL_MS = 30 * 60 * 1000;
+
+async function pickPlayableMedia(rkey, metadata) {
+  const medias = metadata?.Media || [];
+  if (medias.length === 0) return null;
+  // Fast path: single Media — assume it's the one to use (caller's catch handler will
+  // surface a 404 if it's broken). Saves a HEAD on every healthy library.
+  if (medias.length === 1) {
+    const p = medias[0]?.Part?.[0];
+    return p?.key ? { mediaIdx: 0, media: medias[0], part: p, partKey: p.key } : null;
+  }
+  // Cached pick — if we recently confirmed which Media is playable for this rkey, use it.
+  const cached = _playableMediaCache.get(String(rkey));
+  if (cached && cached.expiresAt > Date.now()) {
+    const m = medias[cached.mediaIdx];
+    const p = m?.Part?.[0];
+    if (p?.key) return { mediaIdx: cached.mediaIdx, media: m, part: p, partKey: p.key };
+    // The cached index points at something invalid now — fall through to re-probe.
+  }
+  // Probe each Media in order; first 2xx wins.
+  for (let i = 0; i < medias.length; i++) {
+    const m = medias[i];
+    const p = m?.Part?.[0];
+    if (!p?.key) continue;
+    const url = `${config.plex.url}${p.key}?X-Plex-Token=${config.plex.token}`;
+    try {
+      const r = await axios.head(url, { timeout: 3000, validateStatus: () => true });
+      if (r.status >= 200 && r.status < 300) {
+        _playableMediaCache.set(String(rkey), { mediaIdx: i, expiresAt: Date.now() + PLAYABLE_MEDIA_TTL_MS });
+        if (i > 0) console.log(`[LiveTV] rk=${rkey}: Media[0] unreachable, using Media[${i}] (file=${p.file || '?'})`);
+        return { mediaIdx: i, media: m, part: p, partKey: p.key };
+      }
+    } catch(e) { /* try next */ }
+  }
+  return null;
+}
+
 app.get('/discover.json', (req, res) => {
   res.json(hdhrDiscover(req));
 });
@@ -6027,7 +6069,10 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
       });
 
       const metadata = metaRes.data.MediaContainer.Metadata?.[0];
-      const partKey = metadata?.Media?.[0]?.Part?.[0]?.key;
+      // Multi-Media fallback: Plex sometimes keeps an orphan Media entry pointing at a moved
+      // or deleted file. Probe each entry and use the first one that actually serves bytes.
+      const picked = await pickPlayableMedia(progRkey, metadata);
+      const partKey = picked?.partKey;
       const isFillerItem = !!prog.item.filler_id && !prog.item.program_id;
       if (!partKey) {
         if (isFillerItem) {
@@ -6038,12 +6083,12 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
           }
           return;
         }
-        throw new Error('No media part found');
+        throw new Error('No playable Media entry (all parts 404 or missing)');
       }
 
       const fileUrl = `${config.plex.url}${partKey}?X-Plex-Token=${config.plex.token}`;
-      const videoCodec = metadata?.Media?.[0]?.videoCodec || 'unknown';
-      const audioCodec = metadata?.Media?.[0]?.audioCodec || 'unknown';
+      const videoCodec = picked.media?.videoCodec || 'unknown';
+      const audioCodec = picked.media?.audioCodec || 'unknown';
 
       const segStart = Date.now();
       let segBytes = 0;
