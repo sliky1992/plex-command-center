@@ -9,6 +9,11 @@ services:
     restart: unless-stopped
     ports:
       - "3001:3001"
+      # Plex reverse-proxy gateway port. Off by default; enable by setting
+      # PCC_GATEWAY_ENABLED=1 in your override. Point your router's public port forward
+      # at THIS host:32400 (not PMS directly) so foreign-geo traffic hits the deny page
+      # before reaching Plex.
+      - "32400:32400"
     environment:
       # Plex - REQUIRED
       - PLEX_URL=http://YOUR_PLEX_IP:32400

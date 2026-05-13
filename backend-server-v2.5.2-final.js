@@ -9,6 +9,8 @@ const { spawn, spawnSync } = require('child_process');
 const Database = require('better-sqlite3');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const http = require('http');
+const net = require('net');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -1558,6 +1560,21 @@ pccDb.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_alertlog_decision ON region_alert_log(decision);
   CREATE INDEX IF NOT EXISTS idx_alertlog_created ON region_alert_log(created_at);
+  -- Audit trail for the Plex reverse-proxy gateway. We only log denies and the FIRST allow
+  -- per (ip, day) to keep volume manageable; full allow-stream traffic isn't worth the writes.
+  CREATE TABLE IF NOT EXISTS gateway_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip_address TEXT NOT NULL,
+    country TEXT,
+    city TEXT,
+    allowed INTEGER NOT NULL,
+    action TEXT,
+    url_path TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_gwlog_ip ON gateway_log(ip_address);
+  CREATE INDEX IF NOT EXISTS idx_gwlog_created ON gateway_log(created_at);
+  CREATE INDEX IF NOT EXISTS idx_gwlog_allowed ON gateway_log(allowed);
 `);
 // Seed defaults: feature off, Israel + LAN allowed, alert-only (no auto-terminate) by default.
 pccDb.exec("INSERT OR IGNORE INTO regional_settings (key, value) VALUES ('enabled', '0')");
@@ -1984,9 +2001,12 @@ setInterval(async () => {
           pccDb.prepare(`INSERT INTO connection_log (plex_user, ip_address, device, platform, player_product, geo_country, geo_city, geo_lat, geo_lon, geo_isp, content_title, session_id)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(user, ip, device, platform, product, geo.country, geo.city, geo.lat, geo.lon, geo.isp, content, sessionId);
         }
-        // Run the regional policy check on first sighting OR whenever the device's IP changes.
-        try { await evaluateRegionalSession(s); } catch(e) { console.warn('[REGIONAL] eval error:', e.message); }
       }
+      // Always run the regional policy on every poll — the internal dedupe inside
+      // evaluateRegionalSession decides whether to actually fire an alert. The previous code only
+      // evaluated on new sessions, so when Plex re-used the session_id after an auto-terminate
+      // the block never re-fired (and the alert log went silent past the first kick).
+      try { await evaluateRegionalSession(s); } catch(e) { console.warn('[REGIONAL] eval error:', e.message); }
     }
   } catch(e) { /* silent fail on session poll */ }
 }, 30000);
@@ -2180,13 +2200,23 @@ async function evaluateRegionalSession(s) {
   const geo = await lookupGeo(ip);
   if (!geo || !geo.country) return;
   if (settings.allowed_countries.includes(geo.country)) return;
-  // Don't re-alert on the same (session_id, ip) — a client that's still pending from the same
-  // address shouldn't spam new rows on every poll. But a known device showing up from a NEW IP
-  // is exactly the case we want to surface, so the dedup key includes the IP.
+  // Don't re-alert on the same (session_id, ip) within a short window — a client streaming
+  // continuously shouldn't spam new rows on every 30s poll. Time-windowed instead of
+  // decision='pending' so that a re-stream after auto-terminate still re-fires after 5 minutes,
+  // keeping the audit log honest for repeated attempts.
   const sessionId = s.Session?.id || s.sessionKey || '';
   if (sessionId) {
-    const existing = pccDb.prepare("SELECT id FROM region_alert_log WHERE session_id = ? AND ip_address = ? AND decision = 'pending'").get(sessionId, ip);
-    if (existing) return;
+    const existing = pccDb.prepare(
+      "SELECT id FROM region_alert_log WHERE session_id = ? AND ip_address = ? AND created_at > datetime('now', '-5 minutes')"
+    ).get(sessionId, ip);
+    if (existing) {
+      // Still inside the dedup window. Re-enforce termination silently — Plex may have re-issued
+      // the session after the previous kick and we want it dead again, not just logged.
+      if (settings.action === 'auto_terminate') {
+        await terminatePlexSessionById(sessionId, `Region policy: ${geo.country} not allowed (re-enforce)`);
+      }
+      return;
+    }
   }
 
   const alert = {
@@ -7070,6 +7100,181 @@ app.get('*', (req, res) => {
 app.use((err, req, res, next) => {
   console.error(err.stack);
   res.status(500).json({ error: err.message });
+});
+
+// ============================================
+// PLEX REVERSE-PROXY GATEWAY
+// ============================================
+//
+// When PCC_GATEWAY_ENABLED=1, PCC listens on PCC_GATEWAY_PORT and reverse-proxies every
+// request to the real Plex Media Server (PCC_GATEWAY_TARGET, defaulting to PLEX_URL).
+// Before forwarding, the source IP is checked against the existing regional geofence:
+//   - LAN/private IPs pass.
+//   - IPs in regional_whitelist pass.
+//   - Country in regional_settings.allowed_countries passes.
+//   - Everything else gets a 403 deny page (HTML for browser, plaintext for API/upgrade).
+//
+// Safety: if regional_settings.enabled is 0, the gateway acts as a pure pass-through proxy.
+// This way enabling the gateway via env never locks you out unintentionally — geofence
+// enforcement is opt-in through the existing UI.
+//
+// Setup steps for the user (documented in release notes):
+//   1. Point router public port forward at PCC's host (not PMS) on PCC_GATEWAY_PORT.
+//   2. In Plex: Settings → Network → add PCC's LAN IP to "LAN networks" so PCC's proxied
+//      requests aren't rate-limited; disable "Enable Relay" so clients can't bypass us.
+//   3. (Optional) Custom server access URL → http://<public_ip>:<port> so Plex tells
+//      clients to use the public endpoint (which is PCC).
+const GATEWAY_ENABLED = process.env.PCC_GATEWAY_ENABLED === '1';
+const GATEWAY_PORT = parseInt(process.env.PCC_GATEWAY_PORT) || 32400;
+const GATEWAY_TARGET = process.env.PCC_GATEWAY_TARGET || config.plex.url || '';
+
+async function checkGatewayAccess(ip) {
+  const cleanIp = (ip || '').replace(/^::ffff:/, '');
+  const geo = await lookupGeo(cleanIp);
+  const settings = readRegionalSettings();
+  // Geofence disabled → pure proxy.
+  if (!settings.enabled) return { allowed: true, geo, reason: 'geofence_disabled' };
+  if (isIpRegionallyWhitelisted(cleanIp)) return { allowed: true, geo, reason: 'whitelisted' };
+  if (settings.allowed_countries.includes(geo.country)) return { allowed: true, geo, reason: 'allowed_country' };
+  return { allowed: false, geo, reason: 'geofence' };
+}
+
+// In-process cache to log only one "allow" per (ip, day) — keeps volume sane.
+const _gatewayAllowSeen = new Map();
+function _gatewayAllowKey(ip) { return ip + '|' + new Date().toISOString().slice(0, 10); }
+function logGatewayEvent(ip, decision, action, urlPath) {
+  try {
+    if (decision.allowed) {
+      const key = _gatewayAllowKey(ip);
+      if (_gatewayAllowSeen.has(key)) return;
+      _gatewayAllowSeen.set(key, true);
+      // Trim old entries periodically.
+      if (_gatewayAllowSeen.size > 5000) {
+        const today = new Date().toISOString().slice(0, 10);
+        for (const k of _gatewayAllowSeen.keys()) if (!k.endsWith(today)) _gatewayAllowSeen.delete(k);
+      }
+    }
+    pccDb.prepare('INSERT INTO gateway_log (ip_address, country, city, allowed, action, url_path) VALUES (?,?,?,?,?,?)')
+      .run(ip, decision.geo?.country || null, decision.geo?.city || null, decision.allowed ? 1 : 0, action, (urlPath || '').slice(0, 200));
+  } catch(e) { /* log failure shouldn't break the proxy */ }
+}
+
+function denyPageHtml(ip, country) {
+  // Plain-template literal; the only interpolated values are ip (already trimmed by socket layer)
+  // and country (from our own ip-api cache, server-controlled). Both are safe to embed.
+  const esc = s => String(s || '').replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c]));
+  return `<!doctype html>
+<html><head><meta charset="utf-8"><title>Access Denied</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; background:#0a0e27; color:#e2e8f0; display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; padding:1rem; }
+  .card { background:rgba(15,23,42,.85); border:1px solid rgba(100,116,139,.3); border-radius:14px; padding:2.5rem; max-width:520px; box-shadow:0 20px 60px rgba(0,0,0,.5); }
+  h1 { color:#ef4444; margin:0 0 .75rem 0; font-size:1.5rem; }
+  p { color:#94a3b8; line-height:1.5; }
+  .meta { font-family: ui-monospace, monospace; font-size:.8rem; color:#64748b; margin-top:1.5rem; padding-top:1rem; border-top:1px solid rgba(100,116,139,.2); }
+  .meta div { margin:.15rem 0; }
+</style></head>
+<body><div class="card">
+  <h1>Access Not Allowed</h1>
+  <p>This server is not accessible from your current location.</p>
+  <p>If you believe this is an error, please contact the server administrator.</p>
+  <div class="meta">
+    <div>IP: ${esc(ip)}</div>
+    <div>Country: ${esc(country || 'Unknown')}</div>
+    <div>Time: ${new Date().toISOString()}</div>
+  </div>
+</div></body></html>`;
+}
+
+if (GATEWAY_ENABLED && GATEWAY_TARGET) {
+  const targetUrl = new URL(GATEWAY_TARGET);
+  const tHost = targetUrl.hostname;
+  const tPort = Number(targetUrl.port) || (targetUrl.protocol === 'https:' ? 443 : 80);
+  const isHttps = targetUrl.protocol === 'https:';
+  const httpMod = isHttps ? require('https') : http;
+
+  const gateway = http.createServer(async (req, res) => {
+    const ip = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+    let decision;
+    try { decision = await checkGatewayAccess(ip); }
+    catch (e) { decision = { allowed: false, geo: { country: 'Unknown' }, reason: 'geo_lookup_failed' }; }
+
+    if (!decision.allowed) {
+      logGatewayEvent(ip, decision, 'deny', req.url);
+      res.writeHead(403, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store, no-cache, must-revalidate',
+        'X-Geofence-Blocked': decision.geo.country || 'unknown'
+      });
+      return res.end(denyPageHtml(ip, decision.geo.country));
+    }
+
+    const proxyReq = httpMod.request({
+      hostname: tHost, port: tPort, path: req.url, method: req.method,
+      headers: { ...req.headers, host: `${tHost}:${tPort}`, 'x-forwarded-for': ip, 'x-real-ip': ip },
+      rejectUnauthorized: false  // PMS uses its own *.plex.direct self-signed cert
+    }, (proxyRes) => {
+      res.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyRes.pipe(res);
+    });
+    proxyReq.on('error', (err) => {
+      console.warn(`[Gateway] upstream error for ${ip}: ${err.message}`);
+      if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'text/plain' });
+      if (!res.writableEnded) res.end('Upstream Plex server unreachable');
+    });
+    req.pipe(proxyReq);
+    logGatewayEvent(ip, decision, 'allow', req.url);
+  });
+
+  // WebSocket / generic Upgrade pass-through (Plex uses /:/eventsource and friends).
+  gateway.on('upgrade', async (req, clientSocket, head) => {
+    const ip = (clientSocket.remoteAddress || '').replace(/^::ffff:/, '');
+    let decision;
+    try { decision = await checkGatewayAccess(ip); }
+    catch (e) { decision = { allowed: false, geo: { country: 'Unknown' }, reason: 'geo_lookup_failed' }; }
+
+    if (!decision.allowed) {
+      logGatewayEvent(ip, decision, 'deny-ws', req.url);
+      clientSocket.write('HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n\r\nAccess denied from your location.');
+      return clientSocket.destroy();
+    }
+    const upstream = net.connect(tPort, tHost, () => {
+      const headers = { ...req.headers, host: `${tHost}:${tPort}`, 'x-forwarded-for': ip };
+      const reqLine = `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n`;
+      const headerLines = Object.entries(headers).map(([k, v]) => `${k}: ${v}`).join('\r\n');
+      upstream.write(reqLine + headerLines + '\r\n\r\n');
+      if (head && head.length) upstream.write(head);
+      upstream.pipe(clientSocket);
+      clientSocket.pipe(upstream);
+    });
+    upstream.on('error', () => clientSocket.destroy());
+    clientSocket.on('error', () => upstream.destroy());
+    logGatewayEvent(ip, decision, 'allow-ws', req.url);
+  });
+
+  gateway.listen(GATEWAY_PORT, () => {
+    console.log(`[Gateway] Plex reverse proxy listening on :${GATEWAY_PORT} → ${GATEWAY_TARGET}`);
+  });
+} else if (GATEWAY_ENABLED && !GATEWAY_TARGET) {
+  console.warn('[Gateway] PCC_GATEWAY_ENABLED=1 but no PCC_GATEWAY_TARGET / PLEX_URL configured. Gateway not started.');
+}
+
+// gateway_log API for the UI
+app.get('/api/security/gateway-log', (req, res) => {
+  const limit = Math.min(500, parseInt(req.query.limit) || 100);
+  const onlyDenied = req.query.denied === '1';
+  const sql = onlyDenied
+    ? 'SELECT * FROM gateway_log WHERE allowed = 0 ORDER BY created_at DESC LIMIT ?'
+    : 'SELECT * FROM gateway_log ORDER BY created_at DESC LIMIT ?';
+  res.json(pccDb.prepare(sql).all(limit));
+});
+app.get('/api/security/gateway-stats', (req, res) => {
+  res.json({
+    enabled: GATEWAY_ENABLED,
+    port: GATEWAY_PORT,
+    target: GATEWAY_TARGET,
+    totals: pccDb.prepare("SELECT SUM(CASE WHEN allowed=1 THEN 1 ELSE 0 END) AS allowed, SUM(CASE WHEN allowed=0 THEN 1 ELSE 0 END) AS denied FROM gateway_log WHERE created_at > datetime('now','-7 days')").get()
+  });
 });
 
 app.listen(PORT, () => {
