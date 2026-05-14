@@ -3230,6 +3230,9 @@ if (LIVETV_ENABLED) {
   // items that aired on a channel within the last N days when there's enough pool depth.
   db.exec("INSERT OR IGNORE INTO livetv_settings (key, value) VALUES ('rerun_window_days', '7')");
   db.exec("INSERT OR IGNORE INTO livetv_settings (key, value) VALUES ('auto_rebuild_enabled', '1')");
+  // Inbox state for the "What's New" tab. Items with added_at > this timestamp are surfaced
+  // until the user clicks "Mark all seen", which advances this to datetime('now').
+  db.exec("INSERT OR IGNORE INTO livetv_settings (key, value) VALUES ('new_items_last_seen_at', '1970-01-01 00:00:00')");
 
   // channel_playlog records what each channel had in its playlist on a given day. Used by the
   // anti-rerun filter to spread movie content across days. Composite uniqueness prevents
@@ -3254,6 +3257,10 @@ if (LIVETV_ENABLED) {
     // Manual program additions — JSON array of program_ids the user explicitly added that bypass
     // the genre filter. buildChannelPlaylist unions these with the filter results before shuffling.
     if (!cols2.includes('included_programs')) db.exec("ALTER TABLE channels ADD COLUMN included_programs TEXT DEFAULT '[]'");
+    // Per-channel auto-renew toggle. When on, the rebuild automatically clears playlog entries
+    // for any show that just completed its full episode run, so the show keeps rotating without
+    // requiring the user to hit Renew manually.
+    if (!cols2.includes('auto_renew_shows')) db.exec("ALTER TABLE channels ADD COLUMN auto_renew_shows INTEGER DEFAULT 0");
   } catch(e) {}
   // Plex summary (one-paragraph description) — used by the Add-Programs UI cards. Populated on
   // scan when present; older rows stay NULL and just render without a description.
@@ -3364,6 +3371,33 @@ if (LIVETV_ENABLED) {
       _gcPlaylog();
     } catch(e) { console.warn('[LiveTV] auto-rebuild loop error:', e.message); }
   }, 60 * 60 * 1000);
+
+  // Airtime logger — every 5 minutes, record the program currently airing on each enabled
+  // channel into channel_playlog. This replaces the old rebuild-time stamp (which marked
+  // everything in the schedule as "aired" regardless of wall-clock) with a real airtime
+  // signal. The rerun filter and show-completion report both consume this.
+  //
+  // Dedupe: we keep the last-logged program_id per channel in memory so a 22-minute show
+  // doesn't generate multiple inserts as the cron ticks within its slot.
+  const _airtimeLastSeen = new Map();
+  setInterval(() => {
+    if (!LIVETV_ENABLED || !db) return;
+    try {
+      const channels = db.prepare('SELECT id, name FROM channels WHERE enabled = 1').all();
+      for (const ch of channels) {
+        try {
+          if (!isChannelEffectivelyOnAir(ch.id)) continue;
+          const prog = getCurrentProgram(ch.id);
+          const pid = prog?.item?.program_id;
+          if (!pid) continue; // skip fillers and empty slots
+          if (_airtimeLastSeen.get(ch.id) === pid) continue;
+          _airtimeLastSeen.set(ch.id, pid);
+          db.prepare('INSERT INTO channel_playlog (channel_id, program_id, filler_id, aired_on) VALUES (?, ?, NULL, ?)')
+            .run(ch.id, pid, _todayDateStr());
+        } catch(e) { /* channel-level failure — keep iterating */ }
+      }
+    } catch(e) { console.warn('[LiveTV] airtime logger error:', e.message); }
+  }, 5 * 60 * 1000);
 }
 
 // --- Virtual Clock Engine ---
@@ -4133,26 +4167,72 @@ function buildChannelPlaylist(channelId) {
     }
   }
 
-  // Anti-rerun: skip MOVIES that aired on this channel within the last N days. We don't apply
-  // this to episodes (TV shows want to rotate through their full season list, not skip episodes
-  // we just aired). We also bail out of filtering if it would leave the movie pool empty —
-  // better to repeat than to have nothing to play.
+  // Anti-rerun: skip programs that aired on this channel within the last N days.
+  // - MOVIES: filter when the remaining movie pool stays >= 5 (small pools would otherwise
+  //   collapse to "nothing on" within a week).
+  // - EPISODES: filter per-show. A show whose unaired-episodes drops below 2 (e.g. all 200
+  //   Naruto episodes have rotated through in the last 7 days) is marked "completed" and
+  //   left ALONE: either auto-renewed (if the channel's auto_renew_shows flag is on) or
+  //   left in the playlist so the user can decide. Without this per-show treatment, shows
+  //   with shallow remaining pools would silently disappear from the channel.
   const { rerunDays } = _readSchedSettings();
+  let completedShows = []; // surfaced via /api/livetv/show-completion below
   if (rerunDays > 0 && programs.length > 0) {
     const recentIds = _recentlyAiredProgramIds(channelId, rerunDays);
     if (recentIds.size > 0) {
       const movies = programs.filter(p => p.type !== 'episode');
       const episodes = programs.filter(p => p.type === 'episode');
+
+      // Movie filter — same as before.
       const moviesAfter = movies.filter(p => !recentIds.has(p.id));
-      // Only apply the filter if it leaves at least 5 movies — small pools would otherwise
-      // collapse to "nothing on" within a week.
+      let keptMovies = movies;
       if (moviesAfter.length >= 5) {
         const removed = movies.length - moviesAfter.length;
         if (removed > 0) console.log(`[LiveTV] Channel ${channel.name}: skipping ${removed} movie(s) aired in last ${rerunDays}d (pool ${movies.length}→${moviesAfter.length})`);
-        programs = episodes.concat(moviesAfter);
+        keptMovies = moviesAfter;
       } else if (movies.length > 0) {
-        console.log(`[LiveTV] Channel ${channel.name}: rerun-filter would shrink movie pool to ${moviesAfter.length}, skipping filter`);
+        console.log(`[LiveTV] Channel ${channel.name}: rerun-filter would shrink movie pool to ${moviesAfter.length}, skipping movie filter`);
       }
+
+      // Episode filter — group by show.
+      const byShow = new Map();
+      for (const ep of episodes) {
+        const key = ep.show_title || '__no_show__';
+        if (!byShow.has(key)) byShow.set(key, []);
+        byShow.get(key).push(ep);
+      }
+      const keptEpisodes = [];
+      const renewShowSet = new Set();
+      const autoRenew = !!channel.auto_renew_shows;
+      for (const [show, eps] of byShow) {
+        const fresh = eps.filter(e => !recentIds.has(e.id));
+        if (fresh.length >= 2) {
+          // Plenty of unaired episodes left — filter normally.
+          keptEpisodes.push(...fresh);
+        } else if (eps.length > 0) {
+          // Pool exhausted for this show. It's "completed".
+          completedShows.push({
+            show, episode_count: eps.length, remaining: fresh.length,
+            renewed: autoRenew
+          });
+          if (autoRenew) {
+            // Wipe this show's playlog so episodes rotate again from this rebuild forward.
+            const ids = eps.map(e => e.id);
+            const placeholders = ids.map(() => '?').join(',');
+            db.prepare(`DELETE FROM channel_playlog WHERE channel_id = ? AND program_id IN (${placeholders})`).run(channelId, ...ids);
+            keptEpisodes.push(...eps);
+            renewShowSet.add(show);
+          } else {
+            // Not auto-renewing — keep what's still fresh (could be 0–1) so the show doesn't
+            // disappear entirely between renewals; user will see the Renew suggestion in the UI.
+            keptEpisodes.push(...(fresh.length > 0 ? fresh : eps));
+          }
+        }
+      }
+      if (renewShowSet.size > 0) {
+        console.log(`[LiveTV] Channel ${channel.name}: auto-renewed ${renewShowSet.size} completed show(s): ${[...renewShowSet].join(', ')}`);
+      }
+      programs = keptEpisodes.concat(keptMovies);
     }
   }
 
@@ -4443,14 +4523,14 @@ function buildChannelPlaylist(channelId) {
   buildTx();
 
   invalidatePlaylistCache(channelId);
-  // Record what's in the playlist as today's playlog so future rebuilds skip these for the rerun
-  // window. Then stamp last_rebuilt_at — the daily auto-rebuild loop uses this to skip channels
-  // already rebuilt today.
+  // last_rebuilt_at lets the daily auto-rebuild loop skip channels already rebuilt today.
+  // NOTE: we used to stamp every scheduled item into channel_playlog here, but that conflated
+  // "scheduled today" with "actually aired" and made the rerun filter + completion report
+  // useless for deep channels. Airtime tracking now lives in the background cron near the
+  // bottom of this file (every 5 min, records what's actually on the channel right now).
   try {
-    const items = db.prepare("SELECT program_id, filler_id FROM channel_programming WHERE channel_id = ?").all(channelId);
-    _writePlaylogForChannel(channelId, items, _todayDateStr());
     db.prepare("UPDATE channels SET last_rebuilt_at = datetime('now') WHERE id = ?").run(channelId);
-  } catch(e) { console.warn('[LiveTV] playlog write failed:', e.message); }
+  } catch(e) { console.warn('[LiveTV] last_rebuilt_at write failed:', e.message); }
   const count = db.prepare('SELECT COUNT(*) as cnt FROM channel_programming WHERE channel_id = ?').get(channelId).cnt;
   console.log(`LiveTV: Built playlist for channel ${channel.name} with ${count} items`);
   return count;
@@ -7453,6 +7533,227 @@ app.get('/api/security/gateway-stats', (req, res) => {
     totals: pccDb.prepare("SELECT SUM(CASE WHEN allowed=1 THEN 1 ELSE 0 END) AS allowed, SUM(CASE WHEN allowed=0 THEN 1 ELSE 0 END) AS denied FROM gateway_log WHERE created_at > datetime('now','-7 days')").get()
   });
 });
+// ============================================
+// "WHAT'S NEW" — newly-arrived Plex items
+// ============================================
+//
+// Surfaces programs whose Plex addedAt timestamp is more recent than the last-seen marker
+// (livetv_settings.new_items_last_seen_at). For each one, computes which channels' genre
+// filter it would fit so the UI can offer a one-click "add to channel" button.
+
+function _suggestChannelsForProgram(prog) {
+  // Mirror buildGenreQuery's matching logic enough to predict whether each channel's filter
+  // would include this row. Returns an array of {id, number, name, source_genre, content_type}.
+  const channels = db.prepare("SELECT id, number, name, source_value, library_key, enabled FROM channels WHERE enabled = 1").all();
+  const out = [];
+  const progGenres = (prog.genre || '').split(',').map(g => g.trim()).filter(Boolean);
+  for (const ch of channels) {
+    let filters;
+    try { filters = JSON.parse(ch.source_value || '{}'); } catch(e) { continue; }
+    if (!filters.genre) continue;
+    // content_type filter
+    if (filters.content_type && filters.content_type !== 'all' && filters.content_type !== prog.type) continue;
+    // library_key filter (channel's column wins)
+    const chLib = ch.library_key || filters.library_key || '';
+    if (chLib && String(chLib) !== String(prog.library_key || '')) continue;
+    // genre match (primary vs any)
+    const wantGenre = filters.genre;
+    let matches = false;
+    if ((filters.genre_mode || 'any') === 'primary') {
+      matches = progGenres[0] === wantGenre;
+    } else {
+      matches = progGenres.includes(wantGenre);
+    }
+    if (!matches) continue;
+    // exclude_genres
+    if (Array.isArray(filters.exclude_genres) && filters.exclude_genres.some(g => g && progGenres.includes(g))) continue;
+    // year range
+    if (filters.year_from && prog.year && prog.year < parseInt(filters.year_from)) continue;
+    if (filters.year_to && prog.year && prog.year > parseInt(filters.year_to)) continue;
+    out.push({ id: ch.id, number: ch.number, name: ch.name, content_type: filters.content_type || 'all' });
+  }
+  return out;
+}
+
+app.get('/api/livetv/new-items', (req, res) => {
+  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
+  // Plex addedAt is stored in ms; convert the SQLite timestamp to a numeric epoch for comparison.
+  const sinceRow = db.prepare("SELECT value FROM livetv_settings WHERE key='new_items_last_seen_at'").get();
+  const sinceStr = sinceRow?.value || '1970-01-01 00:00:00';
+  const sinceMs = new Date(sinceStr.replace(' ', 'T') + 'Z').getTime();
+  const limit = Math.min(500, parseInt(req.query.limit) || 200);
+
+  const rows = db.prepare(`
+    SELECT id, plex_rating_key, title, type, show_title, season_num, episode_num,
+           duration_ms, genre, year, thumb, summary, content_rating, library_key, added_at
+    FROM programs
+    WHERE added_at IS NOT NULL AND added_at > ? AND duration_ms > 0
+    ORDER BY added_at DESC
+    LIMIT ?
+  `).all(sinceMs, limit);
+
+  const plexUrl = config.plex.url || '';
+  const plexToken = config.plex.token || '';
+  const thumbUrl = t => t && plexUrl ? `${plexUrl}${t}?X-Plex-Token=${plexToken}` : null;
+
+  // Group episodes by show so the UI shows one row per show (with episode count), but movies
+  // stay individual. Pick the most-recently-added episode as the rep.
+  const showMap = new Map();
+  const items = [];
+  for (const r of rows) {
+    if (r.type === 'episode' && r.show_title) {
+      const key = r.show_title;
+      if (!showMap.has(key)) {
+        showMap.set(key, { ...r, kind: 'show', title: r.show_title, episode_count: 0, latest_added: r.added_at });
+        items.push(showMap.get(key));
+      }
+      const entry = showMap.get(key);
+      entry.episode_count++;
+      if (r.added_at > entry.latest_added) entry.latest_added = r.added_at;
+    } else {
+      items.push({ ...r, kind: 'movie' });
+    }
+  }
+
+  // Hydrate each surfaced item with suggested channels + thumb URL.
+  const out = items.map(it => {
+    const suggested = _suggestChannelsForProgram(it);
+    const addedAtIso = it.added_at ? new Date(it.added_at).toISOString() : null;
+    return {
+      kind: it.kind,
+      id: it.id, // for movies — for shows this is the rep episode's id
+      plex_rating_key: it.plex_rating_key,
+      title: it.title,
+      show_title: it.show_title,
+      year: it.year,
+      type: it.type,
+      genres: (it.genre || '').split(',').map(g => g.trim()).filter(Boolean).slice(0, 4),
+      duration_minutes: Math.round((it.duration_ms || 0) / 60000),
+      episode_count: it.episode_count,
+      latest_added: it.latest_added || it.added_at,
+      added_at_iso: addedAtIso,
+      cover: thumbUrl(it.thumb),
+      summary: it.summary || null,
+      suggested_channels: suggested
+    };
+  });
+  res.json({ since: sinceStr, totalItems: out.length, items: out });
+});
+
+// Completion report: for each channel (or one specific), figure out which TV shows have rotated
+// through every episode within the rerun window. Used by the UI to surface "ready to renew"
+// suggestions and gives a per-channel summary the user can act on.
+app.get('/api/livetv/show-completion', (req, res) => {
+  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
+  const cidFilter = req.query.channel_id ? parseInt(req.query.channel_id) : null;
+  const { rerunDays } = _readSchedSettings();
+  const sql = cidFilter
+    ? 'SELECT * FROM channels WHERE id = ? AND enabled = 1'
+    : 'SELECT * FROM channels WHERE enabled = 1';
+  const channels = (cidFilter ? db.prepare(sql).all(cidFilter) : db.prepare(sql).all());
+  const out = [];
+
+  for (const ch of channels) {
+    // Reuse the rebuild's source-of-truth path: the *current* matching pool is what's in
+    // channel_programming. That's already the post-filter set, so for "in-pool" we look at
+    // every episode the channel COULD play — i.e. the genre-filter result, not the live
+    // playlist (which might have items pruned away by rerun protection). We approximate by
+    // pulling all programs that match the channel's filters.
+    let filters; try { filters = JSON.parse(ch.source_value || '{}'); } catch(e) { continue; }
+    if (filters.content_type === 'movie') continue; // movie-only channels don't have shows
+    const { sql: progSql, params } = buildGenreQuery({
+      genre: filters.genre || null,
+      content_type: filters.content_type || null,
+      year_from: filters.year_from || null,
+      year_to: filters.year_to || null,
+      genre_mode: filters.genre_mode || 'any',
+      exclude_genres: filters.exclude_genres || [],
+      library_key: ch.library_key || null
+    });
+    const eps = db.prepare(progSql + ' AND type = \'episode\'').all(...params);
+    if (eps.length === 0) continue;
+
+    const recent = _recentlyAiredProgramIds(ch.id, rerunDays);
+    const byShow = new Map();
+    for (const e of eps) {
+      const key = e.show_title || '(no title)';
+      if (!byShow.has(key)) byShow.set(key, { show: key, total: 0, aired: 0 });
+      const row = byShow.get(key);
+      row.total++;
+      if (recent.has(e.id)) row.aired++;
+    }
+    const shows = [...byShow.values()].map(r => ({
+      ...r,
+      remaining: r.total - r.aired,
+      completed: r.total > 0 && (r.total - r.aired) <= 1, // within 1 episode of fully aired
+      percent: r.total > 0 ? Math.round((r.aired / r.total) * 100) : 0
+    })).sort((a, b) => b.percent - a.percent);
+
+    out.push({
+      channel_id: ch.id, channel_number: ch.number, channel_name: ch.name,
+      auto_renew_shows: !!ch.auto_renew_shows,
+      rerun_days: rerunDays,
+      shows,
+      completed_count: shows.filter(s => s.completed).length
+    });
+  }
+  res.json({ channels: out });
+});
+
+// Reset playlog for a specific show on a channel — pool refills with all the show's episodes
+// on the next rebuild.
+app.post('/api/livetv/channels/:id/renew-show', (req, res) => {
+  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
+  const { show_title } = req.body || {};
+  if (!show_title) return res.status(400).json({ error: 'show_title required' });
+  const ch = db.prepare('SELECT id FROM channels WHERE id = ?').get(req.params.id);
+  if (!ch) return res.status(404).json({ error: 'channel not found' });
+  // Find all episode IDs for that show, then drop their playlog entries on this channel.
+  const ids = db.prepare(`SELECT id FROM programs WHERE type='episode' AND show_title=? AND duration_ms>0`).all(show_title).map(e => e.id);
+  if (ids.length === 0) return res.json({ success: true, removed: 0 });
+  const placeholders = ids.map(() => '?').join(',');
+  const r = db.prepare(`DELETE FROM channel_playlog WHERE channel_id = ? AND program_id IN (${placeholders})`).run(req.params.id, ...ids);
+  const count = buildChannelPlaylist(parseInt(req.params.id));
+  res.json({ success: true, removed: r.changes, programCount: count });
+});
+
+// Toggle the channel's auto-renew flag.
+app.put('/api/livetv/channels/:id/auto-renew', (req, res) => {
+  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
+  const enabled = req.body?.enabled ? 1 : 0;
+  const ch = db.prepare('SELECT id FROM channels WHERE id = ?').get(req.params.id);
+  if (!ch) return res.status(404).json({ error: 'channel not found' });
+  db.prepare("UPDATE channels SET auto_renew_shows = ?, updated_at = datetime('now') WHERE id = ?").run(enabled, req.params.id);
+  res.json({ success: true, auto_renew_shows: !!enabled });
+});
+
+app.post('/api/livetv/new-items/mark-seen', (req, res) => {
+  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
+  db.prepare("INSERT OR REPLACE INTO livetv_settings (key, value) VALUES ('new_items_last_seen_at', datetime('now'))").run();
+  res.json({ success: true, since: db.prepare("SELECT value FROM livetv_settings WHERE key='new_items_last_seen_at'").get()?.value });
+});
+
+// Add a program (or all of a show's episodes) to a channel's included list, then rebuild.
+// Body: { channel_id, program_id?, show_title? } — show_title pulls every episode of that show.
+app.post('/api/livetv/new-items/add', (req, res) => {
+  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
+  const { channel_id, program_id, show_title } = req.body || {};
+  const ch = db.prepare('SELECT id, included_programs FROM channels WHERE id = ?').get(channel_id);
+  if (!ch) return res.status(404).json({ error: 'channel not found' });
+  let toAdd = [];
+  if (program_id) toAdd.push(parseInt(program_id));
+  if (show_title) {
+    const eps = db.prepare(`SELECT id FROM programs WHERE type='episode' AND show_title=? AND duration_ms>0`).all(show_title);
+    toAdd = toAdd.concat(eps.map(e => e.id));
+  }
+  if (toAdd.length === 0) return res.status(400).json({ error: 'no program_id or show_title with episodes' });
+  const current = JSON.parse(ch.included_programs || '[]');
+  const next = [...new Set([...current, ...toAdd])].slice(0, 500);
+  db.prepare("UPDATE channels SET included_programs = ?, updated_at = datetime('now') WHERE id = ?").run(JSON.stringify(next), channel_id);
+  const count = buildChannelPlaylist(channel_id);
+  res.json({ success: true, added: next.length - current.length, programCount: count });
+});
+
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });

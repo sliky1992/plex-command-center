@@ -359,6 +359,14 @@ function App() {
 
   // LiveTV state
   const [ltvView, setLtvView] = useState('nowplaying');
+  // "What's New" inbox — items added to Plex since the last seen marker. Refreshed when
+  // the tab is opened and after each successful add. mark-seen advances the marker.
+  const [ltvNewItems, setLtvNewItems] = useState({since:'', totalItems:0, items:[]});
+  const [ltvNewItemsLoading, setLtvNewItemsLoading] = useState(false);
+  const [ltvNewCountBadge, setLtvNewCountBadge] = useState(0);
+  // Show completion + renewal — per-channel list of TV shows that have fully cycled within
+  // the rerun window. Used by the What's New tab to suggest renewals.
+  const [ltvCompletion, setLtvCompletion] = useState({channels:[]});
   const [ltvChannels, setLtvChannels] = useState([]);
   const [ltvNowPlaying, setLtvNowPlaying] = useState([]);
   const [ltvGuide, setLtvGuide] = useState([]);
@@ -947,12 +955,63 @@ function App() {
     return () => clearInterval(t);
   }, [tab]);
 
+  const loadLtvNewItems = async () => {
+    setLtvNewItemsLoading(true);
+    try {
+      const r = await fetch('/api/livetv/new-items').then(x => x.json()).catch(() => null);
+      if (r) { setLtvNewItems(r); setLtvNewCountBadge(r.totalItems || 0); }
+    } catch (e) {}
+    setLtvNewItemsLoading(false);
+  };
+  // Refresh the badge in the background so the user sees the count without opening the tab.
+  // Mirrors the existing loadLiveTv 30s cadence but doesn't fetch the full payload.
+  React.useEffect(() => {
+    if (tab !== 'livetv') return;
+    loadLtvNewItems();
+    const t = setInterval(loadLtvNewItems, 60000);
+    return () => clearInterval(t);
+  }, [tab]);
+  const ltvAddNewItemToChannel = async (item, channelId) => {
+    const body = item.kind === 'show'
+      ? { channel_id: channelId, show_title: item.title }
+      : { channel_id: channelId, program_id: item.id };
+    const r = await doAction('/api/livetv/new-items/add', 'POST', body);
+    if (r.success) {
+      showToast(`Added ${item.title} to channel (${r.added} new, rebuilt ${r.programCount})`);
+      loadLiveTv(); loadLtvGuide();
+    } else showToast('Failed: ' + (r.error || 'unknown'), 'error');
+  };
+  const ltvMarkNewItemsSeen = async () => {
+    const r = await doAction('/api/livetv/new-items/mark-seen', 'POST');
+    if (r.success) { showToast('Inbox cleared'); loadLtvNewItems(); }
+  };
+  const loadLtvCompletion = async () => {
+    const r = await fetch('/api/livetv/show-completion').then(x => x.json()).catch(() => ({channels:[]}));
+    setLtvCompletion(r || {channels:[]});
+  };
+  const ltvRenewShow = async (channelId, showTitle) => {
+    const r = await doAction(`/api/livetv/channels/${channelId}/renew-show`, 'POST', { show_title: showTitle });
+    if (r.success) { showToast(`Renewed "${showTitle}" (rebuilt ${r.programCount} items)`); loadLtvCompletion(); loadLiveTv(); loadLtvGuide(); }
+    else showToast('Renew failed: ' + (r.error || 'unknown'), 'error');
+  };
+  const ltvToggleAutoRenew = async (channelId, enabled) => {
+    const r = await doAction(`/api/livetv/channels/${channelId}/auto-renew`, 'PUT', { enabled });
+    if (r.success) { showToast(`Auto-renew ${enabled?'on':'off'} for channel ${channelId}`); loadLtvCompletion(); }
+    else showToast('Toggle failed: ' + (r.error || 'unknown'), 'error');
+  };
+
   const ltvScan = async () => {
     setLtvScanning(true);
     showToast('Scanning Plex libraries...','info');
     const r = await doAction('/api/livetv/scan');
     setLtvScanning(false);
-    if (r.success) { showToast(`Scan complete: ${r.added} added, ${r.updated} updated (${r.total} total)`); loadLiveTv(); }
+    if (r.success) {
+      const note = r.pruned ? ` (${r.pruned} pruned)` : '';
+      showToast(`Scan complete: ${r.added} added, ${r.updated} updated${note}`);
+      loadLiveTv();
+      // Refresh the inbox so newly-added items appear without manually switching tabs.
+      loadLtvNewItems();
+    }
     else showToast('Scan failed: '+(r.error||'Unknown'),'error');
   };
   const ltvCreateChannel = async () => {
@@ -2394,6 +2453,7 @@ function App() {
                   <button className={`toggle-opt ${ltvView==='guide'?'active':''}`} onClick={()=>{setLtvView('guide');loadLtvGuide();}}>TV Guide</button>
                   <button className={`toggle-opt ${ltvView==='channels'?'active':''}`} onClick={()=>setLtvView('channels')}>Channels</button>
                   <button className={`toggle-opt ${ltvView==='fillers'?'active':''}`} onClick={()=>setLtvView('fillers')}>Fillers</button>
+                  <button className={`toggle-opt ${ltvView==='whatsnew'?'active':''}`} onClick={()=>{setLtvView('whatsnew');loadLtvNewItems();loadLtvCompletion();}}>What's New{ltvNewCountBadge>0?` (${ltvNewCountBadge})`:''}</button>
                   <button className={`toggle-opt ${ltvView==='setup'?'active':''}`} onClick={()=>setLtvView('setup')}>Setup</button>
                 </div>
                 <button className="btn btn-primary" onClick={ltvScan} disabled={ltvScanning}>{ltvScanning?'Scanning...':'Scan Libraries'}</button>
@@ -2895,6 +2955,121 @@ function App() {
                     ))}
                   </div>
                 )}
+              </div>
+            )}
+
+            {/* --- WHAT'S NEW (inbox of recently-added Plex items) --- */}
+            {ltvView==='whatsnew' && (
+              <div>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'1rem'}}>
+                  <div style={{fontSize:'.85rem',color:'#94a3b8'}}>
+                    {ltvNewItemsLoading ? 'Loading…' : `${ltvNewItems.totalItems} item${ltvNewItems.totalItems===1?'':'s'} added to Plex since ${ltvNewItems.since||'—'}`}
+                  </div>
+                  <div style={{display:'flex',gap:'.5rem'}}>
+                    <button className="btn btn-primary" onClick={ltvScan} disabled={ltvScanning}>{ltvScanning ? 'Scanning…' : 'Scan Plex now'}</button>
+                    <button className="btn btn-outline" onClick={loadLtvNewItems}>Refresh list</button>
+                    <button className="btn btn-outline" disabled={ltvNewItems.totalItems===0} onClick={ltvMarkNewItemsSeen}>Mark all seen</button>
+                  </div>
+                </div>
+                {ltvNewItems.totalItems === 0 ? (
+                  <div className="empty">Nothing new since you last checked. The daily Plex scan will pick up new items automatically.</div>
+                ) : (
+                  <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill, minmax(340px, 1fr))',gap:'.75rem'}}>
+                    {ltvNewItems.items.map((it, i) => (
+                      <div key={(it.kind||'x')+'-'+(it.id||it.title)+'-'+i} style={{display:'flex',gap:'.6rem',background:'rgba(15,23,42,.5)',borderRadius:'10px',border:'1px solid rgba(100,116,139,.18)',padding:'.6rem'}}>
+                        <div style={{width:'70px',height:'105px',flexShrink:0,background:'linear-gradient(135deg,#1e3a5f,#2d1f6e)',borderRadius:'6px',overflow:'hidden',display:'flex',alignItems:'center',justifyContent:'center'}}>
+                          {it.cover ? (
+                            <img src={it.cover} style={{width:'100%',height:'100%',objectFit:'cover'}} onError={e=>{e.target.style.display='none';}}/>
+                          ) : (
+                            <span style={{fontSize:'.65rem',color:'#64748b',padding:'.25rem',textAlign:'center'}}>No cover</span>
+                          )}
+                        </div>
+                        <div style={{flex:1,minWidth:0,display:'flex',flexDirection:'column'}}>
+                          <div style={{fontWeight:600,fontSize:'.85rem',lineHeight:1.2,marginBottom:'.15rem',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>
+                            {it.title}
+                            {it.kind==='show' && <span style={{fontSize:'.6rem',color:'#a78bfa',marginLeft:'.4rem'}}>· {it.episode_count} ep{it.episode_count===1?'':'s'}</span>}
+                          </div>
+                          <div style={{fontSize:'.7rem',color:'#94a3b8',marginBottom:'.3rem'}}>
+                            {it.year || ''}
+                            {it.duration_minutes && it.kind==='movie' ? ` · ${it.duration_minutes} min` : ''}
+                            {it.added_at_iso ? ` · added ${ago(it.added_at_iso)}` : ''}
+                          </div>
+                          {(it.genres||[]).length > 0 && (
+                            <div style={{display:'flex',flexWrap:'wrap',gap:'.2rem',marginBottom:'.3rem'}}>
+                              {it.genres.map(g => (
+                                <span key={g} style={{fontSize:'.6rem',padding:'.1rem .35rem',borderRadius:'4px',background:'rgba(59,130,246,.15)',color:'#93c5fd',border:'1px solid rgba(59,130,246,.25)'}}>{g}</span>
+                              ))}
+                            </div>
+                          )}
+                          {it.summary && (
+                            <div style={{fontSize:'.7rem',color:'#94a3b8',lineHeight:1.3,marginBottom:'.4rem',display:'-webkit-box',WebkitLineClamp:2,WebkitBoxOrient:'vertical',overflow:'hidden'}}>{it.summary}</div>
+                          )}
+                          <div style={{marginTop:'auto',display:'flex',flexDirection:'column',gap:'.25rem'}}>
+                            {(it.suggested_channels||[]).length === 0 ? (
+                              <div style={{fontSize:'.65rem',color:'#64748b',fontStyle:'italic'}}>No matching channel</div>
+                            ) : (
+                              <>
+                                <div style={{fontSize:'.65rem',color:'#94a3b8'}}>Suggested:</div>
+                                <div style={{display:'flex',flexWrap:'wrap',gap:'.25rem'}}>
+                                  {it.suggested_channels.map(ch => (
+                                    <button key={ch.id} className="btn-sm btn-approve" style={{fontSize:'.65rem',padding:'.15rem .45rem'}} onClick={()=>ltvAddNewItemToChannel(it, ch.id)}>
+                                      + {ch.number} {ch.name}
+                                    </button>
+                                  ))}
+                                </div>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Show completion / Renew suggestions */}
+                <div style={{marginTop:'2rem'}}>
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'.75rem'}}>
+                    <div style={{fontWeight:600,fontSize:'1rem'}}>Show completion & renewals</div>
+                    <button className="btn-sm btn-outline" onClick={loadLtvCompletion}>Refresh</button>
+                  </div>
+                  <div style={{fontSize:'.8rem',color:'#94a3b8',marginBottom:'.75rem'}}>
+                    Per-channel breakdown of TV shows that have rotated through their full episode list within the last {ltvCompletion.channels[0]?.rerun_days || 7} days. Hit Renew to reset the playlog for that show so its episodes come back into rotation. Toggle Auto-renew on a channel to do this automatically on every rebuild.
+                  </div>
+                  {(ltvCompletion.channels || []).filter(c => c.shows.length > 0).length === 0 ? (
+                    <div className="empty" style={{padding:'1rem',fontSize:'.85rem'}}>No TV channels with episode data to report. (Movie channels don't show here.)</div>
+                  ) : (
+                    <div style={{display:'grid',gap:'.75rem'}}>
+                      {ltvCompletion.channels.filter(c => c.shows.length > 0).map(c => (
+                        <div key={c.channel_id} style={{background:'rgba(15,23,42,.5)',borderRadius:'10px',border:'1px solid rgba(100,116,139,.18)',padding:'.75rem'}}>
+                          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'.5rem'}}>
+                            <div style={{fontWeight:600,fontSize:'.9rem'}}>
+                              <span style={{background:'linear-gradient(135deg,#3b82f6,#8b5cf6)',padding:'.1rem .35rem',borderRadius:'4px',fontSize:'.65rem',marginRight:'.4rem'}}>{c.channel_number}</span>
+                              {c.channel_name}
+                              {c.completed_count > 0 && <span style={{marginLeft:'.5rem',fontSize:'.7rem',color:'#fbbf24'}}>· {c.completed_count} completed</span>}
+                            </div>
+                            <label style={{display:'flex',alignItems:'center',gap:'.4rem',cursor:'pointer',fontSize:'.75rem',color:'#cbd5e1'}}>
+                              <input type="checkbox" checked={!!c.auto_renew_shows} onChange={e=>ltvToggleAutoRenew(c.channel_id, e.target.checked)}/>
+                              Auto-renew completed shows
+                            </label>
+                          </div>
+                          <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill, minmax(280px, 1fr))',gap:'.4rem',maxHeight:'260px',overflowY:'auto'}}>
+                            {c.shows.map(s => (
+                              <div key={s.show} style={{display:'flex',alignItems:'center',gap:'.5rem',padding:'.4rem .55rem',background: s.completed ? 'rgba(245,158,11,.1)' : 'rgba(15,23,42,.4)', border: '1px solid ' + (s.completed ? 'rgba(245,158,11,.3)' : 'rgba(100,116,139,.12)'), borderRadius:'6px'}}>
+                                <div style={{minWidth:0,flex:1}}>
+                                  <div style={{fontSize:'.8rem',fontWeight:500,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{s.show}</div>
+                                  <div style={{fontSize:'.65rem',color:'#94a3b8'}}>{s.aired}/{s.total} aired ({s.percent}%){s.completed ? ' · ready to renew' : ''}</div>
+                                </div>
+                                {s.completed && (
+                                  <button className="btn-sm btn-approve" style={{fontSize:'.65rem',padding:'.15rem .45rem'}} onClick={()=>ltvRenewShow(c.channel_id, s.show)}>Renew</button>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
             )}
 
