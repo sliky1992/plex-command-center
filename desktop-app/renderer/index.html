@@ -548,6 +548,8 @@
         <div class="player-controls">
           <button class="player-btn" onclick="prevChannel()" title="Previous Channel (↑)">⏮</button>
           <button class="player-btn" onclick="nextChannel()" title="Next Channel (↓)">⏭</button>
+          <button class="player-btn" id="fromStartBtn" onclick="watchFromStart()" title="Watch this show from the beginning (B)">⏪</button>
+          <button class="player-btn" id="goLiveBtn" onclick="goLive()" title="Jump back to live (L)" style="display:none;color:#ef4444">● LIVE</button>
           <button class="player-btn" id="muteBtn" onclick="toggleMute()" title="Mute (M)">🔊</button>
           <input type="range" class="volume-slider" id="volumeSlider" min="0" max="100" value="80" oninput="setVolume(this.value)">
           <div class="player-spacer"></div>
@@ -572,6 +574,7 @@
       guideData: [],
       sidebarTab: 'channels',
       guideFilter: 'current', // 'current' = only the channel you're watching, 'all' = every channel
+      fromStart: false, // true while watching the current show from offset 0
       numberBuffer: '',
       numberTimeout: null,
       osdTimeout: null,
@@ -996,14 +999,23 @@
     }
 
     // ---- Player ----
-    async function tuneChannel(ch) {
-      if (state.currentChannel && state.currentChannel.id === ch.id) return;
+    async function tuneChannel(ch, opts = {}) {
+      // Bypass the same-channel short-circuit when the caller is explicitly toggling between
+      // live and from-start on the same channel.
+      if (state.currentChannel && state.currentChannel.id === ch.id && !opts.fromStart && !opts.goLive) return;
 
       // Stop existing player
       stopPlayer();
 
       state.currentChannel = ch;
       state.lastChannel = ch.id;
+      state.fromStart = !!opts.fromStart;
+      // Toggle the "LIVE" badge button visibility — it only makes sense to "go back to live"
+      // when we're currently watching from the start of a show.
+      const liveBtn = document.getElementById('goLiveBtn');
+      const fsBtn = document.getElementById('fromStartBtn');
+      if (liveBtn) liveBtn.style.display = state.fromStart ? '' : 'none';
+      if (fsBtn) fsBtn.style.opacity = state.fromStart ? '0.4' : '1';
       electronAPI.getSettings().then(s => electronAPI.saveSettings({ ...s, serverUrl: state.serverUrl, volume: state.volume, lastChannel: ch.id, alwaysOnTop: state.alwaysOnTop }));
 
       document.getElementById('emptyPlayer').style.display = 'none';
@@ -1042,9 +1054,14 @@
         }, delay);
       };
 
-      // Use the watch API (same as web UI) for Plex direct play / Plex transcoding
+      // Use the watch API (same as web UI) for Plex direct play / Plex transcoding.
+      // From-start hits a separate endpoint that always transcodes from offset 0 so we get
+      // the current show's pilot frames instead of joining at the wall-clock midpoint.
       try {
-        const watchData = await authFetch(`${state.serverUrl}/api/livetv/watch/${ch.id}?client=desktop`).then(r => r.json());
+        const watchPath = opts.fromStart
+          ? `/api/livetv/watch/${ch.id}/from-start?client=desktop`
+          : `/api/livetv/watch/${ch.id}?client=desktop`;
+        const watchData = await authFetch(`${state.serverUrl}${watchPath}`).then(r => r.json());
         if (watchData.offAir) {
           // Channel is off air - show off-air state instead of playing
           video.style.display = 'none';
@@ -1324,6 +1341,21 @@
       tuneChannel(state.channels[prev]);
     }
 
+    // Re-tune the current channel using the from-start endpoint. The backend transcodes the
+    // current show from offset 0, so the user sees the pilot frames instead of joining mid-way.
+    function watchFromStart() {
+      if (!state.currentChannel) return;
+      showOSD('Watching from start');
+      tuneChannel(state.currentChannel, { fromStart: true });
+    }
+
+    // Jump back to the live wall-clock position for the current channel.
+    function goLive() {
+      if (!state.currentChannel) return;
+      showOSD('Back to live');
+      tuneChannel(state.currentChannel, { goLive: true });
+    }
+
     function toggleMute() {
       state.muted = !state.muted;
       video.volume = state.muted ? 0 : state.volume / 100;
@@ -1367,6 +1399,8 @@
         case 'f': case 'F': electronAPI.toggleFullscreen(); break;
         case 's': case 'S': toggleSidebar(); break;
         case 'g': case 'G': switchTab(state.sidebarTab === 'guide' ? 'channels' : 'guide'); break;
+        case 'b': case 'B': watchFromStart(); break;
+        case 'l': case 'L': if (state.fromStart) goLive(); break;
         case 'Escape':
           electronAPI.isFullscreen().then(fs => { if (fs) electronAPI.toggleFullscreen(); });
           break;
