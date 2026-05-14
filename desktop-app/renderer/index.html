@@ -500,6 +500,11 @@
       <!-- Channel list -->
       <div class="channel-list" id="channelList"></div>
 
+      <!-- Guide filter toggle (only visible in Guide tab) -->
+      <div id="guideFilterBar" style="display:none;padding:6px 8px;gap:4px;border-bottom:1px solid rgba(100,116,139,.15)">
+        <button id="gfThis" class="sidebar-tab" style="flex:1;font-size:11px;padding:4px 6px" onclick="setGuideFilter('current')">This channel</button>
+        <button id="gfAll" class="sidebar-tab" style="flex:1;font-size:11px;padding:4px 6px" onclick="setGuideFilter('all')">All channels</button>
+      </div>
       <!-- Guide list -->
       <div class="guide-list" id="guideList" style="display:none"></div>
 
@@ -566,6 +571,7 @@
       nowPlayingInterval: null,
       guideData: [],
       sidebarTab: 'channels',
+      guideFilter: 'current', // 'current' = only the channel you're watching, 'all' = every channel
       numberBuffer: '',
       numberTimeout: null,
       osdTimeout: null,
@@ -923,13 +929,30 @@
 
     function renderGuide() {
       const list = document.getElementById('guideList');
+      // Reflect filter button states each render so they stay in sync.
+      const btnThis = document.getElementById('gfThis');
+      const btnAll = document.getElementById('gfAll');
+      if (btnThis && btnAll) {
+        btnThis.className = `sidebar-tab ${state.guideFilter === 'current' ? 'active' : ''}`;
+        btnAll.className = `sidebar-tab ${state.guideFilter === 'all' ? 'active' : ''}`;
+      }
       if (!state.guideData || state.guideData.length === 0) {
         list.innerHTML = '<div class="empty-state" style="padding:2rem"><p style="font-size:12px">No guide data available</p></div>';
         return;
       }
 
       const now = Date.now();
-      list.innerHTML = state.guideData.map(entry => {
+      // Filter to just the channel we're watching when "This channel" is active. If no channel
+      // is currently tuned, fall back to all channels so the guide isn't empty.
+      let entries = state.guideData;
+      if (state.guideFilter === 'current' && state.currentChannel) {
+        entries = state.guideData.filter(e => {
+          const c = e.channel || e;
+          return c.id === state.currentChannel.id;
+        });
+        if (entries.length === 0) entries = state.guideData; // failsafe
+      }
+      list.innerHTML = entries.map(entry => {
         const chData = entry.channel || entry;
         const programs = (entry.programs || []).slice(0, 8);
         return `
@@ -962,7 +985,14 @@
       document.getElementById('tabGuide').className = `sidebar-tab ${tab === 'guide' ? 'active' : ''}`;
       document.getElementById('channelList').style.display = tab === 'channels' ? '' : 'none';
       document.getElementById('guideList').style.display = tab === 'guide' ? '' : 'none';
+      const fb = document.getElementById('guideFilterBar');
+      if (fb) fb.style.display = tab === 'guide' ? 'flex' : 'none';
       if (tab === 'guide') renderGuide();
+    }
+
+    function setGuideFilter(mode) {
+      state.guideFilter = mode === 'all' ? 'all' : 'current';
+      if (state.sidebarTab === 'guide') renderGuide();
     }
 
     // ---- Player ----
@@ -982,6 +1012,8 @@
 
       showOSD(`Ch ${ch.number} - ${ch.name}`);
       renderChannels();
+      // If the guide is open and filtered to "this channel", re-render so it follows.
+      if (state.sidebarTab === 'guide' && state.guideFilter === 'current') renderGuide();
       updateChannelLogo();
 
       // Show buffering overlay
