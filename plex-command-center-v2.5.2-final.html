@@ -293,8 +293,51 @@ function App() {
   const [subSettings, setSubSettings] = useState({language:'', mode:'burn'});
   const [subSaving, setSubSaving] = useState(false);
 
+  // Missing-subtitles scanner
+  const [subScanLang, setSubScanLang] = useState('eng');
+  const [subScanLoading, setSubScanLoading] = useState(false);
+  const [subScanResult, setSubScanResult] = useState(null);
+  const [subScanError, setSubScanError] = useState('');
+  const [subScanFilter, setSubScanFilter] = useState('');
+  const [subScanExpanded, setSubScanExpanded] = useState({}); // sectionId -> bool
+  const runSubScan = async () => {
+    setSubScanLoading(true); setSubScanError(''); setSubScanResult(null);
+    try {
+      const r = await fetch(`/api/subtitles/scan?lang=${encodeURIComponent(subScanLang.trim().toLowerCase()||'eng')}`);
+      const d = await r.json();
+      if (!r.ok) { setSubScanError(d.error || `HTTP ${r.status}`); return; }
+      setSubScanResult(d);
+      // Auto-expand sections that actually have results
+      const exp = {};
+      for (const s of d.sections) exp[s.id] = s.missingCount > 0;
+      setSubScanExpanded(exp);
+    } catch(e) { setSubScanError(e.message); }
+    finally { setSubScanLoading(false); }
+  };
+  const subScanExport = () => {
+    if (!subScanResult) return;
+    const lines = [`# Missing subtitles (${subScanResult.language}) — ${subScanResult.scannedAt}`, ''];
+    for (const sec of subScanResult.sections) {
+      lines.push(`## ${sec.title} (${sec.type}) — ${sec.missingCount} missing`);
+      for (const m of sec.missing) {
+        const label = m.type === 'movie' ? `${m.title}${m.year?` (${m.year})`:''}` : `${m.show} S${String(m.season).padStart(2,'0')}E${String(m.episode).padStart(2,'0')} — ${m.title}`;
+        lines.push(`${label}\t${m.file}`);
+      }
+      lines.push('');
+    }
+    const blob = new Blob([lines.join('\n')], {type:'text/plain'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `missing-subs-${subScanResult.language}-${Date.now()}.txt`;
+    a.click();
+  };
+
   // YouTube filler download state
   const [ytModal, setYtModal] = useState(false);
+  // Preview a downloaded filler in an inline mp4 player; set to the filler id to open.
+  const [fillerPreviewId, setFillerPreviewId] = useState(null);
+  // Custom YouTube auto-fetch UI inside the YT modal.
+  const [ytCustom, setYtCustom] = useState({ channel: '', query: '', count: 10, running: false });
   const [ytScanResults, setYtScanResults] = useState([]);
   const [ytScanLoading, setYtScanLoading] = useState(false);
   const [ytScanChannel, setYtScanChannel] = useState('');
@@ -1604,6 +1647,7 @@ function App() {
             {currentUser?.role==='admin' && <button className={`nav-btn ${tab==='security'?'active':''}`} onClick={()=>{setTab('security');loadSecLive();loadSecBlocked();loadRegSettings();loadRegAlerts();loadRegWhitelist();}}>Security</button>}
             {currentUser?.role==='admin' && <button className={`nav-btn ${tab==='admin'?'active':''}`} onClick={()=>{setTab('admin');loadAdminUsers();loadSubSettings();}}>Admin</button>}
             <button className={`nav-btn ${tab==='livetv'?'active':''}`} onClick={()=>setTab('livetv')}>Live TV</button>
+            <button className={`nav-btn ${tab==='subs'?'active':''}`} onClick={()=>setTab('subs')}>Missing Subs</button>
             <div style={{display:'flex',alignItems:'center',gap:'.5rem',marginLeft:'.5rem',paddingLeft:'.75rem',borderLeft:'1px solid rgba(100,116,139,.2)'}}>
               {currentUser?.plex_thumb ? <img src={currentUser.plex_thumb} style={{width:28,height:28,borderRadius:'50%'}}/> : <div className="avatar" style={{width:28,height:28,fontSize:'.7rem'}}>{currentUser?.username?.[0]?.toUpperCase()}</div>}
               <span style={{fontSize:'.8rem',color:'#cbd5e1'}}>{currentUser?.username}</span>
@@ -1612,7 +1656,7 @@ function App() {
           </nav>
           <button className="hamburger" onClick={()=>setMenuOpen(!menuOpen)}>&#9776;</button>
           <div className={`mobile-menu ${menuOpen?'open':''}`}>
-            {[['dashboard','Dashboard'],['streams','Active Streams'],['users','Top Users'],['history','Watch History'],['system','System'],['tools','Tools'],['livetv','Live TV']].map(([k,l])=>(
+            {[['dashboard','Dashboard'],['streams','Active Streams'],['users','Top Users'],['history','Watch History'],['system','System'],['tools','Tools'],['livetv','Live TV'],['subs','Missing Subs']].map(([k,l])=>(
               <button key={k} className={`nav-btn ${tab===k?'active':''}`} onClick={()=>{setTab(k);setMenuOpen(false);if(k==='history')loadHistory();}}>{l}</button>
             ))}
             {currentUser?.role==='admin' && <button className={`nav-btn ${tab==='security'?'active':''}`} onClick={()=>{setTab('security');setMenuOpen(false);loadSecLive();loadSecBlocked();loadRegSettings();loadRegAlerts();loadRegWhitelist();}}>Security</button>}
@@ -2070,6 +2114,88 @@ function App() {
                 </div>
               ))}
             </div>
+          </div>
+        )}
+
+        {/* ============ MISSING SUBTITLES ============ */}
+        {tab==='subs' && (
+          <div>
+            <div className="page-title">Missing Subtitles</div>
+            <div style={{fontSize:'.85rem',color:'#94a3b8',marginBottom:'1rem'}}>
+              Scans your Plex library and lists movies/episodes that don't have a subtitle stream in the chosen language.
+              Use this to find files that need an SRT dropped next to them.
+            </div>
+            <div style={{display:'flex',gap:'.75rem',alignItems:'center',flexWrap:'wrap',marginBottom:'1rem'}}>
+              <label style={{fontSize:'.85rem',color:'#cbd5e1'}}>Language (ISO 2/3-letter):</label>
+              <input type="text" value={subScanLang} onChange={e=>setSubScanLang(e.target.value)} style={{width:80,padding:'.4rem .6rem',background:'#1e293b',border:'1px solid #334155',borderRadius:4,color:'#f1f5f9'}} placeholder="eng" />
+              <button className="btn btn-primary" disabled={subScanLoading} onClick={runSubScan}>{subScanLoading?'Scanning…':'Scan Library'}</button>
+              {subScanResult && <button className="btn btn-outline btn-sm" onClick={subScanExport}>Export as text</button>}
+            </div>
+            {subScanError && <div className="empty" style={{color:'#f87171'}}>Error: {subScanError}</div>}
+            {subScanResult && (
+              <div>
+                <div style={{fontSize:'.9rem',marginBottom:'1rem'}}>
+                  Found <strong>{subScanResult.totalMissing.toLocaleString()}</strong> items missing <code>{subScanResult.language}</code> subs across {subScanResult.sections.length} libraries.
+                </div>
+                <input type="text" placeholder="Filter by title, show, or path…" value={subScanFilter} onChange={e=>setSubScanFilter(e.target.value)} style={{width:'100%',maxWidth:500,padding:'.5rem .75rem',background:'#1e293b',border:'1px solid #334155',borderRadius:4,color:'#f1f5f9',marginBottom:'1rem'}} />
+                {subScanResult.sections.map(sec => {
+                  const q = subScanFilter.trim().toLowerCase();
+                  const filtered = q ? sec.missing.filter(m => {
+                    const hay = ((m.show||'') + ' ' + (m.title||'') + ' ' + (m.file||'')).toLowerCase();
+                    return hay.includes(q);
+                  }) : sec.missing;
+                  const open = !!subScanExpanded[sec.id];
+                  return (
+                    <div key={sec.id} className="card" style={{marginBottom:'.75rem',padding:0}}>
+                      <div style={{padding:'.75rem 1rem',cursor:'pointer',display:'flex',justifyContent:'space-between',alignItems:'center'}} onClick={()=>setSubScanExpanded(x=>({...x,[sec.id]:!x[sec.id]}))}>
+                        <div style={{fontWeight:600}}>
+                          {open?'▼':'▶'} {sec.title} <span style={{color:'#94a3b8',fontWeight:400,fontSize:'.85rem'}}>({sec.type})</span>
+                        </div>
+                        <div style={{fontSize:'.85rem',color:'#94a3b8'}}>
+                          {q ? `${filtered.length.toLocaleString()} / ` : ''}{sec.missingCount.toLocaleString()} missing
+                        </div>
+                      </div>
+                      {open && (
+                        <div style={{borderTop:'1px solid #334155',maxHeight:'60vh',overflow:'auto'}}>
+                          {filtered.length===0 ? (
+                            <div style={{padding:'1rem',color:'#94a3b8',fontSize:'.85rem'}}>{q?'No matches for filter.':'Nothing missing here.'}</div>
+                          ) : (
+                            <table style={{width:'100%',fontSize:'.8rem',borderCollapse:'collapse'}}>
+                              <thead>
+                                <tr style={{textAlign:'left',color:'#94a3b8',position:'sticky',top:0,background:'#0f172a'}}>
+                                  <th style={{padding:'.5rem .75rem'}}>Title</th>
+                                  <th style={{padding:'.5rem .75rem'}}>File</th>
+                                  <th style={{padding:'.5rem .75rem'}}>Codec</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {filtered.slice(0,500).map((m,i)=>(
+                                  <tr key={m.ratingKey} style={{borderTop:'1px solid #1e293b'}}>
+                                    <td style={{padding:'.4rem .75rem'}}>
+                                      {m.type==='movie' ? (
+                                        <span>{m.title}{m.year?` (${m.year})`:''}</span>
+                                      ) : (
+                                        <span><strong>{m.show}</strong> S{String(m.season).padStart(2,'0')}E{String(m.episode).padStart(2,'0')} — {m.title}</span>
+                                      )}
+                                    </td>
+                                    <td style={{padding:'.4rem .75rem',fontFamily:'monospace',color:'#cbd5e1',wordBreak:'break-all'}}>
+                                      <button className="btn-sm btn-outline" style={{marginRight:'.4rem',padding:'.1rem .4rem',fontSize:'.7rem'}} onClick={()=>{navigator.clipboard.writeText(m.file);showToast('Copied');}}>Copy</button>
+                                      {m.file}
+                                    </td>
+                                    <td style={{padding:'.4rem .75rem',color:'#94a3b8',whiteSpace:'nowrap'}}>{m.videoCodec} {m.videoResolution?`${m.videoResolution}p`:''} {m.container}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          )}
+                          {filtered.length>500 && <div style={{padding:'.5rem 1rem',fontSize:'.75rem',color:'#94a3b8'}}>Showing first 500 of {filtered.length.toLocaleString()}. Use the export button or filter to narrow down.</div>}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         )}
 
@@ -2949,6 +3075,9 @@ function App() {
                               {ac.name} ✕
                             </button>
                           ))}
+                          {f.local_path && (
+                            <button className="btn-sm btn-outline" onClick={()=>setFillerPreviewId(f.id)} title="Preview this filler in a player">▶ Preview</button>
+                          )}
                           <button className="btn-sm btn-delete" onClick={()=>ltvDeleteFiller(f.id)}>Delete</button>
                         </div>
                       </div>
@@ -4909,6 +5038,48 @@ function App() {
               </div>
             )}
 
+            {/* Custom YouTube search — fetches arbitrary content (e.g. vintage commercials,
+                station idents) and turns each result into a filler. Optional channel link. */}
+            <div style={{marginTop:'1.5rem',paddingTop:'1rem',borderTop:'1px solid rgba(100,116,139,.2)'}}>
+              <div style={{fontSize:'.85rem',fontWeight:600,marginBottom:'.5rem'}}>Custom YouTube search</div>
+              <div style={{fontSize:'.7rem',color:'#64748b',marginBottom:'.6rem'}}>
+                Search for anything (e.g. <em>"vintage tv commercials 1980s"</em>, <em>"retro station bumpers"</em>, <em>"old movie trailers"</em>) and download the top results as fillers. Clips longer than 5 minutes are skipped automatically.
+              </div>
+              <div style={{display:'grid',gridTemplateColumns:'1fr 90px 200px',gap:'.5rem',marginBottom:'.5rem'}}>
+                <input className="form-input" placeholder='Search query' value={ytCustom.query} onChange={e=>setYtCustom({...ytCustom, query:e.target.value})}/>
+                <input className="form-input" type="number" min="1" max="50" placeholder="Count" value={ytCustom.count} onChange={e=>setYtCustom({...ytCustom, count:parseInt(e.target.value)||10})}/>
+                <select className="form-select" value={ytCustom.channel} onChange={e=>setYtCustom({...ytCustom, channel:e.target.value})}>
+                  <option value="">No channel (unassigned)</option>
+                  {ltvChannels.map(ch=><option key={ch.id} value={ch.id}>CH {ch.number} {ch.name}</option>)}
+                </select>
+              </div>
+              <button className="btn btn-primary" disabled={ytCustom.running || !ytCustom.query.trim()} onClick={async()=>{
+                setYtCustom(p=>({...p, running:true}));
+                // Use any existing channel (or just a dummy) — endpoint requires channel_id but our
+                // server-side query override + optional channel link means we can ask for the
+                // channel even when the result shouldn't auto-link. To keep things honest, if no
+                // channel is picked we pass the first enabled channel just so endpoint validates,
+                // but the resulting fillers will be linked to that channel; consider this when
+                // searching for cross-channel content.
+                const channelId = ytCustom.channel ? parseInt(ytCustom.channel) : (ltvChannels[0]?.id);
+                if (!channelId) { showToast('No channel available — create one first','error'); setYtCustom(p=>({...p, running:false})); return; }
+                const r = await fetch('/api/livetv/fillers/auto-fetch', {
+                  method:'POST', headers:{'Content-Type':'application/json'},
+                  body: JSON.stringify({ channel_id: channelId, count: ytCustom.count, quality: ytQuality, query: ytCustom.query.trim() })
+                }).then(x=>x.json()).catch(e=>({error:e.message}));
+                setYtCustom(p=>({...p, running:false}));
+                if (r.success) {
+                  showToast(`Queued ${r.enqueued?.length || 0} download(s) for "${r.query}"`);
+                  ytLoadDownloads();
+                  loadLiveTv();
+                } else {
+                  showToast('Search failed: ' + (r.error || 'unknown'), 'error');
+                }
+              }}>
+                {ytCustom.running ? 'Searching…' : 'Search & download'}
+              </button>
+            </div>
+
             {/* Manual URL fallback */}
             <div style={{marginTop:'1.5rem',paddingTop:'1rem',borderTop:'1px solid rgba(100,116,139,.2)'}}>
               <div style={{fontSize:'.8rem',color:'#64748b',marginBottom:'.5rem'}}>Or paste a YouTube URL manually:</div>
@@ -4920,6 +5091,26 @@ function App() {
           </div>
         </div>
       )}
+
+      {/* Filler preview modal — inline mp4 player against /api/livetv/fillers/:id/preview */}
+      {fillerPreviewId && (() => {
+        const f = ltvFillers.find(x => x.id === fillerPreviewId);
+        return (
+          <div className="overlay" onClick={()=>setFillerPreviewId(null)}>
+            <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:'720px'}}>
+              <div className="modal-head">
+                <div className="modal-title" style={{fontSize:'.95rem'}}>Preview: {f?.name || 'Filler'}</div>
+                <button className="modal-close" onClick={()=>setFillerPreviewId(null)}>x</button>
+              </div>
+              <video src={`/api/livetv/fillers/${fillerPreviewId}/preview`} controls autoPlay style={{width:'100%',borderRadius:'6px',background:'#000'}}/>
+              <div style={{fontSize:'.7rem',color:'#64748b',marginTop:'.5rem'}}>
+                {f?.duration_ms ? `${Math.round(f.duration_ms/1000)}s` : ''}
+                {f?.local_path ? ` · ${f.local_path}` : ''}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {widgetSettings && (
         <div className="overlay" onClick={()=>setWidgetSettings(false)}>

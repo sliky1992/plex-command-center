@@ -271,6 +271,34 @@ function App() {
   const [ytDiskSpace, setYtDiskSpace] = useState(null);
   const [ytSelectedChannels, setYtSelectedChannels] = useState([]);
 
+  // Filler list filters + local upload state
+  const [fillerVerifiedOnly, setFillerVerifiedOnly] = useState(false);
+  const [fillerSearch, setFillerSearch] = useState('');
+  const [fillerUploads, setFillerUploads] = useState([]); // [{ name, status, progress, error }]
+  const [fillerDragging, setFillerDragging] = useState(false);
+
+  // Settings tab state (admin-only — integrated tool tokens/URLs)
+  const [settingsServices, setSettingsServices] = useState([]);
+  const [settingsEdit, setSettingsEdit] = useState(null); // {service, label, fields:[{...,value}]}
+  const [settingsTestResults, setSettingsTestResults] = useState({}); // service -> {ok, detail, error}
+  const [settingsRevealSecret, setSettingsRevealSecret] = useState({}); // field-name -> bool
+  const [settingsSaving, setSettingsSaving] = useState(false);
+
+  // Continue Watching restore modal (admin-only — opens from Tools tab)
+  const [cwModal, setCwModal] = useState(false);
+  const [cwState, setCwState] = useState(null); // {settings, snapshots, plexError, liveCount, snapshotCount, missingCount}
+  const [cwLoading, setCwLoading] = useState(false);
+  const [cwBusyKey, setCwBusyKey] = useState(null); // rating_key currently being restored
+  const [cwShowLive, setCwShowLive] = useState(false);
+
+  // Missing subtitles modal (admin-only — Bazarr cross-reference, opens from Tools tab)
+  const [subsModal, setSubsModal] = useState(false);
+  const [subsState, setSubsState] = useState(null);
+  const [subsLoading, setSubsLoading] = useState(false);
+  const [subsTab, setSubsTab] = useState('episodes');
+  const [subsSearch, setSubsSearch] = useState('');
+  const [subsBusyId, setSubsBusyId] = useState(null);
+
   const showToast = (msg, type='success') => {
     setToast({msg, type});
     setTimeout(() => setToast(null), 3000);
@@ -579,6 +607,163 @@ function App() {
     await fetch(`/api/livetv/fillers/yt-downloads/${id}`, {method:'DELETE'});
     ytLoadDownloads(); loadLiveTv();
   };
+
+  // --- Local filler upload (drag-drop or file picker, one request per file with streamed binary)
+  const ALLOWED_FILLER_EXT = ['.mp4','.mkv','.mov','.webm','.m4v','.avi','.ts','.mpg','.mpeg'];
+  const uploadFillerFile = (file) => new Promise((resolve) => {
+    const ext = '.' + (file.name.split('.').pop() || '').toLowerCase();
+    if (!ALLOWED_FILLER_EXT.includes(ext)) {
+      resolve({ ok: false, name: file.name, error: 'Unsupported file type ' + ext });
+      return;
+    }
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/livetv/fillers/upload', true);
+    xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.upload.onprogress = (e) => {
+      if (!e.lengthComputable) return;
+      const pct = Math.round((e.loaded / e.total) * 100);
+      setFillerUploads(prev => prev.map(u => u.name === file.name ? { ...u, progress: pct } : u));
+    };
+    xhr.onload = () => {
+      let data = {};
+      try { data = JSON.parse(xhr.responseText); } catch(e) {}
+      if (xhr.status >= 200 && xhr.status < 300 && data.success) {
+        resolve({ ok: true, name: file.name, id: data.id });
+      } else {
+        resolve({ ok: false, name: file.name, error: data.error || `HTTP ${xhr.status}` });
+      }
+    };
+    xhr.onerror = () => resolve({ ok: false, name: file.name, error: 'Network error' });
+    xhr.send(file);
+  });
+  const handleFillerFiles = async (files) => {
+    const list = Array.from(files);
+    if (list.length === 0) return;
+    setFillerUploads(prev => [...prev, ...list.map(f => ({ name: f.name, status: 'uploading', progress: 0 }))]);
+    // Sequential uploads — keep disk + ffprobe pressure low and progress legible.
+    let ok = 0, fail = 0;
+    for (const f of list) {
+      const res = await uploadFillerFile(f);
+      setFillerUploads(prev => prev.map(u => u.name === f.name
+        ? { ...u, status: res.ok ? 'done' : 'error', progress: res.ok ? 100 : u.progress, error: res.error }
+        : u));
+      if (res.ok) ok++; else fail++;
+    }
+    if (ok) showToast(`Uploaded ${ok} filler${ok!==1?'s':''}` + (fail ? `, ${fail} failed` : ''));
+    else if (fail) showToast(`Upload failed (${fail})`, 'error');
+    loadLiveTv();
+  };
+
+  // --- Settings tab (admin) ---
+  const loadSettings = async () => {
+    const r = await fetch('/api/settings/services').then(x=>x.json()).catch(()=>[]);
+    setSettingsServices(r);
+  };
+  useEffect(() => {
+    if (tab === 'settings') loadSettings();
+  }, [tab]);
+  const openSettingsEdit = (svc) => {
+    // Clone fields with editable working copies. Secrets start blank; user types to replace.
+    const working = svc.fields.map(f => ({ ...f, value: f.type === 'secret' ? '' : (f.value || '') }));
+    setSettingsEdit({ service: svc.service, label: svc.label, fields: working });
+    setSettingsRevealSecret({});
+  };
+  const saveSettings = async () => {
+    if (!settingsEdit) return;
+    setSettingsSaving(true);
+    const body = {};
+    for (const f of settingsEdit.fields) {
+      // Empty string clears the DB override; mask sentinel means "leave alone".
+      if (f.type === 'secret' && /^[•*]+$/.test(f.value)) continue;
+      body[f.name] = f.value;
+    }
+    const r = await fetch(`/api/settings/services/${settingsEdit.service}`, {
+      method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+    }).then(x=>x.json()).catch(e=>({error:e.message}));
+    setSettingsSaving(false);
+    if (r.success) {
+      showToast('Settings saved');
+      setSettingsEdit(null);
+      loadSettings();
+    } else {
+      showToast('Save failed: ' + (r.error||'Unknown'), 'error');
+    }
+  };
+  const testService = async (service) => {
+    setSettingsTestResults(prev => ({ ...prev, [service]: { testing: true } }));
+    const r = await fetch(`/api/settings/services/${service}/test`, { method: 'POST' }).then(x=>x.json()).catch(e=>({ok:false,error:e.message}));
+    setSettingsTestResults(prev => ({ ...prev, [service]: r }));
+  };
+
+  // --- Continue Watching modal ---
+  const loadCwState = async () => {
+    setCwLoading(true);
+    const r = await fetch('/api/cw/state').then(x=>x.json()).catch(e=>({error:e.message}));
+    setCwState(r); setCwLoading(false);
+  };
+  const cwSnapshotNow = async () => {
+    setCwLoading(true);
+    const r = await fetch('/api/cw/snapshot', { method: 'POST' }).then(x=>x.json()).catch(e=>({error:e.message}));
+    if (r.success) showToast(`Snapshotted ${r.saved} item${r.saved!==1?'s':''}`);
+    else showToast('Snapshot failed: ' + (r.error||'Unknown'), 'error');
+    await loadCwState();
+  };
+  const cwUpdateSettings = async (patch) => {
+    const r = await fetch('/api/cw/settings', {
+      method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(patch)
+    }).then(x=>x.json()).catch(e=>({error:e.message}));
+    if (r.success) { showToast('CW settings updated'); loadCwState(); }
+    else showToast('Update failed: ' + (r.error||'Unknown'), 'error');
+  };
+  const cwRestoreOne = async (rk) => {
+    setCwBusyKey(rk);
+    const r = await fetch(`/api/cw/restore/${rk}`, { method: 'POST' }).then(x=>x.json()).catch(e=>({error:e.message}));
+    setCwBusyKey(null);
+    if (r.success) { showToast('Restored — may take a minute to reappear in Plex'); loadCwState(); }
+    else showToast('Restore failed: ' + (r.error||'Unknown'), 'error');
+  };
+  const cwRestoreAll = async () => {
+    if (!cwState?.snapshots) return;
+    const missing = cwState.snapshots.filter(s => s.isLive === false).map(s => s.rating_key);
+    if (missing.length === 0) return showToast('Nothing to restore', 'info');
+    if (!confirm(`Restore ${missing.length} missing item${missing.length!==1?'s':''}?`)) return;
+    setCwLoading(true);
+    const r = await fetch('/api/cw/restore-bulk', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ rating_keys: missing })
+    }).then(x=>x.json()).catch(e=>({error:e.message}));
+    if (r.success) showToast(`Restored ${r.restored}${r.failed?`, ${r.failed} failed`:''}`);
+    else showToast('Bulk restore failed: ' + (r.error||'Unknown'), 'error');
+    await loadCwState();
+  };
+  const cwForget = async (rk) => {
+    if (!confirm('Forget this snapshot? (cannot be restored after this)')) return;
+    await fetch(`/api/cw/snapshot/${rk}`, { method: 'DELETE' });
+    loadCwState();
+  };
+
+  // --- Missing subtitles (Bazarr) ---
+  const loadSubsState = async () => {
+    setSubsLoading(true);
+    const r = await fetch('/api/bazarr/missing').then(x=>x.json()).catch(e=>({error:e.message}));
+    setSubsState(r); setSubsLoading(false);
+  };
+  const subsSearchOne = async (kind, id) => {
+    setSubsBusyId(`${kind}:${id}`);
+    const r = await fetch(`/api/bazarr/search/${kind}/${id}`, { method: 'POST' }).then(x=>x.json()).catch(e=>({error:e.message}));
+    setSubsBusyId(null);
+    if (r.success) showToast('Search triggered — Bazarr will report results in its own UI');
+    else showToast('Failed: ' + (r.error||'Unknown'), 'error');
+  };
+  const subsSearchAll = async () => {
+    if (!confirm('Trigger Bazarr\'s "search wanted" task for ALL missing subtitles? This can take a while.')) return;
+    setSubsLoading(true);
+    const r = await fetch('/api/bazarr/search-all', { method: 'POST' }).then(x=>x.json()).catch(e=>({error:e.message}));
+    setSubsLoading(false);
+    if (r.success) showToast('Bulk search queued in Bazarr');
+    else showToast('Failed: ' + (r.error||'Unknown'), 'error');
+  };
   // Auto-poll downloads when active
   useEffect(() => {
     if (tab !== 'livetv' || ltvView !== 'fillers') return;
@@ -745,6 +930,7 @@ function App() {
             <button className={`nav-btn ${tab==='tools'?'active':''}`} onClick={()=>setTab('tools')}>Tools</button>
             {currentUser?.role==='admin' && <button className={`nav-btn ${tab==='security'?'active':''}`} onClick={()=>{setTab('security');loadSecLive();loadSecBlocked();}}>Security</button>}
             {currentUser?.role==='admin' && <button className={`nav-btn ${tab==='admin'?'active':''}`} onClick={()=>{setTab('admin');loadAdminUsers();}}>Admin</button>}
+            {currentUser?.role==='admin' && <button className={`nav-btn ${tab==='settings'?'active':''}`} onClick={()=>{setTab('settings');loadSettings();}}>Settings</button>}
             <button className={`nav-btn ${tab==='livetv'?'active':''}`} onClick={()=>setTab('livetv')}>Live TV</button>
             <div style={{display:'flex',alignItems:'center',gap:'.5rem',marginLeft:'.5rem',paddingLeft:'.75rem',borderLeft:'1px solid rgba(100,116,139,.2)'}}>
               {currentUser?.plex_thumb ? <img src={currentUser.plex_thumb} style={{width:28,height:28,borderRadius:'50%'}}/> : <div className="avatar" style={{width:28,height:28,fontSize:'.7rem'}}>{currentUser?.username?.[0]?.toUpperCase()}</div>}
@@ -1164,11 +1350,12 @@ function App() {
                   const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`plex-snapshot-${Date.now()}.json`;a.click();
                   showToast('Snapshot downloaded!');
                 }},
-                {icon:'🧹',title:'Watch History Cleaner',desc:'Coming soon: Fix Continue Watching issues',action:()=>showToast('Feature coming soon','warn')},
+                {icon:'🧹',title:'Continue Watching Restore',desc:'Find items Plex aged out of Continue Watching and put them back',action:()=>{setCwModal(true);loadCwState();},adminOnly:true},
+                {icon:'💬',title:'Missing Subtitles',desc:'List shows/movies missing subs via Bazarr and queue searches',action:()=>{setSubsModal(true);loadSubsState();},adminOnly:true},
                 {icon:'📅',title:'Date Added Editor',desc:'Coming soon: Change date added for items',action:()=>showToast('Feature coming soon','warn')},
                 {icon:'👥',title:'Copy Watch History',desc:'Coming soon: Copy watched status between users',action:()=>showToast('Feature coming soon','warn')},
                 {icon:'📈',title:'Analytics Export',desc:'Coming soon: Export statistics to CSV/JSON',action:()=>showToast('Feature coming soon','warn')}
-              ].map((t,i)=>(
+              ].filter(t => !t.adminOnly || currentUser?.role === 'admin').map((t,i)=>(
                 <div key={i} className="tool-card" onClick={t.action}>
                   <div className="tool-icon">{t.icon}</div>
                   <div className="tool-title">{t.title}</div>
@@ -1178,6 +1365,239 @@ function App() {
             </div>
           </div>
         )}
+
+        {/* Continue Watching Restore Modal (admin) */}
+        {cwModal && currentUser?.role === 'admin' && (() => {
+          const s = cwState?.settings || {};
+          const snaps = cwState?.snapshots || [];
+          const missing = snaps.filter(x => x.isLive === false);
+          const live = snaps.filter(x => x.isLive === true);
+          const unknown = snaps.filter(x => x.isLive === null || x.isLive === undefined);
+          const listFor = cwShowLive ? live : missing;
+          const renderRow = (item) => {
+            const subtitle = item.show_title
+              ? `${item.show_title} · S${String(item.season_num||0).padStart(2,'0')}E${String(item.episode_num||0).padStart(2,'0')}`
+              : (item.year ? `${item.item_type || 'movie'} · ${item.year}` : (item.item_type || ''));
+            const offsetMin = Math.floor((item.view_offset||0) / 60000);
+            const durMin = Math.floor((item.duration||0) / 60000);
+            const seenAgo = item.last_in_hub_at ? ago(item.last_in_hub_at) : '';
+            return (
+              <div key={item.rating_key} className="stream-card" style={{display:'flex',alignItems:'center',gap:'.75rem'}}>
+                {item.thumb ? (
+                  <img src={item.thumb} alt="" style={{width:'44px',height:'66px',objectFit:'cover',borderRadius:'4px',flexShrink:0,background:'#0f172a'}} onError={e=>{e.target.style.display='none';}}/>
+                ) : (
+                  <div style={{width:'44px',height:'66px',borderRadius:'4px',background:'linear-gradient(135deg,#1e3a5f,#2d1f6e)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'1.4rem',flexShrink:0}}>
+                    {item.item_type==='episode'?'📺':'🎬'}
+                  </div>
+                )}
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontWeight:500,fontSize:'.85rem',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{item.title || '(untitled)'}</div>
+                  <div style={{fontSize:'.7rem',color:'#94a3b8'}}>{subtitle}</div>
+                  <div className="progress-wrap" style={{marginTop:'.25rem'}}>
+                    <div className="progress-bar" style={{width:`${item.progress_pct||0}%`}}></div>
+                  </div>
+                  <div style={{fontSize:'.65rem',color:'#94a3b8',marginTop:'.2rem'}}>
+                    {offsetMin}m / {durMin}m ({item.progress_pct||0}%)
+                    {seenAgo && <span> · last in hub {seenAgo}</span>}
+                    {item.restored_at && <span style={{color:'#34d399'}}> · restored {ago(item.restored_at)} by {item.restored_by||'?'}</span>}
+                  </div>
+                </div>
+                <div style={{display:'flex',gap:'.3rem',flexShrink:0}}>
+                  {item.isLive === false && (
+                    <button className="btn-sm btn-primary" onClick={()=>cwRestoreOne(item.rating_key)} disabled={cwBusyKey===item.rating_key}>
+                      {cwBusyKey===item.rating_key ? '…' : 'Restore'}
+                    </button>
+                  )}
+                  <button className="btn-sm btn-delete" onClick={()=>cwForget(item.rating_key)}>Forget</button>
+                </div>
+              </div>
+            );
+          };
+          return (
+            <div className="overlay" onClick={()=>setCwModal(false)}>
+              <div className="modal" onClick={e=>e.stopPropagation()} style={{width:'720px',maxWidth:'95vw',maxHeight:'90vh',overflowY:'auto'}}>
+                <div className="modal-head">
+                  <div className="modal-title">Continue Watching Restore</div>
+                  <button className="modal-close" onClick={()=>setCwModal(false)}>×</button>
+                </div>
+
+                <div style={{fontSize:'.75rem',color:'#94a3b8',marginBottom:'.75rem'}}>
+                  Snapshots items currently in your Plex <em>Continue Watching</em> hub so that anything Plex ages out can be re-pushed via a stopped-timeline event. Restore re-applies the snapshotted <code>viewOffset</code> and updates <code>lastViewedAt</code> — Plex's hub may take a minute to refresh.
+                </div>
+
+                {/* Controls + status */}
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'.75rem',marginBottom:'1rem'}}>
+                  <div className="card" style={{padding:'.75rem'}}>
+                    <div style={{fontWeight:600,fontSize:'.85rem',marginBottom:'.5rem'}}>Snapshotter</div>
+                    <label style={{display:'flex',alignItems:'center',gap:'.4rem',fontSize:'.8rem',marginBottom:'.4rem'}}>
+                      <input type="checkbox" checked={!!s.enabled} onChange={e=>cwUpdateSettings({enabled:e.target.checked})}/>
+                      Enabled
+                    </label>
+                    <label style={{display:'flex',alignItems:'center',gap:'.4rem',fontSize:'.8rem',marginBottom:'.4rem'}}>
+                      Interval
+                      <input type="number" min="1" max="1440" className="form-input" style={{width:'70px',padding:'.2rem .4rem'}}
+                        value={s.interval_minutes ?? 15}
+                        onChange={e=>cwUpdateSettings({interval_minutes:parseInt(e.target.value)||15})}/>
+                      <span style={{fontSize:'.7rem',color:'#94a3b8'}}>minutes</span>
+                    </label>
+                    <label style={{display:'flex',alignItems:'center',gap:'.4rem',fontSize:'.8rem'}}>
+                      <input type="checkbox" checked={!!s.auto_restore} onChange={e=>cwUpdateSettings({auto_restore:e.target.checked})}/>
+                      Auto-restore missing items each cycle
+                    </label>
+                  </div>
+                  <div className="card" style={{padding:'.75rem'}}>
+                    <div style={{fontWeight:600,fontSize:'.85rem',marginBottom:'.5rem'}}>Status</div>
+                    <div style={{fontSize:'.75rem',color:'#94a3b8',lineHeight:1.6}}>
+                      Snapshots: <strong style={{color:'#cbd5e1'}}>{cwState?.snapshotCount ?? '–'}</strong><br/>
+                      Live in hub: <strong style={{color:'#cbd5e1'}}>{cwState?.liveCount ?? '–'}</strong><br/>
+                      Missing (recoverable): <strong style={{color:'#f87171'}}>{cwState?.missingCount ?? '–'}</strong><br/>
+                      Last run: <strong style={{color:'#cbd5e1'}}>{s.last_run ? ago(s.last_run) : 'never'}</strong>
+                      {s.last_error && <div style={{color:'#f87171',marginTop:'.25rem'}}>Last error: {s.last_error}</div>}
+                      {cwState?.plexError && <div style={{color:'#f87171',marginTop:'.25rem'}}>Plex error: {cwState.plexError}</div>}
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'.75rem',flexWrap:'wrap',gap:'.5rem'}}>
+                  <div className="toggle">
+                    <button className={`toggle-opt ${!cwShowLive?'active':''}`} onClick={()=>setCwShowLive(false)}>
+                      Missing ({missing.length})
+                    </button>
+                    <button className={`toggle-opt ${cwShowLive?'active':''}`} onClick={()=>setCwShowLive(true)}>
+                      Live ({live.length})
+                    </button>
+                  </div>
+                  <div style={{display:'flex',gap:'.4rem'}}>
+                    <button className="btn-sm btn-outline" onClick={loadCwState} disabled={cwLoading}>{cwLoading?'…':'Refresh'}</button>
+                    <button className="btn-sm btn-outline" onClick={cwSnapshotNow} disabled={cwLoading}>Snapshot now</button>
+                    {!cwShowLive && missing.length > 0 && (
+                      <button className="btn-sm btn-primary" onClick={cwRestoreAll} disabled={cwLoading}>Restore all ({missing.length})</button>
+                    )}
+                  </div>
+                </div>
+
+                {cwLoading && snaps.length === 0 ? (
+                  <div className="empty">Loading…</div>
+                ) : listFor.length === 0 ? (
+                  <div className="empty">
+                    {cwShowLive
+                      ? 'No items currently live in Continue Watching.'
+                      : (snaps.length === 0
+                          ? 'No snapshots yet. Click "Snapshot now" — the cron will then track items over time.'
+                          : 'Nothing missing. Plex still has all snapshotted items in its Continue Watching hub.')}
+                  </div>
+                ) : (
+                  <div>{listFor.map(renderRow)}</div>
+                )}
+
+                {unknown.length > 0 && !cwState?.plexError && (
+                  <div style={{fontSize:'.7rem',color:'#94a3b8',marginTop:'.5rem'}}>{unknown.length} snapshot{unknown.length!==1?'s':''} with unknown live status (Plex unreachable for this lookup).</div>
+                )}
+              </div>
+            </div>
+          );
+        })()}
+
+        {/* Missing Subtitles Modal (admin) */}
+        {subsModal && currentUser?.role === 'admin' && (() => {
+          const eps = subsState?.episodes || [];
+          const movs = subsState?.movies || [];
+          const search = subsSearch.trim().toLowerCase();
+          const filt = (arr, getLabel) => search ? arr.filter(x => getLabel(x).toLowerCase().includes(search)) : arr;
+          const epList = filt(eps, e => `${e.title||''} ${e.episode_title||''} ${e.episode_label||''}`);
+          const mvList = filt(movs, m => `${m.title||''} ${m.year||''}`);
+          const list = subsTab === 'episodes' ? epList : mvList;
+          const error = subsState?.error || subsState?.epError || subsState?.mvError;
+          return (
+            <div className="overlay" onClick={()=>setSubsModal(false)}>
+              <div className="modal" onClick={e=>e.stopPropagation()} style={{width:'780px',maxWidth:'95vw',maxHeight:'90vh',overflowY:'auto'}}>
+                <div className="modal-head">
+                  <div className="modal-title">Missing Subtitles (via Bazarr)</div>
+                  <button className="modal-close" onClick={()=>setSubsModal(false)}>×</button>
+                </div>
+                <div style={{fontSize:'.75rem',color:'#94a3b8',marginBottom:'.75rem'}}>
+                  Items pulled directly from Bazarr's "wanted" lists. Coverage depends on what Bazarr knows about — content not in Sonarr/Radarr won't appear here. "Search" triggers Bazarr's normal search-missing-subtitles flow.
+                </div>
+
+                {error && (
+                  <div className="alert-box" style={{background:'rgba(239,68,68,.1)',border:'1px solid rgba(239,68,68,.3)',color:'#f87171',marginBottom:'.75rem',padding:'.5rem .75rem',fontSize:'.8rem',borderRadius:'6px'}}>
+                    {error.includes('not configured') ? <>Bazarr is not configured. Open <strong>Settings → Bazarr</strong> to add the URL and API key, then come back.</> : error}
+                  </div>
+                )}
+
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:'.5rem',marginBottom:'.75rem',flexWrap:'wrap'}}>
+                  <div className="toggle">
+                    <button className={`toggle-opt ${subsTab==='episodes'?'active':''}`} onClick={()=>setSubsTab('episodes')}>
+                      Episodes ({epList.length}{search && search !== '' && epList.length !== eps.length ? ` / ${eps.length}` : ''})
+                    </button>
+                    <button className={`toggle-opt ${subsTab==='movies'?'active':''}`} onClick={()=>setSubsTab('movies')}>
+                      Movies ({mvList.length}{search && search !== '' && mvList.length !== movs.length ? ` / ${movs.length}` : ''})
+                    </button>
+                  </div>
+                  <div style={{display:'flex',gap:'.4rem',alignItems:'center'}}>
+                    <input
+                      className="form-input"
+                      style={{width:'180px',fontSize:'.8rem'}}
+                      placeholder="Search title…"
+                      value={subsSearch}
+                      onChange={e=>setSubsSearch(e.target.value)}/>
+                    <button className="btn-sm btn-outline" onClick={loadSubsState} disabled={subsLoading}>
+                      {subsLoading ? '…' : 'Refresh'}
+                    </button>
+                    <button className="btn-sm btn-primary" onClick={subsSearchAll} disabled={subsLoading || !!error}>
+                      Search all wanted
+                    </button>
+                  </div>
+                </div>
+
+                {subsLoading && !subsState ? (
+                  <div className="empty">Loading…</div>
+                ) : !subsState ? (
+                  <div className="empty">Click Refresh to load missing subs.</div>
+                ) : error ? null : list.length === 0 ? (
+                  <div className="empty">
+                    {subsTab === 'episodes'
+                      ? (search ? 'No episodes match your search.' : 'No episodes missing subtitles — clean library!')
+                      : (search ? 'No movies match your search.' : 'No movies missing subtitles — clean library!')}
+                  </div>
+                ) : (
+                  <div>
+                    {list.map(item => {
+                      const busy = subsBusyId === `${subsTab==='episodes'?'episode':'movie'}:${item.bazarr_id}`;
+                      const langs = (item.missing_languages || []).map(l => l.code || l.name).filter(Boolean).join(', ');
+                      return (
+                        <div key={item.bazarr_id} className="stream-card" style={{display:'flex',alignItems:'center',gap:'.75rem',opacity:item.monitored===false?.55:1}}>
+                          <div style={{width:'40px',height:'40px',borderRadius:'8px',background:subsTab==='episodes'?'rgba(139,92,246,.2)':'rgba(59,130,246,.2)',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0,fontSize:'1.2rem'}}>
+                            {subsTab==='episodes'?'📺':'🎬'}
+                          </div>
+                          <div style={{flex:1,minWidth:0}}>
+                            <div style={{fontWeight:500,fontSize:'.85rem',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>
+                              {item.title}
+                              {subsTab==='episodes' && item.episode_label && <span style={{color:'#a78bfa'}}> · {item.episode_label}</span>}
+                              {subsTab==='movies' && item.year && <span style={{color:'#94a3b8'}}> ({item.year})</span>}
+                            </div>
+                            <div style={{fontSize:'.7rem',color:'#94a3b8'}}>
+                              {subsTab==='episodes' && item.episode_title && <>{item.episode_title} · </>}
+                              <span style={{color:'#fbbf24'}}>missing: {langs || '?'}</span>
+                              {item.failed_attempts && <span style={{color:'#f87171'}}> · {item.failed_attempts} failed attempt{item.failed_attempts!==1?'s':''}</span>}
+                              {!item.monitored && <span style={{marginLeft:'.4rem',color:'#94a3b8'}}>(unmonitored)</span>}
+                            </div>
+                          </div>
+                          <button
+                            className="btn-sm btn-primary"
+                            onClick={()=>subsSearchOne(subsTab==='episodes'?'episode':'movie', item.bazarr_id)}
+                            disabled={busy}>
+                            {busy ? '…' : 'Search'}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })()}
 
         {/* ============ SECURITY ============ */}
         {tab==='security' && currentUser?.role==='admin' && (
@@ -1361,6 +1781,119 @@ function App() {
                 </select>
               </div>
               <button className="btn btn-primary" style={{width:'100%'}} onClick={createUser}>Create User</button>
+            </div>
+          </div>
+        )}
+
+        {/* ============ SETTINGS ============ */}
+        {tab==='settings' && currentUser?.role==='admin' && (
+          <div>
+            <div className="page-title">
+              <span>Integrations & Tokens</span>
+              <button className="btn btn-outline btn-sm" onClick={loadSettings}>Refresh</button>
+            </div>
+            <div style={{fontSize:'.8rem',color:'#94a3b8',marginBottom:'1rem',maxWidth:'780px'}}>
+              Edit connection URLs and API tokens for the tools this app integrates with. Values
+              saved here override the <code>.env</code>/Docker config (DB wins). Clear a field and
+              save to revert to the env value. Changes apply immediately — no restart required.
+            </div>
+            {settingsServices.length === 0 ? (
+              <div className="empty">Loading…</div>
+            ) : (
+              <div style={{display:'grid',gap:'.75rem',maxWidth:'780px'}}>
+                {settingsServices.map(svc => {
+                  const test = settingsTestResults[svc.service];
+                  return (
+                    <div key={svc.service} className="stream-card">
+                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:'1rem'}}>
+                        <div style={{flex:1,minWidth:0}}>
+                          <div style={{fontWeight:600,fontSize:'.95rem'}}>{svc.label}</div>
+                          {svc.description && <div style={{fontSize:'.75rem',color:'#94a3b8',marginTop:'.2rem'}}>{svc.description}</div>}
+                          <div style={{display:'flex',flexWrap:'wrap',gap:'.4rem',marginTop:'.5rem'}}>
+                            {svc.fields.map(f => (
+                              <span key={f.name} className={`status-badge ${f.hasValue ? (f.source==='db'?'status-approved':'status-available') : 'status-declined'}`}
+                                style={{fontSize:'.7rem'}}>
+                                {f.label}: {f.hasValue ? (f.source==='db' ? 'overridden' : f.source) : 'unset'}
+                              </span>
+                            ))}
+                          </div>
+                          {test && !test.testing && (
+                            <div style={{marginTop:'.6rem',padding:'.4rem .6rem',borderRadius:'4px',fontSize:'.75rem',
+                                         background: test.ok ? 'rgba(16,185,129,.12)' : 'rgba(239,68,68,.12)',
+                                         color: test.ok ? '#34d399' : '#f87171'}}>
+                              {test.ok ? `✓ ${test.detail || 'OK'}` : `✗ ${test.error || 'Failed'}`}
+                            </div>
+                          )}
+                        </div>
+                        <div style={{display:'flex',gap:'.4rem',flexShrink:0}}>
+                          <button className="btn-sm btn-outline" onClick={()=>testService(svc.service)} disabled={test?.testing}>
+                            {test?.testing ? 'Testing…' : 'Test'}
+                          </button>
+                          <button className="btn-sm btn-primary" onClick={()=>openSettingsEdit(svc)}>Edit</button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Settings Edit Modal */}
+        {settingsEdit && (
+          <div className="overlay" onClick={()=>!settingsSaving && setSettingsEdit(null)}>
+            <div className="modal" onClick={e=>e.stopPropagation()} style={{width:'480px',maxHeight:'85vh',overflowY:'auto'}}>
+              <div className="modal-head">
+                <div className="modal-title">{settingsEdit.label}</div>
+                <button className="modal-close" onClick={()=>setSettingsEdit(null)} disabled={settingsSaving}>×</button>
+              </div>
+              <div style={{fontSize:'.75rem',color:'#94a3b8',marginBottom:'.75rem'}}>
+                Leave a field blank and save to clear the override (reverts to env / default).
+                Secret fields show <code>••••</code> placeholder — type a new value to replace.
+              </div>
+              {settingsEdit.fields.map((f, idx) => (
+                <div key={f.name} className="form-row">
+                  <label className="form-label" style={{display:'flex',justifyContent:'space-between',alignItems:'baseline'}}>
+                    <span>{f.label}</span>
+                    <span style={{fontSize:'.65rem',color:'#94a3b8',fontWeight:400}}>env: <code>{f.envKey}</code> · src: {f.source}</span>
+                  </label>
+                  {f.type === 'secret' ? (
+                    <div style={{display:'flex',gap:'.4rem'}}>
+                      <input
+                        className="form-input"
+                        type={settingsRevealSecret[f.name] ? 'text' : 'password'}
+                        placeholder={f.hasValue ? '•••••••• (saved — type to replace)' : 'not set'}
+                        value={f.value}
+                        onChange={e=>{
+                          const nf = [...settingsEdit.fields];
+                          nf[idx] = { ...nf[idx], value: e.target.value };
+                          setSettingsEdit({ ...settingsEdit, fields: nf });
+                        }}/>
+                      <button className="btn-sm btn-outline" onClick={()=>setSettingsRevealSecret(prev=>({...prev,[f.name]:!prev[f.name]}))}>
+                        {settingsRevealSecret[f.name] ? 'Hide' : 'Show'}
+                      </button>
+                    </div>
+                  ) : (
+                    <input
+                      className="form-input"
+                      type={f.type === 'url' ? 'url' : 'text'}
+                      placeholder={f.type === 'url' ? 'http://host:port' : ''}
+                      value={f.value}
+                      onChange={e=>{
+                        const nf = [...settingsEdit.fields];
+                        nf[idx] = { ...nf[idx], value: e.target.value };
+                        setSettingsEdit({ ...settingsEdit, fields: nf });
+                      }}/>
+                  )}
+                </div>
+              ))}
+              <div style={{display:'flex',gap:'.5rem',marginTop:'.75rem'}}>
+                <button className="btn btn-outline" style={{flex:1}} onClick={()=>setSettingsEdit(null)} disabled={settingsSaving}>Cancel</button>
+                <button className="btn btn-primary" style={{flex:2}} onClick={saveSettings} disabled={settingsSaving}>
+                  {settingsSaving ? 'Saving…' : 'Save changes'}
+                </button>
+              </div>
             </div>
           </div>
         )}
@@ -1564,15 +2097,81 @@ function App() {
             )}
 
             {/* --- FILLERS --- */}
-            {ltvView==='fillers' && (
+            {ltvView==='fillers' && (() => {
+              const verifiedCount = ltvFillers.filter(f => f.verified).length;
+              const search = fillerSearch.trim().toLowerCase();
+              const filtered = ltvFillers.filter(f => {
+                if (fillerVerifiedOnly && !f.verified) return false;
+                if (search && !(f.name||'').toLowerCase().includes(search)) return false;
+                return true;
+              });
+              const fileInputId = 'filler-upload-input';
+              return (
               <div>
-                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'1rem'}}>
-                  <div style={{fontSize:'.85rem',color:'#94a3b8'}}>{ltvFillers.length} filler{ltvFillers.length!==1?'s':''}</div>
-                  <div style={{display:'flex',gap:'.5rem'}}>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'1rem',flexWrap:'wrap',gap:'.5rem'}}>
+                  <div style={{fontSize:'.85rem',color:'#94a3b8'}}>
+                    {filtered.length === ltvFillers.length
+                      ? <>{ltvFillers.length} filler{ltvFillers.length!==1?'s':''} ({verifiedCount} verified)</>
+                      : <>Showing {filtered.length} of {ltvFillers.length} ({verifiedCount} verified)</>}
+                  </div>
+                  <div style={{display:'flex',gap:'.5rem',alignItems:'center',flexWrap:'wrap'}}>
+                    <input
+                      className="form-input"
+                      style={{width:'180px',fontSize:'.8rem'}}
+                      placeholder="Search…"
+                      value={fillerSearch}
+                      onChange={e=>setFillerSearch(e.target.value)}/>
+                    <label style={{display:'flex',alignItems:'center',gap:'.35rem',fontSize:'.8rem',cursor:'pointer',userSelect:'none'}}>
+                      <input type="checkbox" checked={fillerVerifiedOnly} onChange={e=>setFillerVerifiedOnly(e.target.checked)}/>
+                      Verified only
+                    </label>
+                    <button className="btn btn-outline" onClick={()=>document.getElementById(fileInputId)?.click()}>Upload from PC</button>
                     <button className="btn btn-primary" onClick={()=>{setYtModal(true);ytLoadDownloads();}}>Download from YouTube</button>
                     <button className="btn btn-primary" onClick={ltvScanTrailers}>Scan Trailers from Plex</button>
                   </div>
                 </div>
+
+                {/* Drag-drop area + hidden file input. Drag-over anywhere on the fillers view triggers the overlay. */}
+                <input id={fileInputId} type="file" multiple accept={ALLOWED_FILLER_EXT.join(',')} style={{display:'none'}}
+                  onChange={e=>{ handleFillerFiles(e.target.files); e.target.value=''; }}/>
+                <div
+                  onDragOver={e=>{e.preventDefault();setFillerDragging(true);}}
+                  onDragLeave={e=>{e.preventDefault();setFillerDragging(false);}}
+                  onDrop={e=>{e.preventDefault();setFillerDragging(false);handleFillerFiles(e.dataTransfer.files);}}
+                  style={{
+                    border: `2px dashed ${fillerDragging ? '#3b82f6' : 'rgba(100,116,139,.3)'}`,
+                    borderRadius: '8px', padding: '.75rem', textAlign: 'center', fontSize: '.8rem',
+                    color: fillerDragging ? '#60a5fa' : '#94a3b8',
+                    background: fillerDragging ? 'rgba(59,130,246,.08)' : 'transparent',
+                    marginBottom: '1rem', transition: 'all .15s'
+                  }}>
+                  {fillerDragging ? 'Release to upload' : <>Drag video files here, or <span style={{color:'#60a5fa',cursor:'pointer'}} onClick={()=>document.getElementById(fileInputId)?.click()}>browse</span> ({ALLOWED_FILLER_EXT.join(', ')})</>}
+                </div>
+
+                {/* Upload progress list */}
+                {fillerUploads.length > 0 && (
+                  <div style={{marginBottom:'1.5rem'}}>
+                    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'.5rem'}}>
+                      <div style={{fontSize:'.85rem',fontWeight:600}}>Uploads</div>
+                      <button className="btn-sm btn-outline" onClick={()=>setFillerUploads([])}>Clear</button>
+                    </div>
+                    {fillerUploads.map((u, i) => (
+                      <div key={`${u.name}-${i}`} className="stream-card" style={{display:'flex',alignItems:'center',gap:'1rem',opacity:u.status==='error'?.7:1}}>
+                        <span className={`status-badge ${u.status==='done'?'status-approved':u.status==='error'?'status-declined':'status-available'}`}>{u.status}</span>
+                        <div style={{flex:1,minWidth:0}}>
+                          <div style={{fontWeight:500,fontSize:'.85rem',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{u.name}</div>
+                          {u.status === 'uploading' && (
+                            <div className="progress-wrap" style={{marginTop:'.3rem'}}>
+                              <div className="progress-bar" style={{width:`${u.progress}%`}}></div>
+                            </div>
+                          )}
+                          {u.error && <div style={{fontSize:'.7rem',color:'#f87171'}}>{u.error}</div>}
+                        </div>
+                        {u.status === 'uploading' && <span style={{fontSize:'.8rem',fontWeight:700}}>{u.progress}%</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
 
                 {/* Active Downloads */}
                 {ytDownloads.filter(d=>d.status==='downloading'||d.status==='processing'||d.status==='pending').length > 0 && (
@@ -1615,16 +2214,21 @@ function App() {
                 )}
 
                 {ltvFillers.length===0 ? (
-                  <div className="empty">No fillers. Click "Scan Trailers from Plex" or "Download from YouTube" to add filler content.</div>
+                  <div className="empty">No fillers. Upload from PC, click "Scan Trailers from Plex", or "Download from YouTube" to add filler content.</div>
+                ) : filtered.length === 0 ? (
+                  <div className="empty">No fillers match the current filter.</div>
                 ) : (
                   <div>
-                    {ltvFillers.map(f => (
+                    {filtered.map(f => (
                       <div key={f.id} className="stream-card" style={{display:'flex',alignItems:'center',gap:'1rem'}}>
-                        <div style={{width:'40px',height:'40px',borderRadius:'8px',background:f.type==='youtube'?'rgba(239,68,68,.2)':'rgba(139,92,246,.2)',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0,fontSize:'1.2rem'}}>
-                          {f.type==='youtube'?'▶️':f.type==='trailer'?'🎬':f.type==='bumper'?'📺':f.type==='preroll'?'🎞️':'📢'}
+                        <div style={{width:'40px',height:'40px',borderRadius:'8px',background:f.type==='youtube'?'rgba(239,68,68,.2)':f.type==='upload'?'rgba(16,185,129,.2)':'rgba(139,92,246,.2)',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0,fontSize:'1.2rem'}}>
+                          {f.type==='youtube'?'▶️':f.type==='trailer'?'🎬':f.type==='bumper'?'📺':f.type==='preroll'?'🎞️':f.type==='upload'?'📁':'📢'}
                         </div>
                         <div style={{flex:1}}>
-                          <div style={{fontWeight:500,fontSize:'.85rem'}}>{f.name}</div>
+                          <div style={{fontWeight:500,fontSize:'.85rem',display:'flex',alignItems:'center',gap:'.4rem'}}>
+                            {f.name}
+                            {f.verified ? <span className="status-badge status-approved" style={{fontSize:'.6rem'}}>verified</span> : <span className="status-badge status-declined" style={{fontSize:'.6rem'}}>unverified</span>}
+                          </div>
                           <div style={{fontSize:'.7rem',color:'#94a3b8'}}>{f.type} | {fmt(Math.floor(f.duration_ms/1000))}{f.local_path ? ' | Local file' : ''}</div>
                         </div>
                         <button className="btn-sm btn-delete" onClick={()=>ltvDeleteFiller(f.id)}>Delete</button>
@@ -1633,7 +2237,8 @@ function App() {
                   </div>
                 )}
               </div>
-            )}
+              );
+            })()}
 
             {/* --- SETUP / TUNER INSTRUCTIONS --- */}
             {ltvView==='setup' && (

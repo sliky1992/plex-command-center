@@ -5,12 +5,48 @@ const cors = require('cors');
 const axios = require('axios');
 const si = require('systeminformation');
 const path = require('path');
+const fs = require('fs');
 const { spawn, spawnSync } = require('child_process');
 const Database = require('better-sqlite3');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const http = require('http');
 const net = require('net');
+
+// --- Cross-platform path layout ---
+// Data lives separately from the app code so a service install can keep its DB / fillers /
+// uploads / sub cache stable across upgrades. PCC_DATA_DIR wins; otherwise default by OS.
+const DATA_DIR = process.env.PCC_DATA_DIR
+  || (process.platform === 'win32'
+      ? path.join(process.env.PROGRAMDATA || 'C:\\ProgramData', 'PlexCommandCenter')
+      : path.join(__dirname, 'data'));
+const paths = {
+  appDir: __dirname,
+  dataDir: DATA_DIR,
+  logsDir: process.env.PCC_LOGS_DIR || path.join(DATA_DIR, 'logs'),
+  pccDb: path.join(DATA_DIR, 'pcc.db'),
+  livetvDb: path.join(DATA_DIR, 'livetv.db'),
+  fillerDir: path.join(DATA_DIR, 'fillers'),
+  fillerUploadDir: path.join(DATA_DIR, 'fillers', 'uploads'),
+  subsCacheDir: path.join(DATA_DIR, 'subs'),
+  publicDir: path.join(__dirname, 'public')
+};
+for (const d of [paths.dataDir, paths.logsDir, paths.fillerDir, paths.fillerUploadDir, paths.subsCacheDir]) {
+  try { fs.mkdirSync(d, { recursive: true }); } catch (e) { console.warn('[paths] mkdir failed for', d, e.message); }
+}
+
+// --- Cross-platform binary resolution ---
+// On Windows we prefer a bundled bin dir (set by the installer) so ffmpeg/yt-dlp don't need to
+// be on PATH. On Linux this is a no-op — names resolve via PATH the same as before.
+function binPath(name) {
+  if (process.platform !== 'win32') return name;
+  const exe = name.endsWith('.exe') ? name : `${name}.exe`;
+  if (process.env.PCC_BIN_DIR) {
+    const full = path.join(process.env.PCC_BIN_DIR, exe);
+    if (fs.existsSync(full)) return full;
+  }
+  return exe;
+}
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -75,7 +111,7 @@ app.use((req, res, next) => {
   console.log(`[REQ] ${req.method} ${req.path} from ${req.ip}`);
   next();
 });
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(paths.publicDir));
 
 // Auth middleware MUST be mounted before any /api/* route is registered. Express applies
 // middleware in registration order, so anything declared above this line is public.
@@ -83,11 +119,16 @@ app.use(express.static(path.join(__dirname, 'public')));
 // and friends only at request time, by which point those const tables are initialized.
 app.use(requireAuth);
 
+// Live service config. Values are seeded from env here so the rest of the file can be loaded
+// before pccDb exists; reapplyServiceConfigs() (defined below the DB init) overlays any DB
+// overrides on top of these env defaults, in place, so existing call sites need no changes.
 const config = {
-  plex: { url: process.env.PLEX_URL || 'http://localhost:32400', token: process.env.PLEX_TOKEN },
-  tautulli: { url: process.env.TAUTULLI_URL || 'http://localhost:8181', apiKey: process.env.TAUTULLI_API_KEY },
-  jellyseerr: { url: process.env.JELLYSEERR_URL || 'http://localhost:5055', apiKey: process.env.JELLYSEERR_API_KEY },
-  zabbix: { url: process.env.ZABBIX_URL || '', user: process.env.ZABBIX_USER || 'Admin', password: process.env.ZABBIX_PASSWORD || '', hostId: process.env.ZABBIX_HOST_ID || '' }
+  plex: { url: process.env.PLEX_URL || 'http://localhost:32400', token: process.env.PLEX_TOKEN || '' },
+  tautulli: { url: process.env.TAUTULLI_URL || 'http://localhost:8181', apiKey: process.env.TAUTULLI_API_KEY || '' },
+  jellyseerr: { url: process.env.JELLYSEERR_URL || 'http://localhost:5055', apiKey: process.env.JELLYSEERR_API_KEY || '' },
+  zabbix: { url: process.env.ZABBIX_URL || '', user: process.env.ZABBIX_USER || 'Admin', password: process.env.ZABBIX_PASSWORD || '', hostId: process.env.ZABBIX_HOST_ID || '' },
+  bazarr: { url: process.env.BAZARR_URL || '', apiKey: process.env.BAZARR_API_KEY || '' },
+  opensubtitles: { apiKey: process.env.OPENSUBTITLES_API_KEY || '', username: process.env.OPENSUBTITLES_USERNAME || '', password: process.env.OPENSUBTITLES_PASSWORD || '' }
 };
 
 // ============================================
@@ -321,43 +362,60 @@ app.get('/api/docker/resources', async (req, res) => {
     const [cpu, mem, disks, net] = await Promise.all([si.currentLoad(), si.mem(), si.fsSize(), si.networkStats()]);
     
     // Get actual directory sizes using du command (async, parallel)
-    const { exec } = require('child_process');
-    const { promisify } = require('util');
-    const execPromise = promisify(exec);
-    const directories = ['/app', '/app/logs', '/app/data', '/app/public', '/tmp'];
+    const directories = [
+      { label: 'app',  path: paths.appDir },
+      { label: 'data', path: paths.dataDir },
+      { label: 'logs', path: paths.logsDir },
+      { label: 'fillers', path: paths.fillerDir }
+    ];
     const dirSizes = [];
 
-    const duResults = await Promise.all(directories.map(async (dir) => {
+    const sumDir = (dir) => {
+      let total = 0;
       try {
-        const { stdout } = await execPromise(`du -sb ${dir} 2>/dev/null | cut -f1`);
-        const bytes = parseInt(stdout.toString().trim());
-        if (bytes > 0) {
-          return {
-            name: dir,
-            mount: dir,
-            label: dir.replace('/app/', ''),
-            total: Math.round(bytes / 1048576), // MB
-            used: Math.round(bytes / 1048576),
-            percentage: 0, // Will calculate based on parent
-            sizeFormatted: bytes > 1073741824
-              ? `${(bytes / 1073741824).toFixed(2)} GB`
-              : `${(bytes / 1048576).toFixed(1)} MB`
-          };
+        const stack = [dir];
+        while (stack.length) {
+          const cur = stack.pop();
+          let entries; try { entries = fs.readdirSync(cur, { withFileTypes: true }); } catch (e) { continue; }
+          for (const ent of entries) {
+            const p = path.join(cur, ent.name);
+            try {
+              if (ent.isDirectory()) stack.push(p);
+              else total += fs.statSync(p).size;
+            } catch (e) {}
+          }
         }
-        return null;
-      } catch (e) {
-        return null; // Directory doesn't exist or can't read
-      }
+      } catch (e) {}
+      return total;
+    };
+
+    const duResults = await Promise.all(directories.map(async (entry) => {
+      try {
+        if (!fs.existsSync(entry.path)) return null;
+        const bytes = sumDir(entry.path);
+        if (!bytes) return null;
+        return {
+          name: entry.path,
+          mount: entry.path,
+          label: entry.label,
+          total: Math.round(bytes / 1048576),
+          used: Math.round(bytes / 1048576),
+          percentage: 0,
+          sizeFormatted: bytes > 1073741824
+            ? `${(bytes / 1073741824).toFixed(2)} GB`
+            : `${(bytes / 1048576).toFixed(1)} MB`
+        };
+      } catch (e) { return null; }
     }));
     dirSizes.push(...duResults.filter(Boolean));
-    
-    // Add main disk info
-    const mainDisk = disks.find(d => d.mount === '/');
+
+    // Add main disk info — first disk on Linux (/), system drive on Windows
+    const mainDisk = disks.find(d => d.mount === '/' || d.mount === 'C:') || disks[0];
     if (mainDisk) {
       dirSizes.unshift({
-        name: 'overlay',
-        mount: '/',
-        label: 'Container Root',
+        name: mainDisk.mount,
+        mount: mainDisk.mount,
+        label: process.platform === 'win32' ? `${mainDisk.mount} Drive` : 'Container Root',
         total: Math.round(mainDisk.size / 1073741824),
         used: Math.round(mainDisk.used / 1073741824),
         percentage: Math.round(mainDisk.use * 10) / 10,
@@ -1400,10 +1458,7 @@ app.post('/api/plex/collections/:key/pin', async (req, res) => {
 // AUTO-COLLECTION ENGINE (SQLite-backed)
 // ============================================
 
-const fs = require('fs');
-const pccDbDir = path.join(__dirname, 'data');
-if (!fs.existsSync(pccDbDir)) fs.mkdirSync(pccDbDir, { recursive: true });
-const pccDb = new Database(path.join(pccDbDir, 'pcc.db'));
+const pccDb = new Database(paths.pccDb);
 pccDb.pragma('journal_mode = WAL');
 pccDb.exec(`
   CREATE TABLE IF NOT EXISTS auto_collections (
@@ -1588,6 +1643,217 @@ pccDb.exec("INSERT OR IGNORE INTO regional_settings (key, value) VALUES ('telegr
 pccDb.exec(`INSERT OR IGNORE INTO regional_settings (key, value) VALUES ('gateway_enabled', '${process.env.PCC_GATEWAY_ENABLED === '1' ? '1' : '0'}')`);
 pccDb.exec(`INSERT OR IGNORE INTO regional_settings (key, value) VALUES ('gateway_port', '${parseInt(process.env.PCC_GATEWAY_PORT) || 32400}')`);
 pccDb.exec(`INSERT OR IGNORE INTO regional_settings (key, value) VALUES ('gateway_target', '${(process.env.PCC_GATEWAY_TARGET || '').replace(/'/g, "''")}')`);
+
+// ============================================
+// SERVICE SETTINGS - UI-editable token/URL overrides
+// ============================================
+// Layered config: env (boot) -> conf/.env file -> service_settings (DB, wins).
+// Secrets are encrypted at rest with AES-256-GCM. Key source priority:
+//   1. PCC_SECRETS_KEY env var (preferred — survives DB rebuilds)
+//   2. Persisted random salt stored in service_settings under (_meta, enc_salt)
+pccDb.exec(`
+  CREATE TABLE IF NOT EXISTS service_settings (
+    service TEXT NOT NULL,
+    field TEXT NOT NULL,
+    value TEXT,
+    is_secret INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (service, field)
+  );
+  CREATE TABLE IF NOT EXISTS settings_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    service TEXT NOT NULL,
+    field TEXT NOT NULL,
+    actor TEXT,
+    action TEXT NOT NULL,
+    detail TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_settings_audit_created ON settings_audit(created_at);
+`);
+
+let _settingsEncKey = null;
+function getSettingsKey() {
+  if (_settingsEncKey) return _settingsEncKey;
+  if (process.env.PCC_SECRETS_KEY) {
+    _settingsEncKey = crypto.createHash('sha256').update(process.env.PCC_SECRETS_KEY).digest();
+    return _settingsEncKey;
+  }
+  let row = pccDb.prepare("SELECT value FROM service_settings WHERE service='_meta' AND field='enc_salt'").get();
+  if (!row) {
+    const salt = crypto.randomBytes(32).toString('hex');
+    pccDb.prepare("INSERT INTO service_settings (service, field, value, is_secret) VALUES ('_meta','enc_salt',?,0)").run(salt);
+    row = { value: salt };
+  }
+  _settingsEncKey = crypto.createHash('sha256').update(row.value).digest();
+  return _settingsEncKey;
+}
+function encryptSecret(plaintext) {
+  if (plaintext == null || plaintext === '') return '';
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', getSettingsKey(), iv);
+  const enc = Buffer.concat([cipher.update(String(plaintext), 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `enc:v1:${iv.toString('base64')}:${tag.toString('base64')}:${enc.toString('base64')}`;
+}
+function decryptSecret(stored) {
+  if (!stored || typeof stored !== 'string') return '';
+  if (!stored.startsWith('enc:v1:')) return stored;
+  try {
+    const [, , ivB64, tagB64, encB64] = stored.split(':');
+    const iv = Buffer.from(ivB64, 'base64');
+    const tag = Buffer.from(tagB64, 'base64');
+    const enc = Buffer.from(encB64, 'base64');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', getSettingsKey(), iv);
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(enc), decipher.final()]).toString('utf8');
+  } catch (e) {
+    console.warn('[SETTINGS] Failed to decrypt secret (key may have changed):', e.message);
+    return '';
+  }
+}
+
+// Public schema of editable services — drives both backend resolver and the Settings UI.
+// envKey: the legacy env var (used as fallback when no DB override exists).
+// configPath: dot path into the live `config` object (so reapply can overwrite in place).
+const SERVICE_DEFS = {
+  plex: {
+    label: 'Plex Media Server',
+    description: 'Source server for sessions, library, and playback.',
+    fields: [
+      { name: 'url',   type: 'url',    label: 'Server URL',   envKey: 'PLEX_URL', configPath: 'plex.url' },
+      { name: 'token', type: 'secret', label: 'X-Plex-Token', envKey: 'PLEX_TOKEN', configPath: 'plex.token' }
+    ]
+  },
+  tautulli: {
+    label: 'Tautulli',
+    description: 'History, watch stats, and per-user analytics.',
+    fields: [
+      { name: 'url',    type: 'url',    label: 'URL',     envKey: 'TAUTULLI_URL', configPath: 'tautulli.url' },
+      { name: 'apiKey', type: 'secret', label: 'API Key', envKey: 'TAUTULLI_API_KEY', configPath: 'tautulli.apiKey' }
+    ]
+  },
+  jellyseerr: {
+    label: 'Jellyseerr',
+    description: 'Media request management.',
+    fields: [
+      { name: 'url',    type: 'url',    label: 'URL',     envKey: 'JELLYSEERR_URL', configPath: 'jellyseerr.url' },
+      { name: 'apiKey', type: 'secret', label: 'API Key', envKey: 'JELLYSEERR_API_KEY', configPath: 'jellyseerr.apiKey' }
+    ]
+  },
+  zabbix: {
+    label: 'Zabbix',
+    description: 'Server health metrics (Windows Plex host).',
+    fields: [
+      { name: 'url',      type: 'url',    label: 'URL',      envKey: 'ZABBIX_URL', configPath: 'zabbix.url' },
+      { name: 'user',     type: 'text',   label: 'Username', envKey: 'ZABBIX_USER', configPath: 'zabbix.user' },
+      { name: 'password', type: 'secret', label: 'Password', envKey: 'ZABBIX_PASSWORD', configPath: 'zabbix.password' },
+      { name: 'hostId',   type: 'text',   label: 'Host ID',  envKey: 'ZABBIX_HOST_ID', configPath: 'zabbix.hostId' }
+    ]
+  },
+  bazarr: {
+    label: 'Bazarr',
+    description: 'Subtitle management for missing subs.',
+    fields: [
+      { name: 'url',    type: 'url',    label: 'URL',     envKey: 'BAZARR_URL', configPath: 'bazarr.url' },
+      { name: 'apiKey', type: 'secret', label: 'API Key', envKey: 'BAZARR_API_KEY', configPath: 'bazarr.apiKey' }
+    ]
+  },
+  opensubtitles: {
+    label: 'OpenSubtitles',
+    description: 'External subtitle fallback for LiveTV playback.',
+    fields: [
+      { name: 'apiKey',   type: 'secret', label: 'API Key',  envKey: 'OPENSUBTITLES_API_KEY', configPath: 'opensubtitles.apiKey' },
+      { name: 'username', type: 'text',   label: 'Username', envKey: 'OPENSUBTITLES_USERNAME', configPath: 'opensubtitles.username' },
+      { name: 'password', type: 'secret', label: 'Password', envKey: 'OPENSUBTITLES_PASSWORD', configPath: 'opensubtitles.password' }
+    ]
+  }
+};
+
+function _setByPath(obj, dotted, value) {
+  const parts = dotted.split('.');
+  let cur = obj;
+  for (let i = 0; i < parts.length - 1; i++) {
+    if (typeof cur[parts[i]] !== 'object' || cur[parts[i]] === null) cur[parts[i]] = {};
+    cur = cur[parts[i]];
+  }
+  cur[parts[parts.length - 1]] = value;
+}
+
+function reapplyServiceConfigs() {
+  const rows = pccDb.prepare("SELECT service, field, value, is_secret FROM service_settings WHERE service != '_meta'").all();
+  const dbBySvc = {};
+  for (const r of rows) {
+    (dbBySvc[r.service] = dbBySvc[r.service] || {})[r.field] = r.is_secret ? decryptSecret(r.value) : (r.value || '');
+  }
+  for (const [svc, def] of Object.entries(SERVICE_DEFS)) {
+    for (const f of def.fields) {
+      const dbVal = dbBySvc[svc]?.[f.name];
+      const envVal = process.env[f.envKey];
+      // DB beats env; if both blank, keep whatever's already in config (preserves seeded defaults).
+      const finalVal = (dbVal !== undefined && dbVal !== '') ? dbVal
+                     : (envVal !== undefined && envVal !== '') ? envVal
+                     : undefined;
+      if (finalVal !== undefined) _setByPath(config, f.configPath, finalVal);
+    }
+  }
+}
+
+// Apply any DB overrides now that pccDb is initialized.
+reapplyServiceConfigs();
+
+function settingsAudit(actor, service, field, action, detail) {
+  try {
+    pccDb.prepare("INSERT INTO settings_audit (service, field, actor, action, detail) VALUES (?,?,?,?,?)")
+      .run(service, field, actor || 'system', action, (detail || '').slice(0, 500));
+  } catch (e) { console.warn('[SETTINGS] audit insert failed:', e.message); }
+}
+
+// ============================================
+// CONTINUE WATCHING SNAPSHOTS - recover items aged out of Plex's Continue Watching hub
+// ============================================
+// Plex's "Continue Watching" hub ages items out after a server-side computed window. Once an
+// item is gone, its viewOffset is lost — so to "restore" we need a snapshot taken BEFORE the
+// item disappeared. Cron polls /library/onDeck (admin token) at a configurable interval and
+// upserts each item with viewOffset > 0. When auto_restore is on, items in the snapshot that
+// disappear from the live hub get re-pushed via /:/timeline to revive both viewOffset and
+// lastViewedAt (the two values Plex uses to decide hub membership).
+pccDb.exec(`
+  CREATE TABLE IF NOT EXISTS cw_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id TEXT NOT NULL DEFAULT 'owner',
+    rating_key TEXT NOT NULL,
+    title TEXT,
+    show_title TEXT,
+    season_num INTEGER,
+    episode_num INTEGER,
+    year INTEGER,
+    item_type TEXT,
+    thumb TEXT,
+    view_offset INTEGER NOT NULL DEFAULT 0,
+    duration INTEGER NOT NULL DEFAULT 0,
+    last_viewed_at INTEGER,
+    first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_in_hub_at TEXT NOT NULL DEFAULT (datetime('now')),
+    restored_at TEXT,
+    restored_by TEXT,
+    UNIQUE(account_id, rating_key)
+  );
+  CREATE INDEX IF NOT EXISTS idx_cw_lastinhub ON cw_snapshots(last_in_hub_at);
+  CREATE TABLE IF NOT EXISTS cw_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled INTEGER NOT NULL DEFAULT 1,
+    interval_minutes INTEGER NOT NULL DEFAULT 15,
+    auto_restore INTEGER NOT NULL DEFAULT 0,
+    stale_after_hours INTEGER NOT NULL DEFAULT 6,
+    last_run TEXT,
+    last_snapshot_count INTEGER NOT NULL DEFAULT 0,
+    last_restore_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
+  );
+  INSERT OR IGNORE INTO cw_settings (id) VALUES (1);
+`);
 
 // Seed default admin if no users exist — flagged so the first login is forced to rotate password.
 const userCount = pccDb.prepare('SELECT COUNT(*) as cnt FROM users').get().cnt;
@@ -1898,6 +2164,364 @@ app.delete('/api/admin/users/:id', requireAdmin, (req, res) => {
   pccDb.prepare('DELETE FROM sessions WHERE user_id = ?').run(req.params.id);
   pccDb.prepare('DELETE FROM users WHERE id = ?').run(req.params.id);
   res.json({ success: true });
+});
+
+// ============================================
+// SERVICE SETTINGS API - UI-editable integration tokens/URLs
+// ============================================
+
+// Returns the schema + current effective values. Secrets are returned as a masked sentinel
+// (presence indicator only) — actual cleartext never leaves the server through this endpoint.
+app.get('/api/settings/services', requireAdmin, (req, res) => {
+  const out = [];
+  // Stable per-row lookup so we can label source as 'db' / 'env' / 'default'.
+  const dbRows = pccDb.prepare("SELECT service, field, value FROM service_settings WHERE service != '_meta'").all();
+  const hasDb = new Set(dbRows.filter(r => r.value && r.value !== '').map(r => `${r.service}|${r.field}`));
+  for (const [svc, def] of Object.entries(SERVICE_DEFS)) {
+    const fields = def.fields.map(f => {
+      const parts = f.configPath.split('.');
+      let v = config; for (const p of parts) v = v ? v[p] : undefined;
+      const has = v !== undefined && v !== '';
+      const dbOverride = hasDb.has(`${svc}|${f.name}`);
+      const envValue = process.env[f.envKey];
+      const source = dbOverride ? 'db' : (envValue ? 'env' : (has ? 'default' : 'unset'));
+      return {
+        name: f.name, label: f.label, type: f.type, envKey: f.envKey,
+        value: f.type === 'secret' ? (has ? '••••••••' : '') : (v || ''),
+        hasValue: has,
+        source
+      };
+    });
+    out.push({ service: svc, label: def.label, description: def.description, fields });
+  }
+  res.json(out);
+});
+
+// Body: { field: value, ... }. Pass an empty string to clear the DB override (revert to env).
+// Masked sentinel '••••' is ignored (user didn't actually edit the secret).
+app.put('/api/settings/services/:service', requireAdmin, (req, res) => {
+  const svc = req.params.service;
+  const def = SERVICE_DEFS[svc];
+  if (!def) return res.status(404).json({ error: 'Unknown service' });
+  const actor = req.user?.username || 'unknown';
+  const patch = req.body || {};
+  const fieldsByName = Object.fromEntries(def.fields.map(f => [f.name, f]));
+
+  const apply = pccDb.transaction(() => {
+    for (const [name, rawVal] of Object.entries(patch)) {
+      const f = fieldsByName[name];
+      if (!f) continue;
+      // Ignore unchanged masked secret
+      if (f.type === 'secret' && typeof rawVal === 'string' && /^[•*]+$/.test(rawVal)) continue;
+      const newVal = rawVal == null ? '' : String(rawVal);
+      const existing = pccDb.prepare("SELECT value FROM service_settings WHERE service=? AND field=?").get(svc, name);
+
+      if (newVal === '') {
+        if (existing) {
+          pccDb.prepare("DELETE FROM service_settings WHERE service=? AND field=?").run(svc, name);
+          settingsAudit(actor, svc, name, 'clear', 'reverted to env/default');
+        }
+        continue;
+      }
+      const isSecret = f.type === 'secret' ? 1 : 0;
+      const stored = isSecret ? encryptSecret(newVal) : newVal;
+      pccDb.prepare(`
+        INSERT INTO service_settings (service, field, value, is_secret, updated_at)
+        VALUES (?,?,?,?, datetime('now'))
+        ON CONFLICT(service, field) DO UPDATE SET value=excluded.value, is_secret=excluded.is_secret, updated_at=datetime('now')
+      `).run(svc, name, stored, isSecret);
+      settingsAudit(actor, svc, name, existing ? 'update' : 'create', isSecret ? 'secret changed' : `value="${newVal.slice(0, 100)}"`);
+    }
+  });
+  try { apply(); } catch (e) { return res.status(500).json({ error: e.message }); }
+
+  reapplyServiceConfigs();
+  // Service-specific reinit hooks after config change
+  if (svc === 'zabbix') {
+    zabbixAuthToken = null; zabbixAuthExpiry = 0; zabbixDisabled = false; zabbixDisabledReason = null;
+    console.log('[SETTINGS] Zabbix config updated — token cleared, polling re-enabled');
+  }
+  if (svc === 'opensubtitles') {
+    _osTokenCache = { token: null, expiresAt: 0 };
+  }
+  res.json({ success: true });
+});
+
+// Test a service using its currently-saved config. Logs the result to audit so admins can
+// see when something stopped working without diffing token rotations.
+app.post('/api/settings/services/:service/test', requireAdmin, async (req, res) => {
+  const svc = req.params.service;
+  if (!SERVICE_DEFS[svc]) return res.status(404).json({ error: 'Unknown service' });
+  const actor = req.user?.username || 'unknown';
+  let result;
+  try { result = await runServiceTest(svc); }
+  catch (e) { result = { ok: false, error: e.response?.data?.error || e.message }; }
+  settingsAudit(actor, svc, '*', 'test', result.ok ? (result.detail || 'ok') : `fail: ${(result.error || '').slice(0, 200)}`);
+  res.json(result);
+});
+
+async function runServiceTest(svc) {
+  const c = config;
+  switch (svc) {
+    case 'plex': {
+      if (!c.plex.url || !c.plex.token) return { ok: false, error: 'URL and token required' };
+      const r = await axios.get(`${c.plex.url}/identity`, { params: { 'X-Plex-Token': c.plex.token }, headers: { Accept: 'application/json' }, timeout: 5000 });
+      const mid = r.data?.MediaContainer?.machineIdentifier;
+      return { ok: !!mid, detail: mid ? `machineId ${String(mid).slice(0, 12)}…` : 'no machineIdentifier in response' };
+    }
+    case 'tautulli': {
+      if (!c.tautulli.url || !c.tautulli.apiKey) return { ok: false, error: 'URL and API key required' };
+      const r = await axios.get(`${c.tautulli.url}/api/v2`, { params: { apikey: c.tautulli.apiKey, cmd: 'get_server_info' }, timeout: 5000 });
+      const ok = r.data?.response?.result === 'success';
+      return ok ? { ok: true, detail: `server: ${r.data?.response?.data?.pms_name || 'connected'}` }
+                : { ok: false, error: r.data?.response?.message || 'auth failed' };
+    }
+    case 'jellyseerr': {
+      if (!c.jellyseerr.url || !c.jellyseerr.apiKey) return { ok: false, error: 'URL and API key required' };
+      const r = await axios.get(`${c.jellyseerr.url}/api/v1/status`, { headers: { 'X-Api-Key': c.jellyseerr.apiKey, Accept: 'application/json' }, timeout: 5000 });
+      return { ok: !!r.data?.version, detail: `version ${r.data?.version}` };
+    }
+    case 'zabbix': {
+      zabbixAuthToken = null; zabbixDisabled = false; zabbixAuthExpiry = 0; zabbixDisabledReason = null;
+      if (!c.zabbix.url || !c.zabbix.user || !c.zabbix.password) return { ok: false, error: 'URL, user and password required' };
+      const t = await getZabbixToken();
+      if (!t) return { ok: false, error: zabbixDisabledReason || 'login failed' };
+      return { ok: true, detail: 'authenticated' };
+    }
+    case 'bazarr': {
+      if (!c.bazarr.url || !c.bazarr.apiKey) return { ok: false, error: 'URL and API key required' };
+      const r = await bazarrGet('/api/system/status');
+      const v = r?.data?.bazarr_version || r?.bazarr_version;
+      return { ok: !!v, detail: v ? `version ${v}` : 'unexpected response shape' };
+    }
+    case 'opensubtitles': {
+      if (!c.opensubtitles.apiKey) return { ok: false, error: 'API key required' };
+      const r = await axios.get('https://api.opensubtitles.com/api/v1/infos/formats', { headers: { 'Api-Key': c.opensubtitles.apiKey, 'User-Agent': OS_USER_AGENT }, timeout: 5000 });
+      return { ok: r.status === 200, detail: 'API reachable' };
+    }
+    default:
+      return { ok: false, error: 'No test handler for this service' };
+  }
+}
+
+app.get('/api/settings/audit', requireAdmin, (req, res) => {
+  const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
+  const rows = pccDb.prepare('SELECT id, service, field, actor, action, detail, created_at FROM settings_audit ORDER BY id DESC LIMIT ?').all(limit);
+  res.json(rows);
+});
+
+// ============================================
+// CONTINUE WATCHING API
+// ============================================
+
+// Combined state: settings + last run + current snapshots annotated with live/missing.
+app.get('/api/cw/state', requireAdmin, async (req, res) => {
+  const settings = pccDb.prepare('SELECT * FROM cw_settings WHERE id=1').get();
+  const snaps = pccDb.prepare(`
+    SELECT rating_key, title, show_title, season_num, episode_num, year, item_type, thumb,
+           view_offset, duration, last_viewed_at, first_seen_at, last_seen_at, last_in_hub_at,
+           restored_at, restored_by
+    FROM cw_snapshots WHERE account_id='owner' ORDER BY last_in_hub_at DESC
+  `).all();
+
+  let liveKeys = null, plexError = null;
+  try {
+    const live = await _cwFetchOnDeck();
+    liveKeys = new Set(live.filter(i => (Number(i.viewOffset)||0) > 0).map(i => String(i.ratingKey)));
+  } catch (e) { plexError = e.message; }
+
+  const annotated = snaps.map(s => ({
+    ...s,
+    // Existing convention across the app: backend returns fully-qualified thumb URLs because
+    // Plex doesn't accept anonymous access. The browser hits Plex directly. Works on LAN /
+    // tailscale; for stricter setups a future server-side proxy could be substituted.
+    thumb: s.thumb && config.plex.url && config.plex.token
+      ? `${config.plex.url}${s.thumb}?X-Plex-Token=${config.plex.token}`
+      : null,
+    isLive: liveKeys ? liveKeys.has(s.rating_key) : null,
+    progress_pct: s.duration > 0 ? Math.min(99, Math.round((s.view_offset / s.duration) * 100)) : 0
+  }));
+
+  res.json({
+    settings,
+    plexError,
+    snapshots: annotated,
+    liveCount: liveKeys ? liveKeys.size : null,
+    snapshotCount: snaps.length,
+    missingCount: liveKeys ? snaps.filter(s => !liveKeys.has(s.rating_key)).length : null
+  });
+});
+
+app.put('/api/cw/settings', requireAdmin, (req, res) => {
+  const cur = pccDb.prepare('SELECT * FROM cw_settings WHERE id=1').get();
+  const { enabled, interval_minutes, auto_restore, stale_after_hours } = req.body || {};
+  const newEnabled = enabled === undefined ? cur.enabled : (enabled ? 1 : 0);
+  const newInterval = interval_minutes === undefined ? cur.interval_minutes : Math.max(1, Math.min(1440, parseInt(interval_minutes) || cur.interval_minutes));
+  const newAuto = auto_restore === undefined ? cur.auto_restore : (auto_restore ? 1 : 0);
+  const newStale = stale_after_hours === undefined ? cur.stale_after_hours : Math.max(1, parseInt(stale_after_hours) || cur.stale_after_hours);
+  pccDb.prepare('UPDATE cw_settings SET enabled=?, interval_minutes=?, auto_restore=?, stale_after_hours=? WHERE id=1')
+    .run(newEnabled, newInterval, newAuto, newStale);
+  scheduleCwSnapshotter();
+  settingsAudit(req.user?.username, 'cw', '*', 'update', `enabled=${newEnabled} interval=${newInterval}m auto=${newAuto}`);
+  res.json({ success: true });
+});
+
+app.post('/api/cw/snapshot', requireAdmin, async (req, res) => {
+  try {
+    const r = await cwSnapshot();
+    pccDb.prepare("UPDATE cw_settings SET last_run = datetime('now'), last_snapshot_count = ?, last_error = NULL WHERE id = 1").run(r.saved);
+    res.json({ success: true, ...r });
+  } catch (e) {
+    pccDb.prepare("UPDATE cw_settings SET last_run = datetime('now'), last_error = ? WHERE id = 1").run((e.message||'').slice(0, 500));
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/cw/restore/:rating_key', requireAdmin, async (req, res) => {
+  const r = await cwRestoreItem(req.params.rating_key, req.user?.username || 'admin');
+  if (r.ok) res.json({ success: true });
+  else res.status(400).json({ error: r.error });
+});
+
+app.post('/api/cw/restore-bulk', requireAdmin, async (req, res) => {
+  const keys = Array.isArray(req.body?.rating_keys) ? req.body.rating_keys : [];
+  if (!keys.length) return res.status(400).json({ error: 'rating_keys array required' });
+  const actor = req.user?.username || 'admin';
+  const results = { restored: 0, failed: 0, errors: [] };
+  for (const k of keys) {
+    const r = await cwRestoreItem(k, actor);
+    if (r.ok) results.restored++;
+    else { results.failed++; results.errors.push({ rating_key: k, error: r.error }); }
+  }
+  res.json({ success: true, ...results });
+});
+
+app.delete('/api/cw/snapshot/:rating_key', requireAdmin, (req, res) => {
+  pccDb.prepare("DELETE FROM cw_snapshots WHERE account_id='owner' AND rating_key = ?").run(req.params.rating_key);
+  res.json({ success: true });
+});
+
+// --- Bazarr client ---
+function _bazarrBase() {
+  if (!config.bazarr.url) throw new Error('Bazarr URL not configured');
+  if (!config.bazarr.apiKey) throw new Error('Bazarr API key not configured');
+  return config.bazarr.url.replace(/\/+$/, '');
+}
+async function bazarrGet(path, params) {
+  const r = await axios.get(`${_bazarrBase()}${path}`, {
+    params,
+    headers: { 'X-API-KEY': config.bazarr.apiKey, Accept: 'application/json' },
+    timeout: 15000
+  });
+  return r.data;
+}
+async function bazarrPatch(path, body, params) {
+  const r = await axios.patch(`${_bazarrBase()}${path}`, body, {
+    params,
+    headers: { 'X-API-KEY': config.bazarr.apiKey, 'Content-Type': 'application/json', Accept: 'application/json' },
+    timeout: 15000
+  });
+  return r.data;
+}
+
+// Aggregated wanted-subs view. Bazarr's wanted endpoints already encode "missing" status from
+// the language profile, so we don't re-scan Plex — we just surface what Bazarr already knows.
+// Episodes and movies are returned in two separate arrays with a normalized shape, so the UI
+// can render and trigger searches with one button each.
+app.get('/api/bazarr/missing', requireAdmin, async (req, res) => {
+  if (!config.bazarr.url || !config.bazarr.apiKey) {
+    return res.status(400).json({ error: 'Bazarr is not configured. Add the URL + API key in Settings.' });
+  }
+  try {
+    // Bazarr paginates wanted with start/length. Default to a large page so admins see everything.
+    const limit = Math.min(5000, parseInt(req.query.limit) || 1000);
+    const [epRes, mvRes] = await Promise.all([
+      bazarrGet('/api/episodes/wanted', { start: 0, length: limit }).catch(e => ({ error: e.message })),
+      bazarrGet('/api/movies/wanted', { start: 0, length: limit }).catch(e => ({ error: e.message }))
+    ]);
+    const epData = Array.isArray(epRes?.data) ? epRes.data : [];
+    const mvData = Array.isArray(mvRes?.data) ? mvRes.data : [];
+
+    const episodes = epData.map(e => ({
+      kind: 'episode',
+      bazarr_id: e.sonarrEpisodeId,
+      series_id: e.sonarrSeriesId,
+      title: e.seriesTitle,
+      episode_label: e.episode_number,
+      episode_title: e.episodeTitle,
+      missing_languages: (e.missing_subtitles || []).map(s => ({
+        code: s.code2 || s.code3, name: s.name, hi: !!s.hi, forced: !!s.forced
+      })),
+      failed_attempts: e.failedAttempts || null,
+      monitored: !!e.monitored,
+      scene_name: e.scene_name || null
+    }));
+    const movies = mvData.map(m => ({
+      kind: 'movie',
+      bazarr_id: m.radarrId,
+      title: m.title,
+      year: m.year,
+      missing_languages: (m.missing_subtitles || []).map(s => ({
+        code: s.code2 || s.code3, name: s.name, hi: !!s.hi, forced: !!s.forced
+      })),
+      failed_attempts: m.failedAttempts || null,
+      monitored: !!m.monitored,
+      scene_name: m.scene_name || null
+    }));
+
+    res.json({
+      episodes, movies,
+      total: episodes.length + movies.length,
+      episodesTotal: epRes?.total ?? episodes.length,
+      moviesTotal: mvRes?.total ?? movies.length,
+      epError: epRes?.error || null,
+      mvError: mvRes?.error || null
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.response?.data?.error || e.message });
+  }
+});
+
+// Trigger Bazarr's "search missing subtitles" for a specific item. Bazarr does the rest
+// (searches enabled providers, downloads if a match is found). This is the same action you'd
+// click inside Bazarr — we just surface it from one place.
+app.post('/api/bazarr/search/:type/:id', requireAdmin, async (req, res) => {
+  const { type, id } = req.params;
+  if (!['episode','movie'].includes(type)) return res.status(400).json({ error: 'type must be episode or movie' });
+  if (!config.bazarr.url || !config.bazarr.apiKey) return res.status(400).json({ error: 'Bazarr not configured' });
+  try {
+    // Bazarr v1 expects PATCH with an "action" body + the id in the URL or as a query param.
+    // The exact shape varies by Bazarr version; we try the modern form first and fall back.
+    const path = type === 'episode' ? '/api/episodes' : '/api/movies';
+    const idField = type === 'episode' ? 'episodeid' : 'radarrid';
+    try {
+      await bazarrPatch(path, { [idField]: [parseInt(id)], action: 'search-missing-subtitles' });
+    } catch (e1) {
+      // Fallback to query-param style (older Bazarr builds)
+      await bazarrPatch(path, null, { [idField]: id, action: 'search-missing-subtitles' });
+    }
+    settingsAudit(req.user?.username, 'bazarr', `${type}:${id}`, 'search', 'triggered search-missing-subtitles');
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.response?.data?.error || e.response?.statusText || e.message });
+  }
+});
+
+app.post('/api/bazarr/search-all', requireAdmin, async (req, res) => {
+  if (!config.bazarr.url || !config.bazarr.apiKey) return res.status(400).json({ error: 'Bazarr not configured' });
+  try {
+    // Bazarr exposes "search wanted" jobs via /api/system/tasks. Triggering them runs in
+    // the background and respects provider rate-limits.
+    await axios.post(`${_bazarrBase()}/api/system/tasks`, null, {
+      params: { taskid: 'wanted_search_missing_subtitles' },
+      headers: { 'X-API-KEY': config.bazarr.apiKey, Accept: 'application/json' },
+      timeout: 10000
+    });
+    settingsAudit(req.user?.username, 'bazarr', '*', 'search-all', 'triggered wanted_search_missing_subtitles');
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.response?.data?.error || e.message });
+  }
 });
 
 // ============================================
@@ -2714,6 +3338,155 @@ function scheduleAutoCollections() {
 // Start on boot (delayed so server is ready)
 setTimeout(() => scheduleAutoCollections(), 5000);
 
+// ============================================
+// CONTINUE WATCHING SNAPSHOTTER + RESTORER
+// ============================================
+
+async function _cwFetchOnDeck() {
+  if (!config.plex.url || !config.plex.token) throw new Error('Plex not configured');
+  const r = await axios.get(`${config.plex.url}/library/onDeck`, {
+    params: { 'X-Plex-Token': config.plex.token },
+    headers: { Accept: 'application/json' },
+    timeout: 15000
+  });
+  return r.data?.MediaContainer?.Metadata || [];
+}
+
+// Snapshot: upsert all live onDeck items with viewOffset>0. Items whose ratingKey is no
+// longer in the live response stay in the table — that's how we detect "missing" items.
+async function cwSnapshot() {
+  const items = await _cwFetchOnDeck();
+  const now = new Date().toISOString();
+  let saved = 0;
+  const upsert = pccDb.prepare(`
+    INSERT INTO cw_snapshots
+      (account_id, rating_key, title, show_title, season_num, episode_num, year, item_type, thumb, view_offset, duration, last_viewed_at, last_seen_at, last_in_hub_at)
+    VALUES ('owner', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+    ON CONFLICT(account_id, rating_key) DO UPDATE SET
+      title = excluded.title,
+      show_title = excluded.show_title,
+      season_num = excluded.season_num,
+      episode_num = excluded.episode_num,
+      year = excluded.year,
+      item_type = excluded.item_type,
+      thumb = excluded.thumb,
+      view_offset = excluded.view_offset,
+      duration = excluded.duration,
+      last_viewed_at = excluded.last_viewed_at,
+      last_seen_at = datetime('now'),
+      last_in_hub_at = datetime('now')
+  `);
+  const tx = pccDb.transaction((rows) => {
+    for (const it of rows) {
+      // Skip items with no progress — next-up episodes naturally re-appear once the prior
+      // episode is watched, no restore needed.
+      const offset = Number(it.viewOffset) || 0;
+      if (offset <= 0) continue;
+      const isEp = it.type === 'episode';
+      upsert.run(
+        String(it.ratingKey),
+        it.title || null,
+        isEp ? (it.grandparentTitle || it.parentTitle || null) : null,
+        isEp ? (Number.isFinite(it.parentIndex) ? it.parentIndex : null) : null,
+        isEp ? (Number.isFinite(it.index) ? it.index : null) : null,
+        Number.isFinite(it.year) ? it.year : null,
+        it.type || null,
+        it.thumb || null,
+        offset,
+        Number(it.duration) || 0,
+        Number(it.lastViewedAt) || null
+      );
+      saved++;
+    }
+  });
+  tx(items);
+  return { fetched: items.length, saved };
+}
+
+// Restore one item by pushing a /:/timeline event with state=stopped. That updates BOTH
+// viewOffset and lastViewedAt, which is what Plex's Continue Watching hub uses to decide
+// membership. Single timeline call is what mobile clients send when they stop playback.
+async function cwRestoreItem(ratingKey, actor) {
+  const snap = pccDb.prepare("SELECT * FROM cw_snapshots WHERE account_id='owner' AND rating_key = ?").get(String(ratingKey));
+  if (!snap) return { ok: false, error: 'No snapshot for this item' };
+  if (!snap.view_offset || snap.view_offset <= 0) return { ok: false, error: 'Snapshot has no progress to restore' };
+  if (!config.plex.url || !config.plex.token) return { ok: false, error: 'Plex not configured' };
+
+  try {
+    await axios.get(`${config.plex.url}/:/timeline`, {
+      params: {
+        ratingKey: snap.rating_key,
+        key: `/library/metadata/${snap.rating_key}`,
+        identifier: 'com.plexapp.plugins.library',
+        state: 'stopped',
+        time: snap.view_offset,
+        duration: snap.duration || (snap.view_offset + 1),
+        'X-Plex-Token': config.plex.token
+      },
+      timeout: 10000
+    });
+    pccDb.prepare("UPDATE cw_snapshots SET restored_at = datetime('now'), restored_by = ? WHERE account_id='owner' AND rating_key = ?")
+      .run(actor || 'system', String(ratingKey));
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.response?.status ? `Plex ${e.response.status}: ${e.response.statusText}` : e.message };
+  }
+}
+
+// Auto-restore tick: for every snapshot item NOT in the current live hub AND not restored
+// recently, push the timeline event. Runs as part of each snapshot cycle when enabled.
+async function cwAutoRestoreCycle(liveKeys) {
+  // Only consider items snapshotted at least once before this cycle (i.e., last_in_hub_at < a moment ago).
+  const candidates = pccDb.prepare(`
+    SELECT rating_key, view_offset, title FROM cw_snapshots
+    WHERE account_id='owner' AND view_offset > 0
+      AND (restored_at IS NULL OR restored_at < datetime('now','-1 day'))
+  `).all();
+  let restored = 0, failed = 0;
+  for (const c of candidates) {
+    if (liveKeys.has(c.rating_key)) continue;
+    const r = await cwRestoreItem(c.rating_key, 'auto-restore');
+    if (r.ok) restored++; else failed++;
+  }
+  return { restored, failed };
+}
+
+let cwTimer = null;
+function scheduleCwSnapshotter() {
+  if (cwTimer) { clearInterval(cwTimer); cwTimer = null; }
+  const s = pccDb.prepare('SELECT * FROM cw_settings WHERE id=1').get();
+  if (!s.enabled) { console.log('[CW] Snapshotter disabled'); return; }
+  const minutes = Math.max(1, Number(s.interval_minutes) || 15);
+  console.log(`[CW] Snapshotter scheduled every ${minutes}m (auto_restore=${s.auto_restore ? 'on' : 'off'})`);
+
+  const tick = async () => {
+    try {
+      const cur = pccDb.prepare('SELECT * FROM cw_settings WHERE id=1').get();
+      if (!cur.enabled) return;
+      const result = await cwSnapshot();
+      let restoreResult = { restored: 0, failed: 0 };
+      if (cur.auto_restore) {
+        // Need live keys for diff
+        const live = await _cwFetchOnDeck();
+        const liveKeys = new Set(live.filter(i => (Number(i.viewOffset)||0) > 0).map(i => String(i.ratingKey)));
+        restoreResult = await cwAutoRestoreCycle(liveKeys);
+      }
+      pccDb.prepare(`
+        UPDATE cw_settings SET last_run = datetime('now'), last_snapshot_count = ?, last_restore_count = ?, last_error = NULL WHERE id = 1
+      `).run(result.saved, restoreResult.restored);
+      if (restoreResult.restored || restoreResult.failed) {
+        console.log(`[CW] Tick: snapshotted ${result.saved}, restored ${restoreResult.restored}, failed ${restoreResult.failed}`);
+      }
+    } catch (e) {
+      pccDb.prepare("UPDATE cw_settings SET last_run = datetime('now'), last_error = ? WHERE id = 1").run((e.message || String(e)).slice(0, 500));
+      console.warn('[CW] Tick error:', e.message);
+    }
+  };
+  tick().catch(()=>{});
+  cwTimer = setInterval(tick, minutes * 60 * 1000);
+}
+setTimeout(() => scheduleCwSnapshotter(), 7000);
+
 // Unwatched report
 app.get('/api/plex/library/:key/unwatched', async (req, res) => {
   try {
@@ -3078,10 +3851,7 @@ const LIVETV_EPOCH = new Date('2025-01-01T00:00:00Z').getTime();
 // --- Database Init ---
 let db;
 if (LIVETV_ENABLED) {
-  const fs = require('fs');
-  const dbDir = path.join(__dirname, 'data');
-  if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
-  db = new Database(path.join(dbDir, 'livetv.db'));
+  db = new Database(paths.livetvDb);
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
 
@@ -5447,7 +6217,7 @@ function pickPlexSubtitleStreamId(media, langCode) {
 // OPENSUBTITLES_USERNAME, and OPENSUBTITLES_PASSWORD env vars are set; otherwise no-op.
 // API docs: https://opensubtitles.stoplight.io/docs/opensubtitles-api/
 const OPENSUBTITLES_API = 'https://api.opensubtitles.com/api/v1';
-const SUBS_CACHE_DIR = '/app/data/subs';
+const SUBS_CACHE_DIR = paths.subsCacheDir;
 const OS_USER_AGENT = 'PlexCommandCenter v3.0';
 let _osTokenCache = { token: null, expiresAt: 0 };
 
@@ -5462,7 +6232,7 @@ function osLangCode(code) {
 
 async function osLogin() {
   if (_osTokenCache.token && _osTokenCache.expiresAt > Date.now()) return _osTokenCache.token;
-  const { OPENSUBTITLES_API_KEY: apiKey, OPENSUBTITLES_USERNAME: u, OPENSUBTITLES_PASSWORD: p } = process.env;
+  const apiKey = config.opensubtitles.apiKey, u = config.opensubtitles.username, p = config.opensubtitles.password;
   if (!apiKey || !u || !p) return null;
   const r = await axios.post(`${OPENSUBTITLES_API}/login`, { username: u, password: p },
     { headers: { 'Api-Key': apiKey, 'Content-Type': 'application/json', 'User-Agent': OS_USER_AGENT }, timeout: 10000 });
@@ -5471,7 +6241,7 @@ async function osLogin() {
 }
 
 async function osSearch(program, langCode) {
-  const apiKey = process.env.OPENSUBTITLES_API_KEY;
+  const apiKey = config.opensubtitles.apiKey;
   if (!apiKey) return null;
   const params = { languages: osLangCode(langCode), query: program.show_title || program.title };
   if (program.type === 'episode') {
@@ -5493,7 +6263,7 @@ async function osSearch(program, langCode) {
 }
 
 async function osDownload(fileId, destPath) {
-  const apiKey = process.env.OPENSUBTITLES_API_KEY;
+  const apiKey = config.opensubtitles.apiKey;
   const token = await osLogin();
   if (!apiKey || !token) return false;
   const r = await axios.post(`${OPENSUBTITLES_API}/download`, { file_id: fileId },
@@ -5507,8 +6277,8 @@ async function osDownload(fileId, destPath) {
 }
 
 async function findOpenSubtitlesSubtitle(rkey, langCode) {
-  if (!process.env.OPENSUBTITLES_API_KEY) return null;
-  const destPath = `${SUBS_CACHE_DIR}/${rkey}.${osLangCode(langCode)}.srt`;
+  if (!config.opensubtitles.apiKey) return null;
+  const destPath = path.join(SUBS_CACHE_DIR, `${rkey}.${osLangCode(langCode)}.srt`);
   if (fs.existsSync(destPath)) return { kind: 'external', url: destPath, codec: 'srt' };
   const program = db.prepare('SELECT * FROM programs WHERE plex_rating_key = ?').get(String(rkey));
   if (!program) return null;
@@ -5555,7 +6325,7 @@ async function findPlexSubtitleStream(rkey, fileUrl, langCode) {
   const target = String(langCode).toLowerCase();
 
   // 1) ffprobe of the video URL — finds EMBEDDED subs only.
-  const r = spawnSync('ffprobe', [
+  const r = spawnSync(binPath('ffprobe'), [
     '-v', 'error', '-select_streams', 's',
     '-show_entries', 'stream=index,codec_name:stream_tags=language',
     '-of', 'json', fileUrl
@@ -6002,7 +6772,7 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
       'Cache-Control': 'no-cache, no-store',
       'Access-Control-Allow-Origin': '*'
     });
-    const ff = spawn('ffmpeg', [
+    const ff = spawn(binPath('ffmpeg'), [
       '-f', 'lavfi', '-i',
       `color=c=0x0a0e27:s=1280x720:d=60,drawtext=text='${safeChName}':fontcolor=white:fontsize=52:x=(w-text_w)/2:y=(h/2)-60,drawtext=text='Off Air':fontcolor=0x94a3b8:fontsize=36:x=(w-text_w)/2:y=(h/2)+10,drawtext=text='Resumes ${nextOnFmt}':fontcolor=0x60a5fa:fontsize=28:x=(w-text_w)/2:y=(h/2)+70`,
       '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
@@ -6102,7 +6872,7 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
         '-output_ts_offset', String(cumulativeDurationSec),
         'pipe:1'
       ];
-      const ff = spawn('ffmpeg', ffArgs);
+      const ff = spawn(binPath('ffmpeg'), ffArgs);
       ff.on('error', (err) => {
         console.error('[LiveTV local filler] ffmpeg spawn error:', err.message);
         if (!clientDisconnected && !res.writableEnded) {
@@ -6238,7 +7008,7 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
         'pipe:1'
       ];
 
-      const ffmpeg = spawn('ffmpeg', ffArgs);
+      const ffmpeg = spawn(binPath('ffmpeg'), ffArgs);
 
       // Spawn-level error (e.g. ENOENT) emits 'error' instead of throwing — handle it so it
       // doesn't escape as an unhandled exception. The 'close' handler in the Promise below
@@ -6340,6 +7110,20 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
 });
 
 // --- Filler CRUD ---
+// Stream a downloaded filler's local mp4 directly so the user can preview it in the browser
+// without waiting for it to come up in a channel's wall-clock rotation. Only applies to YouTube
+// fillers (the ones with a local_path); Plex-sourced fillers should be played via the regular
+// /api/livetv/stream pipeline. Honors HTTP Range so seeking works.
+app.get('/api/livetv/fillers/:id/preview', (req, res) => {
+  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
+  const f = db.prepare('SELECT id, name, local_path FROM fillers WHERE id = ?').get(req.params.id);
+  if (!f) return res.status(404).json({ error: 'Filler not found' });
+  if (!f.local_path) return res.status(400).json({ error: 'This filler has no downloaded file (Plex-sourced trailer — preview not supported)' });
+  if (!fs.existsSync(f.local_path)) return res.status(404).json({ error: 'File missing on disk: ' + f.local_path });
+  res.set('Content-Type', 'video/mp4');
+  res.sendFile(f.local_path);
+});
+
 app.get('/api/livetv/fillers', (req, res) => {
   if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
   const fillers = db.prepare('SELECT * FROM fillers ORDER BY name').all();
@@ -6373,6 +7157,77 @@ app.delete('/api/livetv/fillers/:id', (req, res) => {
   db.prepare('DELETE FROM fillers WHERE id = ?').run(req.params.id);
   invalidatePlaylistCache();
   res.json({ success: true });
+});
+
+// Streaming upload for local video files (multi-file drag-drop on the UI side calls this once
+// per file). Client sends raw binary with the file name in X-Filename. We pipe to disk to avoid
+// buffering large videos in memory, then ffprobe for duration before inserting the filler row.
+const FILLER_UPLOAD_MAX = 1024 * 1024 * 1024; // 1 GiB per file
+const FILLER_ALLOWED_EXT = new Set(['.mp4','.mkv','.mov','.webm','.m4v','.avi','.ts','.mpg','.mpeg']);
+app.post('/api/livetv/fillers/upload', (req, res) => {
+  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
+  const rawName = req.headers['x-filename'] || `upload-${Date.now()}.mp4`;
+  const decodedName = (() => {
+    try { return decodeURIComponent(String(rawName)); } catch(e) { return String(rawName); }
+  })();
+  // Strip path separators and dodgy chars — keep the file's actual extension for ffprobe muxer detection.
+  const baseName = path.basename(decodedName);
+  const ext = path.extname(baseName).toLowerCase();
+  if (!FILLER_ALLOWED_EXT.has(ext)) {
+    return res.status(400).json({ error: `Unsupported file type "${ext}". Allowed: ${[...FILLER_ALLOWED_EXT].join(', ')}` });
+  }
+  const safeName = baseName.replace(/[^a-zA-Z0-9._\- ]/g, '_').slice(0, 200);
+
+  const destDir = paths.fillerUploadDir;
+  fs.mkdirSync(destDir, { recursive: true });
+  const destPath = path.join(destDir, `${Date.now()}-${safeName}`);
+
+  let bytes = 0;
+  let aborted = false;
+  const ws = fs.createWriteStream(destPath);
+  let responded = false;
+  const sendErr = (code, msg) => {
+    if (responded) return;
+    responded = true;
+    try { ws.destroy(); } catch(e) {}
+    try { fs.unlinkSync(destPath); } catch(e) {}
+    res.status(code).json({ error: msg });
+  };
+
+  req.on('data', (chunk) => {
+    bytes += chunk.length;
+    if (bytes > FILLER_UPLOAD_MAX) {
+      aborted = true;
+      req.destroy();
+      sendErr(413, `File exceeds ${(FILLER_UPLOAD_MAX/1024/1024).toFixed(0)} MB limit`);
+    }
+  });
+  req.on('error', (e) => sendErr(500, 'upload stream error: ' + e.message));
+  ws.on('error', (e) => sendErr(500, 'disk write error: ' + e.message));
+
+  req.pipe(ws);
+  ws.on('finish', () => {
+    if (aborted || responded) return;
+    let durMs = 0;
+    try {
+      const r = spawnSync(binPath('ffprobe'), ['-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', destPath], { timeout: 15000 });
+      const dur = (r.stdout || '').toString().trim();
+      durMs = Math.round(parseFloat(dur) * 1000) || 0;
+    } catch(e) {}
+    if (!durMs) return sendErr(400, 'Could not determine duration — file may be corrupt or unsupported');
+
+    const title = path.basename(safeName, ext).slice(0, 200) || `Upload ${new Date().toLocaleString()}`;
+    const fillerType = req.headers['x-filler-type'] || 'upload';
+    const contentType = req.headers['x-content-type'] || null;
+    const genre = req.headers['x-genre'] ? String(req.headers['x-genre']).slice(0, 200) : null;
+    const result = db.prepare(`
+      INSERT INTO fillers (name, type, duration_ms, local_path, enabled, verified, content_type, genre)
+      VALUES (?,?,?,?,1,1,?,?)
+    `).run(title, fillerType, durMs, destPath, contentType, genre);
+
+    responded = true;
+    res.json({ success: true, id: result.lastInsertRowid, name: title, duration_ms: durMs, bytes });
+  });
 });
 
 app.post('/api/livetv/fillers/scan-trailers', async (req, res) => {
@@ -6477,7 +7332,7 @@ app.post('/api/livetv/fillers/scan-trailers', async (req, res) => {
 const activeDownloads = new Map(); // downloadId -> child process
 
 // Static serving for downloaded fillers
-app.use('/fillers', express.static(path.join(__dirname, 'data', 'fillers')));
+app.use('/fillers', express.static(paths.fillerDir));
 
 app.get('/api/livetv/fillers/disk-space', async (req, res) => {
   if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
@@ -6499,8 +7354,7 @@ app.get('/api/livetv/fillers/disk-space', async (req, res) => {
         }
         return total;
       };
-      const fillerDir = path.join(__dirname, 'data', 'fillers');
-      if (fsLocal.existsSync(fillerDir)) fillersSize = walk(fillerDir);
+      if (fsLocal.existsSync(paths.fillerDir)) fillersSize = walk(paths.fillerDir);
     } catch(e) {}
     res.json({
       total: main?.size || 0,
@@ -6547,7 +7401,7 @@ app.post('/api/livetv/fillers/yt-scan', async (req, res) => {
     const searchQuery = `${searchTitle} ${prog.year || ''} official trailer`.trim();
     try {
       // spawnSync with array args — no shell, query passed as a single literal arg
-      const r = spawnSync('yt-dlp', [
+      const r = spawnSync(binPath('yt-dlp'), [
         `ytsearch1:${searchQuery}`,
         '--dump-json', '--no-download', '--no-playlist'
       ], { timeout: 15000, maxBuffer: 5 * 1024 * 1024 });
@@ -6594,7 +7448,7 @@ app.get('/api/livetv/fillers/yt-info', async (req, res) => {
     return res.status(400).json({ error: 'Only http(s) URLs are allowed' });
   }
   try {
-    const r = spawnSync('yt-dlp', ['--dump-json', '--no-download', parsed.toString()], {
+    const r = spawnSync(binPath('yt-dlp'), ['--dump-json', '--no-download', parsed.toString()], {
       timeout: 30000, maxBuffer: 5 * 1024 * 1024
     });
     if (r.error) throw r.error;
@@ -6624,19 +7478,18 @@ function startYtDownload(url, quality, channelIds, fillerName, meta) {
   const result = db.prepare('INSERT INTO yt_downloads (url, quality, title) VALUES (?, ?, ?)').run(url, q, fillerName || null);
   const dlId = result.lastInsertRowid;
 
-  const fillerDir = path.join(__dirname, 'data', 'fillers');
-  if (!require('fs').existsSync(fillerDir)) require('fs').mkdirSync(fillerDir, { recursive: true });
+  if (!fs.existsSync(paths.fillerDir)) fs.mkdirSync(paths.fillerDir, { recursive: true });
 
   const args = [
     '-f', `bestvideo[height<=${height}]+bestaudio/best[height<=${height}]`,
     '--merge-output-format', 'mp4',
-    '-o', path.join(fillerDir, '%(title)s.%(ext)s'),
+    '-o', path.join(paths.fillerDir, '%(title)s.%(ext)s'),
     '--progress', '--newline',
     '--no-playlist',
     url
   ];
 
-  const proc = spawn('yt-dlp', args);
+  const proc = spawn(binPath('yt-dlp'), args);
   activeDownloads.set(dlId, proc);
   // Keep the tail of stderr so a failure stores a useful reason in error_msg instead of just
   // "exit code 1". Plain progress lines get filtered out so we keep only the meaningful chatter.
@@ -6680,7 +7533,7 @@ function startYtDownload(url, quality, channelIds, fillerName, meta) {
         fileSize = require('fs').statSync(filePath).size;
         try {
           // spawnSync with array args — filePath is a single literal arg (cannot break out of quotes)
-          const r = spawnSync('ffprobe', [
+          const r = spawnSync(binPath('ffprobe'), [
             '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', filePath
           ], { timeout: 10000 });
           if (r.status === 0) {
@@ -6762,7 +7615,7 @@ app.post('/api/livetv/fillers/auto-fetch', async (req, res) => {
 
   try {
     // yt-dlp --dump-json gives one JSON line per result; --flat-playlist keeps it light (no per-video extraction).
-    const search = spawnSync('yt-dlp',
+    const search = spawnSync(binPath('yt-dlp'),
       ['--dump-json', '--flat-playlist', '--no-warnings', `ytsearch${n * 2}:${query}`],
       { timeout: 60000, maxBuffer: 8 * 1024 * 1024 });
     if (search.status !== 0) {
@@ -6978,6 +7831,100 @@ app.put('/api/livetv/subtitle-settings', (req, res) => {
   // Bust the per-rkey probe cache so the next stream re-detects with the new settings
   _subtitleProbeCache.clear();
   res.json({ success: true, settings: readSubtitleSettings() });
+});
+
+// --- Missing-subtitles scanner ---
+// Read-only library scan: for each requested library section, ask Plex which items lack a sub
+// stream in the given language. Plex's filter syntax `subtitleLanguage!=<lang>` does the heavy
+// lifting in a single per-section request, so even a 10k-item library returns in ~1s.
+// Query params:
+//   lang      — 2- or 3-letter ISO code. Defaults to the saved subtitle_language setting, or 'eng'.
+//   sections  — comma-separated section IDs. Defaults to all movie + show sections.
+app.get('/api/subtitles/scan', async (req, res) => {
+  try {
+    let lang = String(req.query.lang || '').trim().toLowerCase();
+    if (!lang) {
+      try { lang = readSubtitleSettings().language || ''; } catch(e) { lang = ''; }
+    }
+    if (!lang) lang = 'eng';
+    if (!/^[a-z]{2,3}$/.test(lang)) {
+      return res.status(400).json({ error: 'lang must be a 2- or 3-letter ISO code' });
+    }
+
+    const secsRes = await axios.get(`${config.plex.url}/library/sections`, {
+      params: { 'X-Plex-Token': config.plex.token },
+      headers: { Accept: 'application/json' }, timeout: 10000
+    });
+    const allSections = (secsRes.data?.MediaContainer?.Directory || [])
+      .filter(s => s.type === 'movie' || s.type === 'show');
+
+    let requested = allSections;
+    if (req.query.sections) {
+      const wanted = new Set(String(req.query.sections).split(',').map(x => x.trim()).filter(Boolean));
+      requested = allSections.filter(s => wanted.has(String(s.key)));
+      if (requested.length === 0) {
+        return res.status(400).json({ error: 'no matching movie/show sections for given ids' });
+      }
+    }
+
+    const sectionResults = [];
+    let grandTotal = 0;
+    for (const sec of requested) {
+      const isMovie = sec.type === 'movie';
+      // type=1 = movie, type=4 = episode. Episodes are scanned individually (one row per ep).
+      const url = `${config.plex.url}/library/sections/${sec.key}/all`;
+      const r = await axios.get(url, {
+        params: {
+          type: isMovie ? 1 : 4,
+          'subtitleLanguage!': lang,
+          'X-Plex-Container-Size': 50000,
+          'X-Plex-Token': config.plex.token
+        },
+        headers: { Accept: 'application/json' }, timeout: 60000
+      });
+      const items = r.data?.MediaContainer?.Metadata || [];
+      const missing = items.map(m => {
+        const part = m.Media?.[0]?.Part?.[0] || {};
+        const media = m.Media?.[0] || {};
+        const base = {
+          ratingKey: m.ratingKey,
+          file: part.file || '',
+          container: media.container || '',
+          videoCodec: media.videoCodec || '',
+          videoResolution: media.videoResolution || '',
+          addedAt: m.addedAt || 0
+        };
+        if (isMovie) {
+          return { ...base, type: 'movie', title: m.title, year: m.year || null };
+        }
+        return {
+          ...base, type: 'episode',
+          show: m.grandparentTitle || '',
+          season: m.parentIndex || 0,
+          episode: m.index || 0,
+          title: m.title || ''
+        };
+      });
+      grandTotal += missing.length;
+      sectionResults.push({
+        id: String(sec.key),
+        title: sec.title,
+        type: sec.type,
+        missingCount: missing.length,
+        missing
+      });
+    }
+
+    res.json({
+      language: lang,
+      scannedAt: new Date().toISOString(),
+      totalMissing: grandTotal,
+      sections: sectionResults
+    });
+  } catch (e) {
+    console.error('[subtitles/scan] failed:', e.response?.status, e.message);
+    res.status(500).json({ error: 'scan failed: ' + (e.response?.status ? `Plex ${e.response.status}` : e.message) });
+  }
 });
 
 // --- Channel Logos ---

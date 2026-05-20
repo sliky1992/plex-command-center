@@ -25,6 +25,15 @@ hotpatch-v2.5.2.sh
 # Desktop app build artifacts
 PlexLiveTV-win64.zip
 
+# Windows installer build artifacts (large binaries — attach to releases, don't commit)
+dist/
+windows/bin/
+windows/staging/
+windows/output/
+windows/.cache/
+windows/env.example.txt
+*.exe
+
 # Local override with real credentials
 docker-compose.override.yml
 
