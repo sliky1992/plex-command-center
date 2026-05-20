@@ -1,6 +1,6 @@
 {
   "name": "plex-command-center",
-  "version": "4.0.0",
+  "version": "4.0.1",
   "description": "Advanced Plex monitoring and control dashboard",
   "main": "backend-server-v2.5.2-final.js",
   "scripts": {

@@ -171,7 +171,12 @@ const ago = (dateStr) => {
 
 function App() {
   // Auth state
-  const [authState, setAuthState] = useState('checking'); // checking, login, authenticated
+  const [authState, setAuthState] = useState('checking'); // checking, login, pwchange, authenticated
+  const [pwChangeCurrent, setPwChangeCurrent] = useState('');
+  const [pwChangeNew, setPwChangeNew] = useState('');
+  const [pwChangeConfirm, setPwChangeConfirm] = useState('');
+  const [pwChangeLoading, setPwChangeLoading] = useState(false);
+  const [pwChangeError, setPwChangeError] = useState('');
   const [currentUser, setCurrentUser] = useState(null);
   const [loginError, setLoginError] = useState('');
   const [loginUser, setLoginUser] = useState('');
@@ -304,13 +309,22 @@ function App() {
     setTimeout(() => setToast(null), 3000);
   };
 
+  // Defensive: API errors (403, 500) may return an object instead of the expected array.
+  // Wrap setter calls with asArray() so .map() in render never gets a non-array.
+  const asArray = (x) => Array.isArray(x) ? x : [];
+
   // Auth check on mount
   useEffect(() => {
     fetch('/api/auth/me').then(r => {
       if (r.ok) return r.json();
+      // 403 mustChangePassword means we ARE logged in but must rotate password before the app loads
+      if (r.status === 403) return r.json().then(d => { d.__mustChange = true; return d; });
       throw new Error('not authenticated');
     }).then(data => {
+      if (data && data.__mustChange) { setAuthState('pwchange'); return; }
       setCurrentUser(data.user);
+      // user.must_change_password is also surfaced here for completeness
+      if (data.user && data.user.must_change_password) { setAuthState('pwchange'); return; }
       setAuthState('authenticated');
     }).catch(() => setAuthState('login'));
   }, []);
@@ -325,27 +339,64 @@ function App() {
       });
       const data = await r.json();
       if (!r.ok) throw new Error(data.error || 'Login failed');
-      setCurrentUser(data.user); setAuthState('authenticated');
+      setCurrentUser(data.user);
+      // If the server says the password must be changed, gate the app on the change-password screen
+      if (data.mustChangePassword) {
+        setPwChangeCurrent(loginPass); // pre-fill current password from the login attempt
+        setAuthState('pwchange');
+      } else {
+        setAuthState('authenticated');
+      }
     } catch(err) { setLoginError(err.message); }
     setLoginLoading(false);
+  };
+
+  const doChangePassword = async (e) => {
+    e && e.preventDefault();
+    setPwChangeError('');
+    if (pwChangeNew.length < 8) { setPwChangeError('New password must be at least 8 characters.'); return; }
+    if (pwChangeNew !== pwChangeConfirm) { setPwChangeError('Passwords do not match.'); return; }
+    if (pwChangeNew === pwChangeCurrent) { setPwChangeError('New password must differ from current.'); return; }
+    setPwChangeLoading(true);
+    try {
+      const r = await fetch('/api/auth/change-password', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ currentPassword: pwChangeCurrent, newPassword: pwChangeNew })
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || 'Change failed');
+      // Refresh /me so currentUser.must_change_password is cleared, then enter the app
+      const me = await fetch('/api/auth/me').then(x=>x.json()).catch(()=>null);
+      if (me && me.user) setCurrentUser(me.user);
+      setPwChangeCurrent(''); setPwChangeNew(''); setPwChangeConfirm('');
+      setAuthState('authenticated');
+    } catch(err) { setPwChangeError(err.message); }
+    setPwChangeLoading(false);
   };
 
   const doPlexLogin = async () => {
     setLoginLoading(true); setLoginError('');
     try {
+      // Plex requires the SAME X-Plex-Client-Identifier on PIN create, PIN poll, and the
+      // auth URL. Store the full identifier (including pcc- prefix) so all three match.
+      let clientId = localStorage.getItem('pcc_client_id');
+      if (!clientId || !clientId.startsWith('pcc-')) {
+        clientId = 'pcc-' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+        localStorage.setItem('pcc_client_id', clientId);
+      }
       // Create a Plex PIN
       const pinRes = await fetch('https://plex.tv/api/v2/pins?strong=true', {
         method: 'POST',
         headers: {
           'Accept': 'application/json',
           'X-Plex-Product': 'Plex Command Center',
-          'X-Plex-Client-Identifier': 'pcc-' + (localStorage.getItem('pcc_client_id') || (() => { const id = Math.random().toString(36).slice(2); localStorage.setItem('pcc_client_id', id); return id; })())
+          'X-Plex-Client-Identifier': clientId
         }
       });
       const pin = await pinRes.json();
-      const clientId = localStorage.getItem('pcc_client_id');
+      if (!pin?.id || !pin?.code) throw new Error('Plex did not return a PIN — check connectivity to plex.tv');
       // Open Plex auth in popup
-      const authUrl = `https://app.plex.tv/auth#?clientID=${clientId}&code=${pin.code}&context%5Bdevice%5D%5Bproduct%5D=Plex%20Command%20Center`;
+      const authUrl = `https://app.plex.tv/auth#?clientID=${encodeURIComponent(clientId)}&code=${pin.code}&context%5Bdevice%5D%5Bproduct%5D=Plex%20Command%20Center`;
       const popup = window.open(authUrl, 'PlexAuth', 'width=800,height=600');
       // Poll for token
       const pollInterval = setInterval(async () => {
@@ -364,7 +415,8 @@ function App() {
             });
             const loginData = await loginRes.json();
             if (!loginRes.ok) throw new Error(loginData.error || 'Plex login failed');
-            setCurrentUser(loginData.user); setAuthState('authenticated');
+            setCurrentUser(loginData.user);
+            if (loginData.mustChangePassword) setAuthState('pwchange'); else setAuthState('authenticated');
             setLoginLoading(false);
           }
         } catch(e) { /* keep polling */ }
@@ -384,7 +436,7 @@ function App() {
 
   const loadAdminUsers = async () => {
     const r = await fetch('/api/admin/users').then(x=>x.json()).catch(()=>[]);
-    setAdminUsers(r);
+    setAdminUsers(asArray(r));
   };
 
   const createUser = async () => {
@@ -408,9 +460,9 @@ function App() {
     loadAdminUsers();
   };
 
-  const loadSecLive = async () => { const r = await fetch('/api/security/connections/live').then(x=>x.json()).catch(()=>[]); setSecLive(r); };
-  const loadSecHistory = async () => { const r = await fetch(`/api/security/connections?days=${secDaysFilter}`).then(x=>x.json()).catch(()=>[]); setSecHistory(r); };
-  const loadSecBlocked = async () => { const r = await fetch('/api/security/blocked').then(x=>x.json()).catch(()=>[]); setSecBlocked(r); };
+  const loadSecLive = async () => { const r = await fetch('/api/security/connections/live').then(x=>x.json()).catch(()=>[]); setSecLive(asArray(r)); };
+  const loadSecHistory = async () => { const r = await fetch(`/api/security/connections?days=${secDaysFilter}`).then(x=>x.json()).catch(()=>[]); setSecHistory(asArray(r)); };
+  const loadSecBlocked = async () => { const r = await fetch('/api/security/blocked').then(x=>x.json()).catch(()=>[]); setSecBlocked(asArray(r)); };
   const doBlock = async () => {
     if (!blockModal) return;
     await fetch('/api/security/block', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({entity_type:blockModal.type, entity_value:blockModal.value, reason:blockReason})});
@@ -432,8 +484,8 @@ function App() {
         fetch('/api/tautulli/users').then(r=>r.json()).catch(()=>[])
       ]);
       setStatus(st); setPlexRes(pr); setDockerRes(dr);
-      setStreams(sess); setRequests(reqs); setCollections(cols);
-      setTopUsers(users); setLibraries(libs); setTautulliUsers(tUsers);
+      setStreams(asArray(sess)); setRequests(asArray(reqs)); setCollections(asArray(cols));
+      setTopUsers(asArray(users)); setLibraries(asArray(libs)); setTautulliUsers(asArray(tUsers));
       setLoading(false);
     } catch(e) { setLoading(false); }
   }, []);
@@ -449,7 +501,7 @@ function App() {
     if (histUser) params.append('user', histUser);
     if (histSearch) params.append('search', histSearch);
     const r = await fetch(`/api/tautulli/history?${params}`).then(x=>x.json()).catch(()=>({data:[]}));
-    setHistory(r.data || []);
+    setHistory(asArray(r && r.data));
   };
 
   useEffect(() => {
@@ -513,11 +565,11 @@ function App() {
       fetch('/api/livetv/genres').then(r=>r.json()).catch(()=>[]),
       fetch('/api/livetv/fillers').then(r=>r.json()).catch(()=>[])
     ]);
-    setLtvNowPlaying(np); setLtvChannels(ch); setLtvGenres(genres); setLtvFillers(fillers);
+    setLtvNowPlaying(asArray(np)); setLtvChannels(asArray(ch)); setLtvGenres(asArray(genres)); setLtvFillers(asArray(fillers));
   };
   const loadLtvGuide = async () => {
     const g = await fetch('/api/livetv/guide?hours=6').then(r=>r.json()).catch(()=>[]);
-    setLtvGuide(g);
+    setLtvGuide(asArray(g));
   };
   useEffect(() => {
     if (tab === 'livetv') { loadLiveTv(); loadLtvGuide(); }
@@ -601,7 +653,7 @@ function App() {
   };
   const ytLoadDownloads = async () => {
     const r = await fetch('/api/livetv/fillers/yt-downloads').then(x=>x.json()).catch(()=>[]);
-    setYtDownloads(r);
+    setYtDownloads(asArray(r));
   };
   const ytCancelDownload = async (id) => {
     await fetch(`/api/livetv/fillers/yt-downloads/${id}`, {method:'DELETE'});
@@ -658,7 +710,7 @@ function App() {
   // --- Settings tab (admin) ---
   const loadSettings = async () => {
     const r = await fetch('/api/settings/services').then(x=>x.json()).catch(()=>[]);
-    setSettingsServices(r);
+    setSettingsServices(asArray(r));
   };
   useEffect(() => {
     if (tab === 'settings') loadSettings();
@@ -894,6 +946,44 @@ function App() {
             {loginLoading ? 'Signing in...' : 'Sign In'}
           </button>
         </form>
+      </div>
+    </div>
+  );
+
+  // Forced password change screen — shown when the server signals mustChangePassword: true.
+  // The user is logged in (we have a session cookie) but the backend blocks all routes except
+  // /api/auth/me, /api/auth/logout and /api/auth/change-password until this is done.
+  if (authState === 'pwchange') return (
+    <div className="login-page">
+      <div className="login-box">
+        <div className="login-logo">
+          <div className="logo-icon" style={{background:'linear-gradient(135deg,#f59e0b,#ef4444)',borderRadius:'14px',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'1.6rem',width:'56px',height:'56px',margin:'0 auto .75rem'}}>🔒</div>
+          <h2 style={{fontSize:'1.3rem',fontWeight:700}}>Change your password</h2>
+          <p style={{fontSize:'.8rem',color:'#94a3b8',marginTop:'.3rem'}}>For security, you must set a new password before continuing.</p>
+        </div>
+        <form onSubmit={doChangePassword}>
+          <div className="form-row">
+            <label className="form-label" style={{fontSize:'.75rem'}}>Current password</label>
+            <input className="form-input" type="password" placeholder="Current password" value={pwChangeCurrent} onChange={e=>setPwChangeCurrent(e.target.value)} autoFocus/>
+          </div>
+          <div className="form-row">
+            <label className="form-label" style={{fontSize:'.75rem'}}>New password (min 8 chars)</label>
+            <input className="form-input" type="password" placeholder="New password" value={pwChangeNew} onChange={e=>setPwChangeNew(e.target.value)}/>
+          </div>
+          <div className="form-row">
+            <label className="form-label" style={{fontSize:'.75rem'}}>Confirm new password</label>
+            <input className="form-input" type="password" placeholder="Confirm new password" value={pwChangeConfirm} onChange={e=>setPwChangeConfirm(e.target.value)}/>
+          </div>
+          {pwChangeError && <div className="alert-box alert-error" style={{marginBottom:'1rem',fontSize:'.8rem'}}>{pwChangeError}</div>}
+          <button type="submit" className="btn btn-primary" style={{width:'100%'}} disabled={pwChangeLoading}>
+            {pwChangeLoading ? 'Saving...' : 'Set new password'}
+          </button>
+        </form>
+        <div style={{textAlign:'center',marginTop:'.75rem'}}>
+          <button className="btn-link" style={{fontSize:'.75rem',color:'#94a3b8',background:'none',border:'none',cursor:'pointer'}} onClick={async()=>{ await fetch('/api/auth/logout',{method:'POST'}).catch(()=>{}); setCurrentUser(null); setAuthState('login'); }}>
+            Sign out instead
+          </button>
+        </div>
       </div>
     </div>
   );
