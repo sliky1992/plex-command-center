@@ -111,7 +111,18 @@ app.use((req, res, next) => {
   console.log(`[REQ] ${req.method} ${req.path} from ${req.ip}`);
   next();
 });
-app.use(express.static(paths.publicDir));
+// Static handler. We deliberately mark index.html and sw.js as no-store: the inline React
+// app in index.html ships every new feature/bug-fix, and sw.js controls cache invalidation
+// for everything else. If either gets HTTP-cached by the browser, a deploy looks like it
+// never happened (user sees the old UI; SW happily serves the old cached HTML). Other
+// assets keep default Express caching.
+app.use(express.static(paths.publicDir, {
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith('index.html') || filePath.endsWith('sw.js')) {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    }
+  }
+}));
 
 // Auth middleware MUST be mounted before any /api/* route is registered. Express applies
 // middleware in registration order, so anything declared above this line is public.
