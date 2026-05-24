@@ -827,6 +827,17 @@ function App() {
     if (r.success) showToast('Bulk search queued in Bazarr');
     else showToast('Failed: ' + (r.error||'Unknown'), 'error');
   };
+  const subsRefresh = async () => {
+    if (!confirm('Ask Bazarr to re-sync series/movies and rescan disk? Use this when items appear in the missing list that you know already have subs — Bazarr\'s cache is stale.')) return;
+    setSubsLoading(true);
+    const r = await fetch('/api/bazarr/refresh', { method: 'POST' }).then(x=>x.json()).catch(e=>({error:e.message}));
+    if (r.success) {
+      showToast('Refresh queued — wait ~30s then reload the list');
+      // Auto-reload the missing list after a short delay so the user sees the cleaned-up state.
+      setTimeout(loadSubsState, 30000);
+    } else showToast('Failed: ' + (r.error||'Unknown'), 'error');
+    setSubsLoading(false);
+  };
   // Auto-poll downloads when active
   useEffect(() => {
     if (tab !== 'livetv' || ltvView !== 'fillers') return;
@@ -1645,6 +1656,9 @@ function App() {
                       onChange={e=>setSubsSearch(e.target.value)}/>
                     <button className="btn-sm btn-outline" onClick={loadSubsState} disabled={subsLoading}>
                       {subsLoading ? '…' : 'Refresh'}
+                    </button>
+                    <button className="btn-sm btn-outline" onClick={subsRefresh} disabled={subsLoading || !!error} title="Ask Bazarr to re-sync from Sonarr/Radarr and rescan disk. Fixes items that show as missing but already have subs.">
+                      Re-sync Bazarr
                     </button>
                     <button className="btn-sm btn-primary" onClick={subsSearchAll} disabled={subsLoading || !!error}>
                       Search all wanted

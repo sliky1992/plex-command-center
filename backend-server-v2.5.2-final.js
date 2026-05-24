@@ -2502,46 +2502,104 @@ app.get('/api/bazarr/missing', requireAdmin, async (req, res) => {
   }
 });
 
+// Tells Bazarr to rescan its libraries from disk. The "wanted/missing" list often goes stale
+// after users add subs manually or after the file layout changes — running this clears the
+// false-positive items (the user's "Bazarr says X is missing but I have subs" complaint).
+app.post('/api/bazarr/refresh', requireAdmin, async (req, res) => {
+  if (!config.bazarr.url || !config.bazarr.apiKey) return res.status(400).json({ error: 'Bazarr not configured' });
+  // Bazarr uses separate sync tasks per source (sonarr/radarr) plus disk-scan jobs. No single
+  // combined task exists, so we trigger several and report which succeeded.
+  const taskIds = ['update_series', 'update_movies', 'sync_episodes'];
+  const results = await Promise.all(taskIds.map(async (taskid) => {
+    try {
+      await axios.post(`${_bazarrBase()}/api/system/tasks`, null, {
+        params: { taskid },
+        headers: { 'X-API-KEY': config.bazarr.apiKey, Accept: 'application/json' },
+        timeout: 10000
+      });
+      return { taskid, ok: true };
+    } catch (e) {
+      return { taskid, ok: false, error: _bazarrErr(e) };
+    }
+  }));
+  const anyOk = results.some(r => r.ok);
+  if (!anyOk) return res.status(502).json({ error: results.map(r => `${r.taskid}: ${r.error}`).join('; ') });
+  settingsAudit(req.user?.username, 'bazarr', '*', 'refresh', `triggered ${results.filter(r=>r.ok).map(r=>r.taskid).join(',')}`);
+  res.json({ success: true, results });
+});
+
+// Pulls a human-readable error out of a Bazarr axios failure so the UI doesn't just see
+// "Internal Server Error". Bazarr surfaces validation errors as JSON, as plain text, or as
+// HTML depending on the route — handle all three.
+function _bazarrErr(e) {
+  const r = e.response;
+  if (!r) return e.message || 'Bazarr unreachable';
+  const body = r.data;
+  if (typeof body === 'string') return `Bazarr ${r.status}: ${body.slice(0, 200)}`;
+  if (body && typeof body === 'object') {
+    return `Bazarr ${r.status}: ${body.error || body.message || JSON.stringify(body).slice(0, 200)}`;
+  }
+  return `Bazarr ${r.status} ${r.statusText || ''}`.trim();
+}
+
 // Trigger Bazarr's "search missing subtitles" for a specific item. Bazarr does the rest
-// (searches enabled providers, downloads if a match is found). This is the same action you'd
-// click inside Bazarr — we just surface it from one place.
+// (searches enabled providers, downloads if a match is found). Bazarr's own PATCH route
+// reads the IDs from the *query string* (request.args) and the action name is the literal
+// string "search-missing" (NOT "search-missing-subtitles" — that's what the prior version
+// sent, which is why every call 500'd). Confirmed against bazarr/api/episodes + movies.
 app.post('/api/bazarr/search/:type/:id', requireAdmin, async (req, res) => {
   const { type, id } = req.params;
   if (!['episode','movie'].includes(type)) return res.status(400).json({ error: 'type must be episode or movie' });
   if (!config.bazarr.url || !config.bazarr.apiKey) return res.status(400).json({ error: 'Bazarr not configured' });
-  try {
-    // Bazarr v1 expects PATCH with an "action" body + the id in the URL or as a query param.
-    // The exact shape varies by Bazarr version; we try the modern form first and fall back.
-    const path = type === 'episode' ? '/api/episodes' : '/api/movies';
-    const idField = type === 'episode' ? 'episodeid' : 'radarrid';
+  const numericId = parseInt(id);
+  if (!Number.isFinite(numericId)) return res.status(400).json({ error: 'id must be numeric' });
+
+  const path = type === 'episode' ? '/api/episodes' : '/api/movies';
+  const idField = type === 'episode' ? 'episodeid' : 'radarrid';
+
+  // Bazarr's query parser is forgiving about list vs. scalar — it'll accept either a bare
+  // numeric ID or a JSON-encoded list. Try a JSON list first (the format Bazarr's own web UI
+  // sends, and what newer Sonarr/Radarr forks expect), then fall back to the bare integer.
+  const attempts = [
+    { [idField]: `[${numericId}]`, action: 'search-missing' },
+    { [idField]: String(numericId), action: 'search-missing' }
+  ];
+  let lastError = null;
+  for (const params of attempts) {
     try {
-      await bazarrPatch(path, { [idField]: [parseInt(id)], action: 'search-missing-subtitles' });
-    } catch (e1) {
-      // Fallback to query-param style (older Bazarr builds)
-      await bazarrPatch(path, null, { [idField]: id, action: 'search-missing-subtitles' });
-    }
-    settingsAudit(req.user?.username, 'bazarr', `${type}:${id}`, 'search', 'triggered search-missing-subtitles');
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: e.response?.data?.error || e.response?.statusText || e.message });
+      await bazarrPatch(path, null, params);
+      settingsAudit(req.user?.username, 'bazarr', `${type}:${id}`, 'search', `triggered search-missing (params=${JSON.stringify(params)})`);
+      return res.json({ success: true });
+    } catch (e) { lastError = e; }
   }
+  console.warn(`[BAZARR] search ${type}:${id} failed:`, _bazarrErr(lastError));
+  res.status(502).json({ error: _bazarrErr(lastError) });
 });
 
 app.post('/api/bazarr/search-all', requireAdmin, async (req, res) => {
   if (!config.bazarr.url || !config.bazarr.apiKey) return res.status(400).json({ error: 'Bazarr not configured' });
-  try {
-    // Bazarr exposes "search wanted" jobs via /api/system/tasks. Triggering them runs in
-    // the background and respects provider rate-limits.
-    await axios.post(`${_bazarrBase()}/api/system/tasks`, null, {
-      params: { taskid: 'wanted_search_missing_subtitles' },
-      headers: { 'X-API-KEY': config.bazarr.apiKey, Accept: 'application/json' },
-      timeout: 10000
-    });
-    settingsAudit(req.user?.username, 'bazarr', '*', 'search-all', 'triggered wanted_search_missing_subtitles');
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: e.response?.data?.error || e.message });
+  // Bazarr schedules wanted-search as TWO separate jobs (one for movies, one for series).
+  // There's no combined "wanted_search_missing_subtitles" task id — sending that name 404'd
+  // the previous build. We trigger both and report on whichever fail.
+  const taskIds = ['wanted_search_missing_subtitles_movies', 'wanted_search_missing_subtitles_series'];
+  const results = await Promise.all(taskIds.map(async (taskid) => {
+    try {
+      await axios.post(`${_bazarrBase()}/api/system/tasks`, null, {
+        params: { taskid },
+        headers: { 'X-API-KEY': config.bazarr.apiKey, Accept: 'application/json' },
+        timeout: 10000
+      });
+      return { taskid, ok: true };
+    } catch (e) {
+      return { taskid, ok: false, error: _bazarrErr(e) };
+    }
+  }));
+  const fails = results.filter(r => !r.ok);
+  if (fails.length === results.length) {
+    return res.status(502).json({ error: fails.map(f => `${f.taskid}: ${f.error}`).join('; ') });
   }
+  settingsAudit(req.user?.username, 'bazarr', '*', 'search-all', `triggered ${results.filter(r=>r.ok).map(r=>r.taskid).join(',')}`);
+  res.json({ success: true, results });
 });
 
 // ============================================
