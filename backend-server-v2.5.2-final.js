@@ -9005,7 +9005,7 @@ function denyPageHtml(ip, country) {
 let _gatewayServer = null;
 let _gatewayMeta = { port: 0, target: '', lastError: null };
 
-function startGateway() {
+async function startGateway() {
   if (_gatewayServer) return { ok: true, alreadyRunning: true, ..._gatewayMeta };
   const cfg = readGatewayConfig();
   if (!cfg.target) {
