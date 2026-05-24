@@ -613,6 +613,35 @@ function App() {
     else showToast('Stop failed: ' + (r.error||'Unknown'), 'error');
   };
 
+  // Quick-allow actions from the gateway log so the admin doesn't have to bounce to the
+  // Geofence tab. After mutating, refresh BOTH panes so the user sees the new whitelist /
+  // allowed-country entry AND the gateway log re-decides the next attempt as Allowed.
+  const gwQuickAllowIp = async (ip, country) => {
+    if (!ip || !confirm(`Whitelist IP ${ip}${country?` (${country})`:''}? Future traffic from this exact IP will bypass the geofence.`)) return;
+    const r = await fetch('/api/security/regional-whitelist', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ ip_address: ip, reason: `Quick-allow from gateway log${country?` (${country})`:''}` })
+    }).then(x=>x.json()).catch(e=>({error:e.message}));
+    if (r.success) { showToast(`Whitelisted ${ip}`); await loadGateway(); await loadGeofence(); }
+    else showToast('Failed: ' + (r.error||'Unknown'), 'error');
+  };
+  const gwQuickAllowCountry = async (country) => {
+    if (!country || country === 'Unknown') return showToast('Country unknown — pick a specific IP to whitelist instead', 'error');
+    // Pull the latest settings inline. If geoSettings is null because the user never visited
+    // the Geofence tab in this session, reading our cached empty list and PUTting it would
+    // clobber existing allow-list entries (e.g. Israel + Local).
+    const fresh = await fetch('/api/security/regional-settings').then(x=>x.json()).catch(()=>null);
+    const cur = fresh?.allowed_countries || [];
+    if (cur.includes(country)) return showToast(`${country} is already allowed`);
+    if (!confirm(`Add "${country}" to the allowed-countries list? All traffic from this country will bypass the geofence going forward.\n\nCurrent: ${cur.join(', ') || '(none)'}`)) return;
+    const r = await fetch('/api/security/regional-settings', {
+      method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ allowed_countries: [...cur, country] })
+    }).then(x=>x.json()).catch(e=>({error:e.message}));
+    if (r.success) { showToast(`Allowed country: ${country}`); await loadGateway(); await loadGeofence(); }
+    else showToast('Failed: ' + (r.error||'Unknown'), 'error');
+  };
+
   const fetchAll = useCallback(async () => {
     try {
       const [st, pr, dr, sess, reqs, cols, users, libs, tUsers] = await Promise.all([
@@ -2153,7 +2182,7 @@ function App() {
                       </div>
                       {gwLog.length===0 ? <div style={{fontSize:'.75rem',color:'#64748b'}}>No log entries yet</div> : (
                         <table className="hist-table">
-                          <thead><tr><th>Time</th><th>IP</th><th>Country</th><th>Path</th><th>Result</th></tr></thead>
+                          <thead><tr><th>Time</th><th>IP</th><th>Country</th><th>Path</th><th>Result</th><th>Quick allow</th></tr></thead>
                           <tbody>
                             {gwLog.map(l => (
                               <tr key={l.id}>
@@ -2162,6 +2191,18 @@ function App() {
                                 <td>{l.country || ''}</td>
                                 <td style={{maxWidth:'260px',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{l.url_path || l.path}</td>
                                 <td><span className={`status-badge ${l.allowed?'status-approved':'status-declined'}`}>{l.allowed?'Allowed':'Denied'}</span></td>
+                                <td>
+                                  {l.allowed ? (
+                                    <span style={{fontSize:'.7rem',color:'#64748b'}}>—</span>
+                                  ) : (
+                                    <div style={{display:'flex',gap:'.3rem'}}>
+                                      <button className="btn-sm btn-outline" style={{fontSize:'.7rem'}} onClick={()=>gwQuickAllowIp(l.ip_address, l.country)} title={`Whitelist ${l.ip_address}`}>+ IP</button>
+                                      {l.country && l.country !== 'Unknown' && l.country !== 'Local' && (
+                                        <button className="btn-sm btn-outline" style={{fontSize:'.7rem'}} onClick={()=>gwQuickAllowCountry(l.country)} title={`Allow all of ${l.country}`}>+ Country</button>
+                                      )}
+                                    </div>
+                                  )}
+                                </td>
                               </tr>
                             ))}
                           </tbody>
