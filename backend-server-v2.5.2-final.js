@@ -8672,10 +8672,15 @@ app.get('/api/security/gateway-log', requireAdmin, (req, res) => {
   res.json(pccDb.prepare(sql).all(limit));
 });
 app.get('/api/security/gateway-stats', requireAdmin, (req, res) => {
+  // Earlier revisions referenced GATEWAY_ENABLED/PORT/TARGET as module-scoped variables, but
+  // those names only ever existed as DB-seed strings — calling this endpoint threw a bare
+  // ReferenceError that bubbled out as a 500. Source-of-truth is the regional_settings table
+  // via readGatewayConfig(), same as the /gateway endpoint already uses.
+  const cfg = readGatewayConfig();
   res.json({
-    enabled: GATEWAY_ENABLED,
-    port: GATEWAY_PORT,
-    target: GATEWAY_TARGET,
+    enabled: cfg.enabled,
+    port: cfg.port,
+    target: cfg.target,
     totals: pccDb.prepare("SELECT SUM(CASE WHEN allowed=1 THEN 1 ELSE 0 END) AS allowed, SUM(CASE WHEN allowed=0 THEN 1 ELSE 0 END) AS denied FROM gateway_log WHERE created_at > datetime('now','-7 days')").get()
   });
 });
