@@ -161,12 +161,24 @@ const fmtUptime = (s) => {
   return d>0?`${d}d ${h}h ${m}m`:`${h}h ${m}m`;
 };
 const ago = (dateStr) => {
-  const d = new Date(dateStr);
-  const diff = Date.now()-d;
-  const days=Math.floor(diff/86400000),hrs=Math.floor(diff/3600000),mins=Math.floor(diff/60000);
-  if(days>0) return `${days}d ago`;
-  if(hrs>0) return `${hrs}h ago`;
-  return `${mins}m ago`;
+  if (!dateStr) return '';
+  let s = String(dateStr);
+  // SQLite's datetime('now') emits "YYYY-MM-DD HH:MM:SS" with no timezone marker. JavaScript
+  // parses that as the BROWSER'S local time, but SQLite stores it as UTC — so on a non-UTC
+  // client the relative-time math is off by exactly the local UTC offset (e.g. -3h in Israel,
+  // +9h in Tokyo). Detect the naive shape and rewrite it to a proper UTC ISO string before
+  // parsing. Strings that already carry a timezone (Z, +HH:MM, -HH:MM) are left alone.
+  if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?$/.test(s)) {
+    s = s.replace(' ', 'T') + 'Z';
+  }
+  const d = new Date(s);
+  const diff = Date.now() - d;
+  if (diff < 0) return 'just now'; // clock skew or future-dated row
+  const days = Math.floor(diff/86400000), hrs = Math.floor(diff/3600000), mins = Math.floor(diff/60000);
+  if (days > 0) return `${days}d ago`;
+  if (hrs > 0) return `${hrs}h ago`;
+  if (mins > 0) return `${mins}m ago`;
+  return 'just now';
 };
 
 function App() {
