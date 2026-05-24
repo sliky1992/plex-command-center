@@ -3598,6 +3598,11 @@ async function cwRestoreItem(ratingKey, actor) {
   if (!config.plex.url || !config.plex.token) return { ok: false, error: 'Plex not configured' };
 
   try {
+    // Plex's /:/timeline endpoint refuses any request that doesn't identify itself with an
+    // X-Plex-Client-Identifier (returns bare 400 Bad Request HTML — no body). The other
+    // X-Plex-* headers (Product/Version/Device-Name/Platform) aren't strictly required for
+    // the 200 response but Plex attributes the event to a "Client" in its session list, so
+    // sending them makes the activity legible in Plex's own logs / Tautulli history.
     await axios.get(`${config.plex.url}/:/timeline`, {
       params: {
         ratingKey: snap.rating_key,
@@ -3606,8 +3611,14 @@ async function cwRestoreItem(ratingKey, actor) {
         state: 'stopped',
         time: snap.view_offset,
         duration: snap.duration || (snap.view_offset + 1),
-        'X-Plex-Token': config.plex.token
+        'X-Plex-Token': config.plex.token,
+        'X-Plex-Client-Identifier': 'pcc-cw-restore',
+        'X-Plex-Product': 'Plex Command Center',
+        'X-Plex-Version': '4.0.5',
+        'X-Plex-Device-Name': 'PCC Continue-Watching Restore',
+        'X-Plex-Platform': 'PCC'
       },
+      headers: { Accept: 'application/json' },
       timeout: 10000
     });
     pccDb.prepare("UPDATE cw_snapshots SET restored_at = datetime('now'), restored_by = ? WHERE account_id='owner' AND rating_key = ?")
@@ -8651,8 +8662,8 @@ app.post('/api/security/gateway/stop', requireAdmin, (req, res) => {
   res.json({ success: r.ok, ...r });
 });
 
-// gateway_log API for the UI
-app.get('/api/security/gateway-log', (req, res) => {
+// gateway_log API for the UI — admin-gated like the rest of /api/security/*.
+app.get('/api/security/gateway-log', requireAdmin, (req, res) => {
   const limit = Math.min(500, parseInt(req.query.limit) || 100);
   const onlyDenied = req.query.denied === '1';
   const sql = onlyDenied
@@ -8660,7 +8671,7 @@ app.get('/api/security/gateway-log', (req, res) => {
     : 'SELECT * FROM gateway_log ORDER BY created_at DESC LIMIT ?';
   res.json(pccDb.prepare(sql).all(limit));
 });
-app.get('/api/security/gateway-stats', (req, res) => {
+app.get('/api/security/gateway-stats', requireAdmin, (req, res) => {
   res.json({
     enabled: GATEWAY_ENABLED,
     port: GATEWAY_PORT,

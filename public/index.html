@@ -194,6 +194,19 @@ function App() {
   const [secDaysFilter, setSecDaysFilter] = useState(7);
   const [blockModal, setBlockModal] = useState(null); // {type, value}
   const [blockReason, setBlockReason] = useState('');
+  // Geofence + Gateway
+  const [geoSettings, setGeoSettings] = useState(null); // {enabled, allowed_countries, action, telegram_chat_id, telegram_bot_token_set, telegram_webhook_secret_set}
+  const [geoWhitelist, setGeoWhitelist] = useState([]);
+  const [geoAlerts, setGeoAlerts] = useState([]);
+  const [geoCountryDraft, setGeoCountryDraft] = useState('');
+  const [geoIpDraft, setGeoIpDraft] = useState('');
+  const [geoIpReason, setGeoIpReason] = useState('');
+  const [geoTelegramDraft, setGeoTelegramDraft] = useState({ bot_token: '', chat_id: '', webhook_secret: '' });
+  const [gwState, setGwState] = useState(null); // {enabled,port,target,status,lastError,geofenceEnabled}
+  const [gwStats, setGwStats] = useState(null);
+  const [gwLog, setGwLog] = useState([]);
+  const [gwShowDeniedOnly, setGwShowDeniedOnly] = useState(false);
+  const [gwDraft, setGwDraft] = useState({ port: '', target: '' });
 
   const [tab, setTab] = useState('dashboard');
   const [status, setStatus] = useState(null);
@@ -479,6 +492,104 @@ function App() {
     setBlockModal(null); setBlockReason(''); showToast('Blocked'); loadSecLive(); loadSecBlocked();
   };
   const doUnblock = async (id) => { await fetch(`/api/security/block/${id}`, {method:'DELETE'}); showToast('Unblocked'); loadSecBlocked(); };
+
+  // Geofence: regional settings, IP whitelist, alerts ----------------------------------
+  const loadGeofence = async () => {
+    const [s, wl, al] = await Promise.all([
+      fetch('/api/security/regional-settings').then(x=>x.json()).catch(()=>null),
+      fetch('/api/security/regional-whitelist').then(x=>x.json()).catch(()=>[]),
+      fetch('/api/security/alerts?decision=pending').then(x=>x.json()).catch(()=>[])
+    ]);
+    setGeoSettings(s); setGeoWhitelist(asArray(wl)); setGeoAlerts(asArray(al));
+    // Reset secret draft fields so they don't carry across opens.
+    setGeoTelegramDraft({ bot_token: '', chat_id: s?.telegram_chat_id || '', webhook_secret: '' });
+  };
+  const saveGeofence = async (patch) => {
+    const r = await fetch('/api/security/regional-settings', {
+      method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(patch)
+    }).then(x=>x.json()).catch(e=>({error:e.message}));
+    if (r.success) { showToast('Geofence updated'); loadGeofence(); }
+    else showToast('Save failed: ' + (r.error||'Unknown'), 'error');
+  };
+  const addGeoCountry = () => {
+    const c = (geoCountryDraft||'').trim();
+    if (!c) return;
+    const list = Array.from(new Set([...(geoSettings?.allowed_countries||[]), c]));
+    saveGeofence({ allowed_countries: list });
+    setGeoCountryDraft('');
+  };
+  const removeGeoCountry = (c) => {
+    const list = (geoSettings?.allowed_countries||[]).filter(x => x !== c);
+    saveGeofence({ allowed_countries: list });
+  };
+  const addWhitelistIp = async () => {
+    const ip = (geoIpDraft||'').trim();
+    if (!ip) return;
+    const r = await fetch('/api/security/regional-whitelist', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ ip_address: ip, reason: geoIpReason || null })
+    }).then(x=>x.json()).catch(e=>({error:e.message}));
+    if (r.success) { setGeoIpDraft(''); setGeoIpReason(''); loadGeofence(); }
+    else showToast('Add failed: ' + (r.error||'Unknown'), 'error');
+  };
+  const removeWhitelistIp = async (id) => {
+    if (!confirm('Remove this IP from the whitelist?')) return;
+    await fetch(`/api/security/regional-whitelist/${id}`, { method:'DELETE' });
+    loadGeofence();
+  };
+  const resolveAlert = async (uuid, decision) => {
+    const r = await fetch(`/api/security/alerts/${uuid}/resolve`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ decision })
+    }).then(x=>x.json()).catch(e=>({error:e.message}));
+    if (r.success) { showToast(`Alert resolved: ${decision}`); loadGeofence(); }
+    else showToast('Resolve failed: ' + (r.error||'Unknown'), 'error');
+  };
+  const testTelegram = async () => {
+    const r = await fetch('/api/security/regional-settings/test-telegram', { method:'POST' }).then(x=>x.json()).catch(e=>({error:e.message}));
+    if (r.success) showToast('Test message sent — check Telegram');
+    else showToast('Failed: ' + (r.error||'Unknown'), 'error');
+  };
+  const saveTelegram = async () => {
+    const patch = {};
+    // Only send fields the user actually filled. Empty bot_token / webhook_secret means
+    // "leave as-is" so opening + saving doesn't accidentally wipe stored secrets.
+    if (geoTelegramDraft.bot_token) patch.telegram_bot_token = geoTelegramDraft.bot_token;
+    if (geoTelegramDraft.webhook_secret) patch.telegram_webhook_secret = geoTelegramDraft.webhook_secret;
+    patch.telegram_chat_id = geoTelegramDraft.chat_id; // chat_id is non-secret, always overwrite
+    saveGeofence(patch);
+  };
+
+  // Gateway: reverse-proxy controls + log/stats -----------------------------------------
+  const loadGateway = async () => {
+    const [g, st, lg] = await Promise.all([
+      fetch('/api/security/gateway').then(x=>x.json()).catch(()=>null),
+      fetch('/api/security/gateway-stats').then(x=>x.json()).catch(()=>null),
+      fetch(`/api/security/gateway-log?limit=100${gwShowDeniedOnly?'&denied=1':''}`).then(x=>x.json()).catch(()=>[])
+    ]);
+    setGwState(g); setGwStats(st); setGwLog(asArray(lg));
+    if (g) setGwDraft({ port: String(g.port||32400), target: g.target || '' });
+  };
+  const saveGateway = async () => {
+    const port = parseInt(gwDraft.port);
+    const r = await fetch('/api/security/gateway', {
+      method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ port, target: gwDraft.target })
+    }).then(x=>x.json()).catch(e=>({error:e.message}));
+    if (r.success) { showToast(r.restarted ? 'Saved (gateway restarted)' : 'Saved'); loadGateway(); }
+    else showToast('Save failed: ' + (r.error||'Unknown'), 'error');
+  };
+  const startGateway = async () => {
+    const r = await fetch('/api/security/gateway/start', { method:'POST' }).then(x=>x.json()).catch(e=>({error:e.message}));
+    if (r.success) { showToast(`Gateway started on :${r.port}`); loadGateway(); }
+    else showToast('Start failed: ' + (r.error||'Unknown'), 'error');
+  };
+  const stopGateway = async () => {
+    if (!confirm('Stop the gateway? Connections through it will be dropped.')) return;
+    const r = await fetch('/api/security/gateway/stop', { method:'POST' }).then(x=>x.json()).catch(e=>({error:e.message}));
+    if (r.success) { showToast('Gateway stopped'); loadGateway(); }
+    else showToast('Stop failed: ' + (r.error||'Unknown'), 'error');
+  };
 
   const fetchAll = useCallback(async () => {
     try {
@@ -1723,6 +1834,8 @@ function App() {
               <button className={`toggle-opt ${secView==='live'?'active':''}`} onClick={()=>{setSecView('live');loadSecLive();}}>Live Connections</button>
               <button className={`toggle-opt ${secView==='history'?'active':''}`} onClick={()=>{setSecView('history');loadSecHistory();}}>Connection History</button>
               <button className={`toggle-opt ${secView==='blocked'?'active':''}`} onClick={()=>{setSecView('blocked');loadSecBlocked();}}>Blocked ({secBlocked.length})</button>
+              <button className={`toggle-opt ${secView==='geofence'?'active':''}`} onClick={()=>{setSecView('geofence');loadGeofence();}}>Geofence</button>
+              <button className={`toggle-opt ${secView==='gateway'?'active':''}`} onClick={()=>{setSecView('gateway');loadGateway();}}>Gateway</button>
             </div>
 
             {secView==='live' && (
@@ -1814,6 +1927,185 @@ function App() {
                         <button className="btn-sm btn-approve" onClick={()=>doUnblock(b.id)}>Unblock</button>
                       </div>
                     ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {secView==='geofence' && (
+              <div>
+                {!geoSettings ? <div className="empty">Loading…</div> : (
+                  <div style={{display:'grid',gap:'1rem',maxWidth:'860px'}}>
+                    <div className="stream-card">
+                      <div style={{fontWeight:600,marginBottom:'.5rem'}}>Regional policy</div>
+                      <div style={{fontSize:'.75rem',color:'#94a3b8',marginBottom:'.6rem'}}>
+                        When a Plex session connects from a country NOT in the allow-list, take the
+                        chosen action. "Alert only" sends a Telegram alert; "Auto-terminate" also
+                        kills the stream. Sessions on whitelisted IPs are always exempt.
+                      </div>
+                      <label style={{display:'flex',alignItems:'center',gap:'.4rem',fontSize:'.85rem',marginBottom:'.6rem'}}>
+                        <input type="checkbox" checked={!!geoSettings.enabled} onChange={e=>saveGeofence({enabled: e.target.checked})}/>
+                        Enable geofence
+                      </label>
+                      <div style={{marginBottom:'.5rem'}}>
+                        <div style={{fontSize:'.75rem',color:'#cbd5e1',marginBottom:'.3rem'}}>Allowed countries</div>
+                        <div style={{display:'flex',flexWrap:'wrap',gap:'.3rem',marginBottom:'.4rem'}}>
+                          {(geoSettings.allowed_countries||[]).map(c => (
+                            <span key={c} className="status-badge status-available" style={{display:'inline-flex',alignItems:'center',gap:'.3rem'}}>
+                              {c}
+                              <button className="modal-close" style={{padding:0,fontSize:'.7rem',background:'none',border:'none',color:'#94a3b8',cursor:'pointer'}} onClick={()=>removeGeoCountry(c)}>×</button>
+                            </span>
+                          ))}
+                          {(geoSettings.allowed_countries||[]).length===0 && <span style={{fontSize:'.75rem',color:'#94a3b8'}}>None — everything will be flagged</span>}
+                        </div>
+                        <div style={{display:'flex',gap:'.3rem'}}>
+                          <input className="form-input" style={{width:'180px',fontSize:'.8rem'}} placeholder="Country (e.g. Israel)" value={geoCountryDraft} onChange={e=>setGeoCountryDraft(e.target.value)} onKeyDown={e=>e.key==='Enter' && addGeoCountry()}/>
+                          <button className="btn-sm btn-outline" onClick={addGeoCountry}>Add</button>
+                        </div>
+                        <div style={{fontSize:'.65rem',color:'#64748b',marginTop:'.25rem'}}>"Local" matches LAN/Tailscale/Docker IPs that don't have a public geo lookup.</div>
+                      </div>
+                      <div>
+                        <div style={{fontSize:'.75rem',color:'#cbd5e1',marginBottom:'.3rem'}}>Action on foreign connection</div>
+                        <select className="form-select" style={{maxWidth:'240px'}} value={geoSettings.action} onChange={e=>saveGeofence({action: e.target.value})}>
+                          <option value="alert_only">Alert only (Telegram)</option>
+                          <option value="auto_terminate">Auto-terminate + alert</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div className="stream-card">
+                      <div style={{fontWeight:600,marginBottom:'.5rem'}}>Telegram alerts</div>
+                      <div style={{fontSize:'.75rem',color:'#94a3b8',marginBottom:'.6rem'}}>
+                        Create a bot via @BotFather on Telegram, then send it a message and use
+                        <code> https://api.telegram.org/bot&lt;TOKEN&gt;/getUpdates</code> to find your chat id.
+                        Bot token is stored encrypted; leave the field blank to keep the current one.
+                        Status: {geoSettings.telegram_bot_token_set ? <strong style={{color:'#34d399'}}>configured</strong> : <strong style={{color:'#f87171'}}>not set</strong>}.
+                      </div>
+                      <div style={{display:'grid',gridTemplateColumns:'140px 1fr',gap:'.4rem .6rem',alignItems:'center',fontSize:'.8rem'}}>
+                        <label>Bot token</label>
+                        <input className="form-input" type="password" placeholder={geoSettings.telegram_bot_token_set?'••• (saved — type to replace)':'paste token'} value={geoTelegramDraft.bot_token} onChange={e=>setGeoTelegramDraft({...geoTelegramDraft, bot_token: e.target.value})}/>
+                        <label>Chat ID</label>
+                        <input className="form-input" placeholder="e.g. 123456789" value={geoTelegramDraft.chat_id} onChange={e=>setGeoTelegramDraft({...geoTelegramDraft, chat_id: e.target.value})}/>
+                        <label>Webhook secret</label>
+                        <input className="form-input" type="password" placeholder={geoSettings.telegram_webhook_secret_set?'••• (saved)':'optional — gates inbound Telegram callbacks'} value={geoTelegramDraft.webhook_secret} onChange={e=>setGeoTelegramDraft({...geoTelegramDraft, webhook_secret: e.target.value})}/>
+                      </div>
+                      <div style={{display:'flex',gap:'.4rem',marginTop:'.6rem'}}>
+                        <button className="btn-sm btn-primary" onClick={saveTelegram}>Save</button>
+                        <button className="btn-sm btn-outline" onClick={testTelegram} disabled={!geoSettings.telegram_bot_token_set || !geoTelegramDraft.chat_id}>Send test message</button>
+                      </div>
+                    </div>
+
+                    <div className="stream-card">
+                      <div style={{fontWeight:600,marginBottom:'.5rem'}}>IP whitelist ({geoWhitelist.length})</div>
+                      <div style={{fontSize:'.75rem',color:'#94a3b8',marginBottom:'.6rem'}}>
+                        Sessions from these IPs are always allowed regardless of the geofence policy — e.g. your phone abroad, or a known VPN exit.
+                      </div>
+                      <div style={{display:'flex',gap:'.3rem',marginBottom:'.6rem',flexWrap:'wrap'}}>
+                        <input className="form-input" style={{width:'160px',fontSize:'.8rem'}} placeholder="IP address" value={geoIpDraft} onChange={e=>setGeoIpDraft(e.target.value)}/>
+                        <input className="form-input" style={{width:'200px',fontSize:'.8rem'}} placeholder="Reason (optional)" value={geoIpReason} onChange={e=>setGeoIpReason(e.target.value)}/>
+                        <button className="btn-sm btn-outline" onClick={addWhitelistIp}>Add IP</button>
+                      </div>
+                      {geoWhitelist.length===0 ? <div style={{fontSize:'.75rem',color:'#64748b'}}>No whitelisted IPs</div> : geoWhitelist.map(w => (
+                        <div key={w.id} style={{display:'flex',alignItems:'center',gap:'.5rem',padding:'.3rem 0',borderTop:'1px solid #1e293b',fontSize:'.8rem'}}>
+                          <span style={{fontFamily:'monospace',minWidth:'140px'}}>{w.ip_address}</span>
+                          <span style={{flex:1,color:'#94a3b8',fontSize:'.75rem'}}>{w.reason || '—'} <span style={{color:'#64748b'}}>by {w.added_by}</span></span>
+                          <button className="btn-sm btn-delete" onClick={()=>removeWhitelistIp(w.id)}>Remove</button>
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className="stream-card">
+                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'.4rem'}}>
+                        <div style={{fontWeight:600}}>Pending alerts ({geoAlerts.length})</div>
+                        <button className="btn-sm btn-outline" onClick={loadGeofence}>Refresh</button>
+                      </div>
+                      {geoAlerts.length===0 ? <div style={{fontSize:'.75rem',color:'#64748b'}}>No pending alerts</div> : geoAlerts.map(a => (
+                        <div key={a.alert_uuid} style={{display:'flex',gap:'.5rem',padding:'.4rem 0',borderTop:'1px solid #1e293b',alignItems:'center',fontSize:'.8rem',flexWrap:'wrap'}}>
+                          <div style={{flex:1,minWidth:'240px'}}>
+                            <div style={{fontWeight:500}}>{a.plex_user || '(unknown)'} · {a.country || 'Unknown'} {a.city ? `· ${a.city}` : ''}</div>
+                            <div style={{fontSize:'.7rem',color:'#94a3b8'}}>{a.ip_address} {a.device ? `· ${a.device}` : ''} {a.created_at ? `· ${ago(a.created_at)}` : ''}</div>
+                          </div>
+                          <button className="btn-sm btn-approve" onClick={()=>resolveAlert(a.alert_uuid,'allow')}>Allow</button>
+                          <button className="btn-sm btn-delete" onClick={()=>resolveAlert(a.alert_uuid,'block')}>Block</button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {secView==='gateway' && (
+              <div>
+                {!gwState ? <div className="empty">Loading…</div> : (
+                  <div style={{display:'grid',gap:'1rem',maxWidth:'860px'}}>
+                    <div className="stream-card">
+                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',flexWrap:'wrap',gap:'.5rem'}}>
+                        <div>
+                          <div style={{fontWeight:600,marginBottom:'.2rem'}}>Plex reverse-proxy gateway</div>
+                          <div style={{fontSize:'.75rem',color:'#94a3b8'}}>
+                            Status: <strong style={{color: gwState.status==='running'?'#34d399':'#f87171'}}>{gwState.status}</strong>
+                            {gwState.status==='running' && <> on <code>:{gwState.port}</code> → <code>{gwState.targetEffective || '(none)'}</code></>}
+                          </div>
+                          {gwState.lastError && <div style={{color:'#f87171',fontSize:'.75rem',marginTop:'.2rem'}}>Last error: {gwState.lastError}</div>}
+                          {!gwState.geofenceEnabled && <div style={{color:'#fbbf24',fontSize:'.75rem',marginTop:'.2rem'}}>Geofence is disabled — gateway will allow everything through. Enable it in the Geofence tab.</div>}
+                        </div>
+                        <div style={{display:'flex',gap:'.4rem'}}>
+                          {gwState.status==='running'
+                            ? <button className="btn-sm btn-delete" onClick={stopGateway}>Stop gateway</button>
+                            : <button className="btn-sm btn-primary" onClick={startGateway}>Start gateway</button>}
+                          <button className="btn-sm btn-outline" onClick={loadGateway}>Refresh</button>
+                        </div>
+                      </div>
+                      <div style={{display:'grid',gridTemplateColumns:'140px 1fr',gap:'.4rem .6rem',alignItems:'center',fontSize:'.8rem',marginTop:'.6rem'}}>
+                        <label>Listen port</label>
+                        <input className="form-input" style={{maxWidth:'160px'}} type="number" min="1" max="65535" value={gwDraft.port} onChange={e=>setGwDraft({...gwDraft,port:e.target.value})}/>
+                        <label>Target URL</label>
+                        <input className="form-input" placeholder="http://YOUR_PLEX_IP:32400 (leave blank to use Settings → Plex URL)" value={gwDraft.target} onChange={e=>setGwDraft({...gwDraft,target:e.target.value})}/>
+                      </div>
+                      <div style={{display:'flex',gap:'.4rem',marginTop:'.6rem'}}>
+                        <button className="btn-sm btn-primary" onClick={saveGateway}>Save</button>
+                      </div>
+                      <div style={{fontSize:'.7rem',color:'#64748b',marginTop:'.5rem',lineHeight:1.5}}>
+                        Point your router's public Plex port-forward at THIS host:{gwState.port} (instead of Plex directly). The gateway applies the geofence policy on every request, denies foreign traffic with a friendly page, and forwards allowed traffic to the target. Internal LAN clients should keep using Plex directly.
+                      </div>
+                    </div>
+
+                    {gwStats && (
+                      <div className="stream-card">
+                        <div style={{fontWeight:600,marginBottom:'.4rem'}}>Last 7 days</div>
+                        <div style={{display:'flex',gap:'1.5rem',fontSize:'.85rem'}}>
+                          <div>Allowed: <strong style={{color:'#34d399'}}>{gwStats.totals?.allowed || 0}</strong></div>
+                          <div>Denied: <strong style={{color:'#f87171'}}>{gwStats.totals?.denied || 0}</strong></div>
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="stream-card">
+                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'.4rem',flexWrap:'wrap',gap:'.4rem'}}>
+                        <div style={{fontWeight:600}}>Recent traffic ({gwLog.length})</div>
+                        <label style={{display:'flex',alignItems:'center',gap:'.3rem',fontSize:'.75rem'}}>
+                          <input type="checkbox" checked={gwShowDeniedOnly} onChange={e=>{setGwShowDeniedOnly(e.target.checked); setTimeout(loadGateway,50);}}/>
+                          Show denied only
+                        </label>
+                      </div>
+                      {gwLog.length===0 ? <div style={{fontSize:'.75rem',color:'#64748b'}}>No log entries yet</div> : (
+                        <table className="hist-table">
+                          <thead><tr><th>Time</th><th>IP</th><th>Country</th><th>Path</th><th>Result</th></tr></thead>
+                          <tbody>
+                            {gwLog.map(l => (
+                              <tr key={l.id}>
+                                <td>{l.created_at ? ago(l.created_at) : ''}</td>
+                                <td style={{fontFamily:'monospace'}}>{l.ip_address}</td>
+                                <td>{l.country || ''}</td>
+                                <td style={{maxWidth:'260px',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{l.url_path || l.path}</td>
+                                <td><span className={`status-badge ${l.allowed?'status-approved':'status-declined'}`}>{l.allowed?'Allowed':'Denied'}</span></td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      )}
+                    </div>
                   </div>
                 )}
               </div>
