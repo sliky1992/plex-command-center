@@ -8948,6 +8948,17 @@ function readGatewayConfig() {
   };
 }
 
+// Path-prefix list that always passes through the gateway regardless of country. Plex.tv's
+// remote-access prober and various clients only need these to confirm the server is alive at
+// a given URL — they never expose the library or accept auth.
+const _GATEWAY_ALLOW_PATHS = ['/identity', '/resources', '/.well-known/'];
+function _gatewayHealthcheckPath(url) {
+  if (!url) return false;
+  const i = url.indexOf('?');
+  const path = i === -1 ? url : url.slice(0, i);
+  return _GATEWAY_ALLOW_PATHS.some(p => path === p || path.startsWith(p + '/') || path.startsWith(p));
+}
+
 async function checkGatewayAccess(ip) {
   const cleanIp = (ip || '').replace(/^::ffff:/, '');
   const geo = await lookupGeo(cleanIp);
@@ -9031,7 +9042,15 @@ async function startGateway() {
     try { decision = await checkGatewayAccess(ip); }
     catch (e) { decision = { allowed: false, geo: { country: 'Unknown' }, reason: 'geo_lookup_failed' }; }
 
-    if (!decision.allowed) {
+    // ALWAYS-ALLOW paths: Plex.tv's reachability prober and other Plex clients hit /identity
+    // (and a couple of related discovery endpoints) to ask "is this server alive at this
+    // public URL?". If we deny those, Plex marks itself "not remotely accessible" and tells
+    // clients to use Relay — and with Relay disabled there's no fallback, so foreign clients
+    // can't even *attempt* the public URL (which is what the gateway exists to filter). The
+    // bypass paths only leak the server's machineIdentifier, version, and TLS cert hash, all
+    // of which Plex already publishes via plex.tv. No library, no auth, no streams.
+    const healthCheck = _gatewayHealthcheckPath(req.url);
+    if (!decision.allowed && !healthCheck) {
       logGatewayEvent(ip, decision, 'deny', req.url);
       res.writeHead(403, {
         'Content-Type': 'text/html; charset=utf-8',
@@ -9039,6 +9058,11 @@ async function startGateway() {
         'X-Geofence-Blocked': decision.geo.country || 'unknown'
       });
       return res.end(denyPageHtml(ip, decision.geo.country));
+    }
+    if (!decision.allowed && healthCheck) {
+      // Log as a distinct action so the admin can see "we leaked /identity to a foreign IP,
+      // but no library data went out". Useful to confirm the reachability probe is working.
+      logGatewayEvent(ip, decision, 'allow-health', req.url);
     }
 
     const proxyReq = httpMod.request({
