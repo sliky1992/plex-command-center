@@ -8623,7 +8623,7 @@ app.get('/api/security/gateway', requireAdmin, (req, res) => {
   });
 });
 
-app.put('/api/security/gateway', requireAdmin, (req, res) => {
+app.put('/api/security/gateway', requireAdmin, async (req, res) => {
   const body = req.body || {};
   const updates = [];
   if (typeof body.port !== 'undefined') {
@@ -8642,16 +8642,16 @@ app.put('/api/security/gateway', requireAdmin, (req, res) => {
   let restarted = false;
   if (_gatewayServer && updates.length > 0) {
     stopGateway();
-    const r = startGateway();
+    const r = await startGateway();
     restarted = true;
     if (!r.ok) return res.status(500).json({ error: 'Restart failed: ' + r.error, restarted });
   }
   res.json({ success: true, restarted, config: readGatewayConfig() });
 });
 
-app.post('/api/security/gateway/start', requireAdmin, (req, res) => {
+app.post('/api/security/gateway/start', requireAdmin, async (req, res) => {
   pccDb.prepare("UPDATE regional_settings SET value = '1' WHERE key = 'gateway_enabled'").run();
-  const r = startGateway();
+  const r = await startGateway();
   if (!r.ok) return res.status(500).json({ error: r.error || 'start failed' });
   res.json({ success: true, ...r });
 });
@@ -9079,22 +9079,34 @@ function startGateway() {
     logGatewayEvent(ip, decision, 'allow-ws', req.url);
   });
 
-  try {
-    gateway.listen(cfg.port, () => {
+  // listen() is async — we need to await its outcome before the API/UI can truthfully report
+  // "started" or "failed". Without this wait, EADDRINUSE arrived after the response was sent
+  // and the user saw a stale "running" status that contradicted the `lastError` field.
+  return await new Promise((resolve) => {
+    let settled = false;
+    const settleOk = () => {
+      if (settled) return; settled = true;
+      _gatewayServer = gateway;
+      _gatewayMeta = { port: cfg.port, target: cfg.target, lastError: null };
       console.log(`[Gateway] Plex reverse proxy listening on :${cfg.port} → ${cfg.target}`);
-    });
-    gateway.on('error', (err) => {
-      console.error('[Gateway] listen error:', err.message);
-      _gatewayMeta.lastError = err.message;
+      resolve({ ok: true, port: cfg.port, target: cfg.target });
+    };
+    const settleErr = (err) => {
+      if (settled) return; settled = true;
+      const msg = err && err.code === 'EADDRINUSE'
+        ? `Port ${cfg.port} is already in use on this host. Plex Media Server itself listens on 32400 — if PCC is running on the same machine as PMS, pick a different gateway port (e.g. 32401) and forward your router's WAN :32400 to it.`
+        : (err && err.message) || String(err);
+      console.error('[Gateway] listen error:', msg);
+      _gatewayMeta.lastError = msg;
       _gatewayServer = null;
-    });
-    _gatewayServer = gateway;
-    _gatewayMeta = { port: cfg.port, target: cfg.target, lastError: null };
-    return { ok: true, port: cfg.port, target: cfg.target };
-  } catch (e) {
-    _gatewayMeta.lastError = e.message;
-    return { ok: false, error: e.message };
-  }
+      try { gateway.close(); } catch(_) {}
+      resolve({ ok: false, error: msg });
+    };
+    gateway.once('listening', settleOk);
+    gateway.once('error', settleErr);
+    try { gateway.listen(cfg.port); }
+    catch (e) { settleErr(e); }
+  });
 }
 
 function stopGateway() {
@@ -9110,12 +9122,14 @@ function stopGateway() {
 }
 
 // Auto-start on boot if DB flag is on. Settings are read here so seed values from env take
-// effect on the very first run.
+// effect on the very first run. startGateway() is async now (it awaits listen() so EADDRINUSE
+// surfaces correctly), but we don't need to block app boot on it — fire-and-warn.
 {
   const cfg = readGatewayConfig();
   if (cfg.enabled) {
-    const r = startGateway();
-    if (!r.ok) console.warn('[Gateway] auto-start failed:', r.error);
+    startGateway()
+      .then(r => { if (!r.ok) console.warn('[Gateway] auto-start failed:', r.error); })
+      .catch(e => console.warn('[Gateway] auto-start crashed:', e.message));
   }
 }
 

@@ -2093,6 +2093,22 @@ function App() {
                         <label>Target URL</label>
                         <input className="form-input" placeholder="http://YOUR_PLEX_IP:32400 (leave blank to use Settings → Plex URL)" value={gwDraft.target} onChange={e=>setGwDraft({...gwDraft,target:e.target.value})}/>
                       </div>
+                      {(() => {
+                        // Heuristic conflict warning: if the user is asking us to listen on 32400
+                        // AND the target URL also points at this host on 32400, the bind will
+                        // collide with the local Plex Media Server. Suggest 32401.
+                        const port = parseInt(gwDraft.port);
+                        const tgt = (gwDraft.target||'').toLowerCase();
+                        const localTarget = tgt.includes('localhost') || tgt.includes('127.0.0.1') || tgt.includes('::1');
+                        const conflict = port === 32400 && (localTarget || tgt.includes(':32400'));
+                        if (!conflict) return null;
+                        return (
+                          <div style={{marginTop:'.5rem',padding:'.5rem .7rem',background:'rgba(251,191,36,.08)',border:'1px solid rgba(251,191,36,.4)',borderRadius:'6px',fontSize:'.75rem',color:'#fbbf24'}}>
+                            ⚠ Port 32400 will conflict with Plex Media Server if PCC is on the same host.
+                            <button className="btn-sm btn-outline" style={{marginLeft:'.5rem'}} onClick={()=>setGwDraft({...gwDraft,port:'32401'})}>Switch to 32401</button>
+                          </div>
+                        );
+                      })()}
                       <div style={{display:'flex',gap:'.4rem',marginTop:'.6rem'}}>
                         <button className="btn-sm btn-primary" onClick={saveGateway}>Save</button>
                       </div>
