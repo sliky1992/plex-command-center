@@ -579,11 +579,15 @@ function App() {
   };
 
   // Gateway: reverse-proxy controls + log/stats -----------------------------------------
-  const loadGateway = async () => {
+  const loadGateway = async (deniedOnlyOverride) => {
+    // Optional override exists because the "Show denied only" checkbox calls this in the same
+    // tick it calls setGwShowDeniedOnly — the state hasn't propagated yet, so closing over
+    // gwShowDeniedOnly would always be one click behind. Pass the new value through directly.
+    const deniedOnly = deniedOnlyOverride !== undefined ? deniedOnlyOverride : gwShowDeniedOnly;
     const [g, st, lg] = await Promise.all([
       fetch('/api/security/gateway').then(x=>x.json()).catch(()=>null),
       fetch('/api/security/gateway-stats').then(x=>x.json()).catch(()=>null),
-      fetch(`/api/security/gateway-log?limit=100${gwShowDeniedOnly?'&denied=1':''}`).then(x=>x.json()).catch(()=>[])
+      fetch(`/api/security/gateway-log?limit=100${deniedOnly?'&denied=1':''}`).then(x=>x.json()).catch(()=>[])
     ]);
     setGwState(g); setGwStats(st); setGwLog(asArray(lg));
     if (g) setGwDraft({ port: String(g.port||32400), target: g.target || '' });
@@ -2143,7 +2147,7 @@ function App() {
                       <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'.4rem',flexWrap:'wrap',gap:'.4rem'}}>
                         <div style={{fontWeight:600}}>Recent traffic ({gwLog.length})</div>
                         <label style={{display:'flex',alignItems:'center',gap:'.3rem',fontSize:'.75rem'}}>
-                          <input type="checkbox" checked={gwShowDeniedOnly} onChange={e=>{setGwShowDeniedOnly(e.target.checked); setTimeout(loadGateway,50);}}/>
+                          <input type="checkbox" checked={gwShowDeniedOnly} onChange={e=>{ const v=e.target.checked; setGwShowDeniedOnly(v); loadGateway(v); }}/>
                           Show denied only
                         </label>
                       </div>
