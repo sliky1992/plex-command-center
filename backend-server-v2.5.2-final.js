@@ -1948,6 +1948,11 @@ const PWCHANGE_OK_ROUTES = new Set([
   '/api/auth/me', '/api/auth/logout', '/api/auth/change-password'
 ]);
 
+// Per-process secret for internal-to-self HTTP calls (e.g. the auto-collection cron POSTs to
+// /api/plex/collections/suggestions). Regenerated on every restart so it can't be replayed
+// from logs. Only code in this process can present it because it never leaves memory.
+const INTERNAL_API_TOKEN = crypto.randomBytes(32).toString('hex');
+
 // Optional shared key for tuner endpoints. When TUNER_KEY env is set, /lineup.json,
 // /api/livetv/stream/*, /api/livetv/m3u, /api/livetv/xmltv, /api/livetv/logos/* require
 // `?key=…` query or `X-Tuner-Key` header. Plex DVR's HDHR config supports adding the query
@@ -1975,12 +1980,18 @@ function requireAuth(req, res, next) {
     if (!checkTunerKey(req)) return res.status(401).json({ error: 'Tuner key required' });
     return next();
   }
-  // Loopback bypass — the auto-collection cron calls /api/plex/collections/suggestions over
-  // HTTP against its own process. Loopback (127.0.0.1 / ::1) traffic can only come from inside
-  // the container's own network namespace, so it's safe to trust. Without this bypass the auth
-  // middleware introduced in 3.1.0 broke the internal cron.
-  if (req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1') {
-    if (req.path.startsWith('/api/')) return next();
+  // Internal-call bypass — the auto-collection cron calls /api/plex/collections/suggestions
+  // over HTTP against its own process and presents the per-process INTERNAL_API_TOKEN. Only a
+  // process on this host with read access to its own memory can know that token, so any client
+  // that can present it is by definition us. A blanket "loopback bypass" looks similar but is
+  // wrong: when this app runs as a Windows service on localhost:3001 every browser request
+  // also originates from 127.0.0.1, so an unconditional loopback bypass would skip setting
+  // req.user for the *real* user and then any requireAdmin route 403s.
+  if ((req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1')
+      && req.headers['x-internal-token']
+      && req.headers['x-internal-token'] === INTERNAL_API_TOKEN
+      && req.path.startsWith('/api/')) {
+    return next();
   }
   // Skip auth for static files / non-API
   if (!req.path.startsWith('/api/')) return next();
@@ -2315,20 +2326,25 @@ app.get('/api/settings/audit', requireAdmin, (req, res) => {
 // ============================================
 
 // Combined state: settings + last run + current snapshots annotated with live/missing.
+// Also runs a prune-completed pass so the "missing" list doesn't show finished items.
 app.get('/api/cw/state', requireAdmin, async (req, res) => {
   const settings = pccDb.prepare('SELECT * FROM cw_settings WHERE id=1').get();
+
+  let liveKeys = null, plexError = null;
+  try {
+    const live = await _cwFetchOnDeck();
+    liveKeys = new Set(live.filter(i => (Number(i.viewOffset)||0) > 0).map(i => String(i.ratingKey)));
+    // Prune watched/deleted items inline so the user sees a clean list immediately. Best-
+    // effort: an error here just leaves the rows in place until the next snapshot tick.
+    try { await _cwPruneCompleted(liveKeys); } catch (e) { /* swallow — non-fatal */ }
+  } catch (e) { plexError = e.message; }
+
   const snaps = pccDb.prepare(`
     SELECT rating_key, title, show_title, season_num, episode_num, year, item_type, thumb,
            view_offset, duration, last_viewed_at, first_seen_at, last_seen_at, last_in_hub_at,
            restored_at, restored_by
     FROM cw_snapshots WHERE account_id='owner' ORDER BY last_in_hub_at DESC
   `).all();
-
-  let liveKeys = null, plexError = null;
-  try {
-    const live = await _cwFetchOnDeck();
-    liveKeys = new Set(live.filter(i => (Number(i.viewOffset)||0) > 0).map(i => String(i.ratingKey)));
-  } catch (e) { plexError = e.message; }
 
   const annotated = snaps.map(s => ({
     ...s,
@@ -2368,9 +2384,13 @@ app.put('/api/cw/settings', requireAdmin, (req, res) => {
 
 app.post('/api/cw/snapshot', requireAdmin, async (req, res) => {
   try {
-    const r = await cwSnapshot();
+    // `?deep=1` walks every library for items with viewOffset>0 instead of just polling
+    // Plex's /library/onDeck endpoint. Slower but catches items Plex has aged out of the
+    // CW hub — those are exactly the items the user wants to be able to restore.
+    const deep = req.query.deep === '1' || req.body?.deep === true;
+    const r = await cwSnapshot(deep);
     pccDb.prepare("UPDATE cw_settings SET last_run = datetime('now'), last_snapshot_count = ?, last_error = NULL WHERE id = 1").run(r.saved);
-    res.json({ success: true, ...r });
+    res.json({ success: true, deep, ...r });
   } catch (e) {
     pccDb.prepare("UPDATE cw_settings SET last_run = datetime('now'), last_error = ? WHERE id = 1").run((e.message||'').slice(0, 500));
     res.status(500).json({ error: e.message });
@@ -3158,8 +3178,12 @@ async function runAutoCollectionCycle() {
   // Step 3: Get fresh suggestions
   let suggestions = [];
   try {
-    // Call our own suggestions engine internally
-    const sugResponse = await axios.post(`http://localhost:${PORT}/api/plex/collections/suggestions`, {}, { timeout: 30000 });
+    // Call our own suggestions engine internally — uses the per-process internal token to
+    // satisfy requireAuth without going through a user session.
+    const sugResponse = await axios.post(`http://localhost:${PORT}/api/plex/collections/suggestions`, {}, {
+      timeout: 30000,
+      headers: { 'X-Internal-Token': INTERNAL_API_TOKEN }
+    });
     suggestions = sugResponse.data || [];
   } catch(e) {
     result.errors.push({ error: 'Failed to get suggestions: ' + e.message });
@@ -3172,7 +3196,10 @@ async function runAutoCollectionCycle() {
   // Also check existing Plex collections to avoid duplicates
   let existingColTitles = new Set();
   try {
-    const existingRes = await axios.get(`http://localhost:${PORT}/api/plex/collections`, { timeout: 10000 });
+    const existingRes = await axios.get(`http://localhost:${PORT}/api/plex/collections`, {
+      timeout: 10000,
+      headers: { 'X-Internal-Token': INTERNAL_API_TOKEN }
+    });
     existingColTitles = new Set((existingRes.data || []).map(c => c.title));
   } catch(e) {}
   suggestions = suggestions.filter(s => !activeTitles.has(s.title) && !existingColTitles.has(s.title));
@@ -3346,16 +3373,116 @@ async function _cwFetchOnDeck() {
   if (!config.plex.url || !config.plex.token) throw new Error('Plex not configured');
   const r = await axios.get(`${config.plex.url}/library/onDeck`, {
     params: { 'X-Plex-Token': config.plex.token },
-    headers: { Accept: 'application/json' },
+    // Plex's onDeck defaults to a small page (~20). Ask for up to 200 explicitly so users with
+    // a lot of in-progress content don't silently miss items.
+    headers: {
+      Accept: 'application/json',
+      'X-Plex-Container-Start': '0',
+      'X-Plex-Container-Size': '200'
+    },
     timeout: 15000
   });
   return r.data?.MediaContainer?.Metadata || [];
 }
 
+// Fetch a single item's current Plex metadata. Used to detect items that have been watched
+// (viewCount > 0) or deleted (404), so we can prune them from the snapshots.
+async function _cwFetchMetadata(ratingKey) {
+  try {
+    const r = await axios.get(`${config.plex.url}/library/metadata/${ratingKey}`, {
+      params: { 'X-Plex-Token': config.plex.token },
+      headers: { Accept: 'application/json' },
+      timeout: 10000
+    });
+    const md = r.data?.MediaContainer?.Metadata?.[0];
+    if (!md) return { gone: true };
+    return {
+      viewCount: Number(md.viewCount) || 0,
+      viewOffset: Number(md.viewOffset) || 0,
+      duration: Number(md.duration) || 0,
+      lastViewedAt: Number(md.lastViewedAt) || 0
+    };
+  } catch (e) {
+    if (e.response?.status === 404) return { gone: true };
+    return { error: e.message };
+  }
+}
+
+// For every snapshot row that is NOT currently in Plex's onDeck, check its real metadata. If
+// it's been fully watched (viewCount>0 AND viewOffset cleared) OR the item was deleted from
+// the library, drop it from the snapshots — otherwise it pollutes the "missing" list with
+// items the user has actually finished. Returns counts for logging.
+async function _cwPruneCompleted(liveKeys) {
+  const missing = pccDb.prepare(`
+    SELECT rating_key FROM cw_snapshots WHERE account_id='owner'
+  `).all().map(r => r.rating_key).filter(k => !liveKeys.has(k));
+  if (!missing.length) return { checked: 0, pruned: 0 };
+
+  let pruned = 0;
+  const del = pccDb.prepare("DELETE FROM cw_snapshots WHERE account_id='owner' AND rating_key = ?");
+  // Lightly throttled: 5 concurrent metadata fetches at a time.
+  for (let i = 0; i < missing.length; i += 5) {
+    const batch = missing.slice(i, i + 5);
+    const results = await Promise.all(batch.map(async (rk) => ({ rk, md: await _cwFetchMetadata(rk) })));
+    for (const { rk, md } of results) {
+      if (!md || md.error) continue; // transient Plex error — try again next cycle
+      // Treat as completed when: explicitly viewed and no significant remaining progress, OR
+      // the item is gone from Plex entirely. Some Plex versions clear viewOffset to 0 after
+      // a finish; others leave it unset. A viewCount>0 with viewOffset under 30s is a safe
+      // "watched it" signal.
+      const watched = md.gone || (md.viewCount > 0 && md.viewOffset < 30000);
+      if (watched) { del.run(rk); pruned++; }
+    }
+  }
+  return { checked: missing.length, pruned };
+}
+
+// Walks every TV-show and Movie library and returns items with viewOffset > 0. Used by the
+// deep-scan path because Plex's /library/onDeck endpoint silently caps its response and ages
+// items out — that's exactly the failure mode the user reports as "Fallout/Sleepy Hollow/etc.
+// not showing up". Shape mirrors what _cwFetchOnDeck returns so downstream code is the same.
+async function _cwFetchAllInProgress() {
+  if (!config.plex.url || !config.plex.token) throw new Error('Plex not configured');
+  const sec = await axios.get(`${config.plex.url}/library/sections`, {
+    params: { 'X-Plex-Token': config.plex.token },
+    headers: { Accept: 'application/json' },
+    timeout: 15000
+  });
+  const sections = sec.data?.MediaContainer?.Directory || [];
+  const out = [];
+  for (const s of sections) {
+    // movie=1, show=2 → walk episodes (type=4) for shows so we get per-episode viewOffset.
+    const isMovie = s.type === 'movie';
+    const isShow  = s.type === 'show';
+    if (!isMovie && !isShow) continue;
+    try {
+      const r = await axios.get(`${config.plex.url}/library/sections/${s.key}/all`, {
+        params: {
+          'X-Plex-Token': config.plex.token,
+          ...(isShow ? { type: 4 } : {}) // episodes for show libs
+        },
+        headers: {
+          Accept: 'application/json',
+          'X-Plex-Container-Start': '0',
+          'X-Plex-Container-Size': '5000'
+        },
+        timeout: 30000
+      });
+      const items = r.data?.MediaContainer?.Metadata || [];
+      for (const it of items) {
+        if ((Number(it.viewOffset) || 0) > 0) out.push(it);
+      }
+    } catch (e) {
+      console.warn(`[CW] Deep-scan library ${s.key} (${s.title}) failed:`, e.message);
+    }
+  }
+  return out;
+}
+
 // Snapshot: upsert all live onDeck items with viewOffset>0. Items whose ratingKey is no
 // longer in the live response stay in the table — that's how we detect "missing" items.
-async function cwSnapshot() {
-  const items = await _cwFetchOnDeck();
+async function cwSnapshot(deep = false) {
+  const items = deep ? await _cwFetchAllInProgress() : await _cwFetchOnDeck();
   const now = new Date().toISOString();
   let saved = 0;
   const upsert = pccDb.prepare(`
@@ -3464,18 +3591,21 @@ function scheduleCwSnapshotter() {
       const cur = pccDb.prepare('SELECT * FROM cw_settings WHERE id=1').get();
       if (!cur.enabled) return;
       const result = await cwSnapshot();
+      // Fetch live once for the rest of the cycle (prune + optional auto-restore).
+      const live = await _cwFetchOnDeck();
+      const liveKeys = new Set(live.filter(i => (Number(i.viewOffset)||0) > 0).map(i => String(i.ratingKey)));
+      // Prune items the user has actually finished watching so they don't pollute the
+      // "missing" list — without this, every completed episode/movie looked recoverable.
+      const prune = await _cwPruneCompleted(liveKeys);
       let restoreResult = { restored: 0, failed: 0 };
       if (cur.auto_restore) {
-        // Need live keys for diff
-        const live = await _cwFetchOnDeck();
-        const liveKeys = new Set(live.filter(i => (Number(i.viewOffset)||0) > 0).map(i => String(i.ratingKey)));
         restoreResult = await cwAutoRestoreCycle(liveKeys);
       }
       pccDb.prepare(`
         UPDATE cw_settings SET last_run = datetime('now'), last_snapshot_count = ?, last_restore_count = ?, last_error = NULL WHERE id = 1
       `).run(result.saved, restoreResult.restored);
-      if (restoreResult.restored || restoreResult.failed) {
-        console.log(`[CW] Tick: snapshotted ${result.saved}, restored ${restoreResult.restored}, failed ${restoreResult.failed}`);
+      if (restoreResult.restored || restoreResult.failed || prune.pruned) {
+        console.log(`[CW] Tick: snapshotted ${result.saved}, pruned-watched ${prune.pruned}, restored ${restoreResult.restored}, failed ${restoreResult.failed}`);
       }
     } catch (e) {
       pccDb.prepare("UPDATE cw_settings SET last_run = datetime('now'), last_error = ? WHERE id = 1").run((e.message || String(e)).slice(0, 500));

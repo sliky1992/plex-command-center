@@ -754,10 +754,11 @@ function App() {
     const r = await fetch('/api/cw/state').then(x=>x.json()).catch(e=>({error:e.message}));
     setCwState(r); setCwLoading(false);
   };
-  const cwSnapshotNow = async () => {
+  const cwSnapshotNow = async (deep = false) => {
     setCwLoading(true);
-    const r = await fetch('/api/cw/snapshot', { method: 'POST' }).then(x=>x.json()).catch(e=>({error:e.message}));
-    if (r.success) showToast(`Snapshotted ${r.saved} item${r.saved!==1?'s':''}`);
+    const url = deep ? '/api/cw/snapshot?deep=1' : '/api/cw/snapshot';
+    const r = await fetch(url, { method: 'POST' }).then(x=>x.json()).catch(e=>({error:e.message}));
+    if (r.success) showToast(`${deep?'Deep-scan':'Snapshot'}: ${r.saved} item${r.saved!==1?'s':''}`);
     else showToast('Snapshot failed: ' + (r.error||'Unknown'), 'error');
     await loadCwState();
   };
@@ -1559,7 +1560,8 @@ function App() {
                   </div>
                   <div style={{display:'flex',gap:'.4rem'}}>
                     <button className="btn-sm btn-outline" onClick={loadCwState} disabled={cwLoading}>{cwLoading?'…':'Refresh'}</button>
-                    <button className="btn-sm btn-outline" onClick={cwSnapshotNow} disabled={cwLoading}>Snapshot now</button>
+                    <button className="btn-sm btn-outline" onClick={()=>cwSnapshotNow(false)} disabled={cwLoading}>Snapshot now</button>
+                    <button className="btn-sm btn-outline" onClick={()=>cwSnapshotNow(true)} disabled={cwLoading} title="Walk every library for items with progress > 0 — catches items Plex's onDeck hub has aged out (e.g. shows from many months ago).">Deep scan</button>
                     {!cwShowLive && missing.length > 0 && (
                       <button className="btn-sm btn-primary" onClick={cwRestoreAll} disabled={cwLoading}>Restore all ({missing.length})</button>
                     )}
