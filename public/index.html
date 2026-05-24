@@ -460,6 +460,16 @@ function App() {
     loadAdminUsers();
   };
 
+  const setUserRole = async (id, newRole) => {
+    const r = await fetch(`/api/admin/users/${id}`, {
+      method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({role: newRole})
+    });
+    if (r.ok) showToast(`Role set to ${newRole}`);
+    else { const d = await r.json().catch(()=>({})); showToast(d.error || 'Failed to change role', 'error'); }
+    loadAdminUsers();
+  };
+
   const loadSecLive = async () => { const r = await fetch('/api/security/connections/live').then(x=>x.json()).catch(()=>[]); setSecLive(asArray(r)); };
   const loadSecHistory = async () => { const r = await fetch(`/api/security/connections?days=${secDaysFilter}`).then(x=>x.json()).catch(()=>[]); setSecHistory(asArray(r)); };
   const loadSecBlocked = async () => { const r = await fetch('/api/security/blocked').then(x=>x.json()).catch(()=>[]); setSecBlocked(asArray(r)); };
@@ -1838,6 +1848,9 @@ function App() {
                     <span className={`status-badge ${u.enabled?'status-approved':'status-declined'}`}>{u.enabled?'Active':'Disabled'}</span>
                     {u.id !== currentUser?.id && (
                       <div style={{display:'flex',gap:'.4rem'}}>
+                        {u.role === 'admin'
+                          ? <button className="btn-sm btn-outline" onClick={()=>{ if(confirm(`Demote ${u.username} to viewer?`)) setUserRole(u.id, 'viewer'); }}>Make viewer</button>
+                          : <button className="btn-sm btn-outline" onClick={()=>{ if(confirm(`Promote ${u.username} to admin? They will gain full settings/security/user-management access.`)) setUserRole(u.id, 'admin'); }}>Make admin</button>}
                         <button className="btn-sm btn-outline" onClick={()=>toggleUserEnabled(u.id, u.enabled)}>{u.enabled?'Disable':'Enable'}</button>
                         <button className="btn-sm btn-delete" onClick={()=>deleteUser(u.id)}>Delete</button>
                       </div>
