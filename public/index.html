@@ -198,6 +198,8 @@ function App() {
   const [geoSettings, setGeoSettings] = useState(null); // {enabled, allowed_countries, action, telegram_chat_id, telegram_bot_token_set, telegram_webhook_secret_set}
   const [geoWhitelist, setGeoWhitelist] = useState([]);
   const [geoAlerts, setGeoAlerts] = useState([]);
+  const [geoAlertHistory, setGeoAlertHistory] = useState([]);
+  const [geoAlertView, setGeoAlertView] = useState('pending'); // pending | history
   const [geoCountryDraft, setGeoCountryDraft] = useState('');
   const [geoIpDraft, setGeoIpDraft] = useState('');
   const [geoIpReason, setGeoIpReason] = useState('');
@@ -495,12 +497,16 @@ function App() {
 
   // Geofence: regional settings, IP whitelist, alerts ----------------------------------
   const loadGeofence = async () => {
-    const [s, wl, al] = await Promise.all([
+    const [s, wl, al, allAl] = await Promise.all([
       fetch('/api/security/regional-settings').then(x=>x.json()).catch(()=>null),
       fetch('/api/security/regional-whitelist').then(x=>x.json()).catch(()=>[]),
-      fetch('/api/security/alerts?decision=pending').then(x=>x.json()).catch(()=>[])
+      fetch('/api/security/alerts?decision=pending').then(x=>x.json()).catch(()=>[]),
+      // Full history (server caps at 200). Split into "resolved" client-side so the same
+      // fetch covers both the pending counter and the history pane.
+      fetch('/api/security/alerts').then(x=>x.json()).catch(()=>[])
     ]);
     setGeoSettings(s); setGeoWhitelist(asArray(wl)); setGeoAlerts(asArray(al));
+    setGeoAlertHistory(asArray(allAl).filter(a => a.decision !== 'pending'));
     // Reset secret draft fields so they don't carry across opens.
     setGeoTelegramDraft({ bot_token: '', chat_id: s?.telegram_chat_id || '', webhook_secret: '' });
   };
@@ -2015,20 +2021,44 @@ function App() {
                     </div>
 
                     <div className="stream-card">
-                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'.4rem'}}>
-                        <div style={{fontWeight:600}}>Pending alerts ({geoAlerts.length})</div>
+                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'.5rem',flexWrap:'wrap',gap:'.4rem'}}>
+                        <div className="toggle">
+                          <button className={`toggle-opt ${geoAlertView==='pending'?'active':''}`} onClick={()=>setGeoAlertView('pending')}>Pending ({geoAlerts.length})</button>
+                          <button className={`toggle-opt ${geoAlertView==='history'?'active':''}`} onClick={()=>setGeoAlertView('history')}>History ({geoAlertHistory.length})</button>
+                        </div>
                         <button className="btn-sm btn-outline" onClick={loadGeofence}>Refresh</button>
                       </div>
-                      {geoAlerts.length===0 ? <div style={{fontSize:'.75rem',color:'#64748b'}}>No pending alerts</div> : geoAlerts.map(a => (
-                        <div key={a.alert_uuid} style={{display:'flex',gap:'.5rem',padding:'.4rem 0',borderTop:'1px solid #1e293b',alignItems:'center',fontSize:'.8rem',flexWrap:'wrap'}}>
-                          <div style={{flex:1,minWidth:'240px'}}>
-                            <div style={{fontWeight:500}}>{a.plex_user || '(unknown)'} · {a.country || 'Unknown'} {a.city ? `· ${a.city}` : ''}</div>
-                            <div style={{fontSize:'.7rem',color:'#94a3b8'}}>{a.ip_address} {a.device ? `· ${a.device}` : ''} {a.created_at ? `· ${ago(a.created_at)}` : ''}</div>
+                      {geoAlertView==='pending' ? (
+                        geoAlerts.length===0 ? <div style={{fontSize:'.75rem',color:'#64748b'}}>No pending alerts</div> : geoAlerts.map(a => (
+                          <div key={a.alert_uuid} style={{display:'flex',gap:'.5rem',padding:'.4rem 0',borderTop:'1px solid #1e293b',alignItems:'center',fontSize:'.8rem',flexWrap:'wrap'}}>
+                            <div style={{flex:1,minWidth:'240px'}}>
+                              <div style={{fontWeight:500}}>{a.plex_user || '(unknown)'} · {a.geo_country || a.country || 'Unknown'} {a.geo_city || a.city ? `· ${a.geo_city || a.city}` : ''}</div>
+                              <div style={{fontSize:'.7rem',color:'#94a3b8'}}>{a.ip_address} {a.device ? `· ${a.device}` : ''} {a.created_at ? `· ${ago(a.created_at)}` : ''}</div>
+                            </div>
+                            <button className="btn-sm btn-approve" onClick={()=>resolveAlert(a.alert_uuid,'allow')}>Allow</button>
+                            <button className="btn-sm btn-delete" onClick={()=>resolveAlert(a.alert_uuid,'block')}>Block</button>
                           </div>
-                          <button className="btn-sm btn-approve" onClick={()=>resolveAlert(a.alert_uuid,'allow')}>Allow</button>
-                          <button className="btn-sm btn-delete" onClick={()=>resolveAlert(a.alert_uuid,'block')}>Block</button>
-                        </div>
-                      ))}
+                        ))
+                      ) : (
+                        geoAlertHistory.length===0 ? <div style={{fontSize:'.75rem',color:'#64748b'}}>No resolved alerts yet</div> : (
+                          <table className="hist-table">
+                            <thead><tr><th>When</th><th>User</th><th>IP</th><th>Country/City</th><th>ISP / Device</th><th>Decision</th><th>By</th></tr></thead>
+                            <tbody>
+                              {geoAlertHistory.map(a => (
+                                <tr key={a.alert_uuid}>
+                                  <td>{a.created_at ? ago(a.created_at) : ''}</td>
+                                  <td style={{fontWeight:500}}>{a.plex_user || '—'}</td>
+                                  <td style={{fontFamily:'monospace'}}>{a.ip_address}</td>
+                                  <td>{a.geo_country || ''}{a.geo_city ? ` · ${a.geo_city}` : ''}</td>
+                                  <td style={{fontSize:'.7rem',color:'#94a3b8'}}>{a.geo_isp || ''}{a.device ? ` · ${a.device}` : ''}</td>
+                                  <td><span className={`status-badge ${a.decision==='allow'?'status-approved':'status-declined'}`}>{a.decision}</span></td>
+                                  <td style={{fontSize:'.7rem',color:'#94a3b8'}}>{a.decided_by || ''}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        )
+                      )}
                     </div>
                   </div>
                 )}
