@@ -17,10 +17,10 @@ backend-server-v2.5.2-smart.js
 backend-server.js
 plex-command-center-v2.5.2.html
 docker-compose-v2.5.2.yml
-Dockerfile
-package.json
-deploy-v2.5.2.sh
-hotpatch-v2.5.2.sh
+/Dockerfile
+/package.json
+/deploy-v2.5.2.sh
+/hotpatch-v2.5.2.sh
 
 # Desktop app build artifacts
 PlexLiveTV-win64.zip

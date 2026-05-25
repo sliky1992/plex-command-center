@@ -1,0 +1,21 @@
+{
+  "name": "pcc-tcp-front",
+  "version": "1.0.0",
+  "description": "TCP pass-through gateway with IP geofence for Plex Command Center",
+  "main": "index.js",
+  "private": true,
+  "scripts": {
+    "start": "node index.js",
+    "service:install": "node install-service.js",
+    "service:uninstall": "node uninstall-service.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0"
+  },
+  "optionalDependencies": {
+    "node-windows": "^1.0.0-beta.8"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

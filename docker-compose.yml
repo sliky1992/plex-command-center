@@ -58,6 +58,40 @@ services:
     networks:
       - plex-network
 
+  # ---------------------------------------------------------------------------
+  # PCC TCP-Front sidecar (opt-in)
+  # ---------------------------------------------------------------------------
+  # Pure TCP pass-through on :32401 with IP-level geofence. Only useful when
+  # Plex Media Server is on the SAME Linux host as this stack. Reads PCC's
+  # pcc.db for geofence config, writes decisions back to gateway_log.
+  #
+  # Disabled by default. Enable on a host that runs Plex with:
+  #   docker compose --profile tcp-front up -d
+  # or persistently:
+  #   export COMPOSE_PROFILES=tcp-front
+  #
+  # network_mode: host is REQUIRED (Linux only):
+  #   - to see the real client IP for the geofence check
+  #   - to reach Plex on 127.0.0.1:32400 via host loopback
+  # Don't add a `ports:` block; host mode shares the host's network namespace.
+  pcc-tcp-front:
+    build:
+      context: ./windows/tcp-front
+    container_name: pcc-tcp-front
+    restart: unless-stopped
+    profiles: ["tcp-front"]
+    network_mode: host
+    environment:
+      - TCP_PORT=32401
+      - PMS_HOST=127.0.0.1     # Plex Media Server on the docker host
+      - PMS_PORT=32400
+      - PCC_DB_PATH=/pcc-data/pcc.db
+    volumes:
+      # Mount PCC's data dir; the sidecar reads regional settings + writes gateway_log
+      - ./data:/pcc-data
+    depends_on:
+      - plex-command-center
+
 networks:
   plex-network:
     driver: bridge
