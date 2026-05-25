@@ -18,7 +18,7 @@ RUN mkdir -p /app/data /app/logs /app/public /app/data/fillers
 
 # Copy application files
 COPY backend-server-v2.5.2-final.js ./backend-server.js
-COPY plex-command-center-v2.5.2-final.html ./public/index.html
+COPY public/index.html ./public/index.html
 COPY public/desktop-renderer.html ./public/desktop-renderer.html
 COPY manifest.json ./public/manifest.json
 COPY sw.js ./public/sw.js

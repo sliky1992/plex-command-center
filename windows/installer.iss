@@ -7,7 +7,7 @@
 ; (That script stages everything into windows\staging\ then calls ISCC on this file.)
 
 #define MyAppName     "Plex Command Center"
-#define MyAppVersion  "3.0.0"
+#define MyAppVersion  "4.1.0"
 #define MyServiceName "PlexCommandCenter"
 #define MyAppPublisher "Plex Command Center"
 
