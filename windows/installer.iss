@@ -6,10 +6,11 @@
 ; To rebuild the .exe, run:    build-installer.ps1
 ; (That script stages everything into windows\staging\ then calls ISCC on this file.)
 
-#define MyAppName     "Plex Command Center"
-#define MyAppVersion  "4.1.0"
-#define MyServiceName "PlexCommandCenter"
-#define MyAppPublisher "Plex Command Center"
+#define MyAppName        "Plex Command Center"
+#define MyAppVersion     "4.2.0"
+#define MyServiceName    "PlexCommandCenter"
+#define MyTcpServiceName "PCC-TCP-Front"
+#define MyAppPublisher   "Plex Command Center"
 
 [Setup]
 ; A stable GUID - DO NOT regenerate, otherwise upgrade detection breaks.
@@ -86,6 +87,16 @@ Filename: "{cmd}"; \
   StatusMsg: "Registering Windows Service..."; \
   Flags: runhidden waituntilterminated
 
+; --- (2b) Register + start the TCP-Front geofence proxy service -------------
+; Pure TCP pass-through on :32401 with IP-level geofence. Only useful when Plex
+; Media Server runs on the same host; otherwise it idles harmlessly. Reads
+; geofence settings from pcc.db so it stays in sync with the PCC UI.
+Filename: "{cmd}"; \
+  Parameters: "/C set PCC_DB_PATH={commonappdata}\PlexCommandCenter\pcc.db&& ""{app}\node\node.exe"" ""{app}\windows\tcp-front\install-service.js"""; \
+  WorkingDir: "{app}\windows\tcp-front"; \
+  StatusMsg: "Registering TCP-Front geofence service..."; \
+  Flags: runhidden waituntilterminated
+
 ; --- (3) Optional: open dashboard -------------------------------------------
 Filename: "http://localhost:{code:GetPort}"; \
   Description: "Open dashboard"; \
@@ -93,7 +104,14 @@ Filename: "http://localhost:{code:GetPort}"; \
   Tasks: openbrowser
 
 [UninstallRun]
-; Stop + unregister the service before files are removed (otherwise winsw holds locks).
+; Stop + unregister TCP-Front first (no cross-dependency, but unwound in reverse).
+Filename: "{cmd}"; \
+  Parameters: "/C ""{app}\node\node.exe"" ""{app}\windows\tcp-front\uninstall-service.js"""; \
+  WorkingDir: "{app}\windows\tcp-front"; \
+  RunOnceId: "stopTcpFront"; \
+  Flags: runhidden waituntilterminated
+
+; Stop + unregister the main service before files are removed (winsw holds locks).
 Filename: "{cmd}"; \
   Parameters: "/C ""{app}\node\node.exe"" ""{app}\windows\service-uninstaller.js"""; \
   WorkingDir: "{app}"; \
@@ -102,9 +120,11 @@ Filename: "{cmd}"; \
 
 [UninstallDelete]
 ; Sweep generated artifacts the [Files] section doesn't track. node-windows places its
-; daemon files in <script-dir>\daemon by default; we handle both possible locations.
+; daemon files in <script-dir>\daemon by default; handle every location we use.
 Type: filesandordirs; Name: "{app}\daemon"
 Type: filesandordirs; Name: "{app}\windows\daemon"
+Type: filesandordirs; Name: "{app}\windows\tcp-front\daemon"
+Type: filesandordirs; Name: "{app}\tcp-front\daemon"
 Type: filesandordirs; Name: "{app}\logs"
 ; Data dir is intentionally NOT touched - see CurUninstallStepChanged for the explicit prompt.
 
@@ -153,19 +173,30 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
-  OldNodeExe, OldUninstaller, AppDir: String;
+  OldNodeExe, OldUninstaller, OldTcpUninstaller, OldTcpUninstallerAlt, AppDir: String;
 begin
   if CurStep = ssInstall then
   begin
+    AppDir := ExpandConstant('{app}');
+    OldNodeExe := AppDir + '\node\node.exe';
+
+    // TCP-Front first (no cross-dependency, but unwound in reverse). Try both the
+    // canonical {app}\windows\tcp-front location AND the legacy {app}\tcp-front
+    // location used by early manual installs.
+    OldTcpUninstaller    := AppDir + '\windows\tcp-front\uninstall-service.js';
+    OldTcpUninstallerAlt := AppDir + '\tcp-front\uninstall-service.js';
+    if FileExists(OldNodeExe) and FileExists(OldTcpUninstaller) then
+      Exec(OldNodeExe, '"' + OldTcpUninstaller + '"', AppDir, SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    if FileExists(OldNodeExe) and FileExists(OldTcpUninstallerAlt) then
+      Exec(OldNodeExe, '"' + OldTcpUninstallerAlt + '"', AppDir, SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+    // Main PCC service: clean stop + handle release + registration removal.
     if ServiceExists() then
     begin
-      AppDir := ExpandConstant('{app}');
-      OldNodeExe := AppDir + '\node\node.exe';
       OldUninstaller := AppDir + '\windows\service-uninstaller.js';
       if FileExists(OldNodeExe) and FileExists(OldUninstaller) then
         Exec(OldNodeExe, '"' + OldUninstaller + '"', AppDir, SW_HIDE, ewWaitUntilTerminated, ResultCode)
       else
-        // Fallback: best-effort stop only (handles may not release immediately)
         Exec(ExpandConstant('{sys}\sc.exe'), 'stop {#MyServiceName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
       Sleep(2000);
     end;
