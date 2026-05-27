@@ -6408,17 +6408,37 @@ function readSubtitleSettings() {
 // code. Returns the Plex Stream id or null. This is used to drive `subtitleStream=<id>` on the
 // Plex /video/:/transcode/universal/start URL so Plex burns the chosen sub into the video stream
 // (the only way to get subtitles into a <video> element via Plex's direct transcode pipeline).
+// Prefer text-based subtitle codecs (srt/ass/vtt) over image-based ones (pgs/vobsub/dvdsub)
+// for the same language. Plex's transcoder can technically burn image subs but in practice it
+// often silently no-ops on them — meanwhile if the same file has an srt track in the same
+// language we should pick that one. This is the root cause of "The Office has subs but burn
+// doesn't fire": picker used to return whichever sub came first in the Stream array, which
+// for many ripped episodes is the pgs/vobsub track.
+const PLEX_PICK_TEXT_SUBS = new Set(['srt', 'ass', 'ssa', 'vtt', 'webvtt', 'ttml', 'subrip', 'mov_text', 'sub']);
+const PLEX_PICK_IMAGE_SUBS = new Set(['pgs', 'pgssub', 'hdmv_pgs', 'vobsub', 'dvdsub', 'dvd_subtitle', 'xsub']);
 function pickPlexSubtitleStreamId(media, langCode) {
   if (!langCode) return null;
   const target = String(langCode).toLowerCase();
+  const matches = []; // collect every language match, then sort by codec preference
   for (const part of (media?.Part || [])) {
     for (const s of (part.Stream || [])) {
       if (s.streamType !== 3) continue; // 1=video, 2=audio, 3=subtitle
       const lang = (s.languageCode || s.language || s.languageTag || '').toLowerCase();
-      if (lang === target || lang.startsWith(target) || target.startsWith(lang)) return s.id;
+      if (lang === target || lang.startsWith(target) || target.startsWith(lang)) {
+        const codec = String(s.codec || '').toLowerCase();
+        // Rank: 0 = text (best for burning), 1 = unknown/other, 2 = image (Plex flakes on these)
+        let rank = 1;
+        if (PLEX_PICK_TEXT_SUBS.has(codec)) rank = 0;
+        else if (PLEX_PICK_IMAGE_SUBS.has(codec)) rank = 2;
+        // Secondary tiebreaker: prefer non-forced, non-hearing-impaired tracks (cleanest subs).
+        const tieBreak = (s.forced ? 2 : 0) + (s.hearingImpaired ? 1 : 0);
+        matches.push({ id: s.id, rank, tieBreak, codec });
+      }
     }
   }
-  return null;
+  if (matches.length === 0) return null;
+  matches.sort((a, b) => a.rank - b.rank || a.tieBreak - b.tieBreak);
+  return matches[0].id;
 }
 
 // --- OpenSubtitles fallback ---
