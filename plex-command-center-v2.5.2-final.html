@@ -491,6 +491,23 @@ function App() {
   const [autoColActive, setAutoColActive] = useState([]);
   const [autoColRunning, setAutoColRunning] = useState(false);
 
+  // Settings tab state (admin-only — integrated tool tokens/URLs).
+  // Ported from public/index.html so users can edit Plex/Tautulli/Jellyseerr/Zabbix/Bazarr/
+  // OpenSubtitles URLs and tokens at runtime (the DB overrides env values).
+  const [settingsServices, setSettingsServices] = useState([]);
+  const [settingsEdit, setSettingsEdit] = useState(null);
+  const [settingsTestResults, setSettingsTestResults] = useState({});
+  const [settingsRevealSecret, setSettingsRevealSecret] = useState({});
+  const [settingsSaving, setSettingsSaving] = useState(false);
+
+  // Continue Watching restore modal state (admin-only, opens from Tools tab).
+  // Same source — lets the user snapshot Plex's CW hub and re-push items Plex has aged out.
+  const [cwModal, setCwModal] = useState(false);
+  const [cwState, setCwState] = useState(null);
+  const [cwLoading, setCwLoading] = useState(false);
+  const [cwBusyKey, setCwBusyKey] = useState(null);
+  const [cwShowLive, setCwShowLive] = useState(false);
+
   const showToast = (msg, type='success') => {
     setToast({msg, type});
     setTimeout(() => setToast(null), 3000);
@@ -548,6 +565,85 @@ function App() {
   };
 
   const doLogout = async () => { await fetch('/api/auth/logout',{method:'POST'}); setCurrentUser(null); setAuthState('login'); };
+
+  // --- Settings tab helpers (admin) — ported from public/index.html ---
+  const loadSettings = async () => {
+    const r = await fetch('/api/settings/services').then(x=>x.json()).catch(()=>[]);
+    setSettingsServices(Array.isArray(r) ? r : []);
+  };
+  const openSettingsEdit = (svc) => {
+    const working = svc.fields.map(f => ({ ...f, value: f.type === 'secret' ? '' : (f.value || '') }));
+    setSettingsEdit({ service: svc.service, label: svc.label, fields: working });
+    setSettingsRevealSecret({});
+  };
+  const saveSettings = async () => {
+    if (!settingsEdit) return;
+    setSettingsSaving(true);
+    const body = {};
+    for (const f of settingsEdit.fields) {
+      if (f.type === 'secret' && /^[•*]+$/.test(f.value)) continue;
+      body[f.name] = f.value;
+    }
+    const r = await fetch(`/api/settings/services/${settingsEdit.service}`, {
+      method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+    }).then(x=>x.json()).catch(e=>({error:e.message}));
+    setSettingsSaving(false);
+    if (r.success) { showToast('Settings saved'); setSettingsEdit(null); loadSettings(); }
+    else showToast('Save failed: ' + (r.error||'Unknown'), 'error');
+  };
+  const testService = async (service) => {
+    setSettingsTestResults(prev => ({ ...prev, [service]: { testing: true } }));
+    const r = await fetch(`/api/settings/services/${service}/test`, { method: 'POST' }).then(x=>x.json()).catch(e=>({ok:false,error:e.message}));
+    setSettingsTestResults(prev => ({ ...prev, [service]: r }));
+  };
+
+  // --- Continue Watching helpers (admin) — ported from public/index.html ---
+  const loadCwState = async () => {
+    setCwLoading(true);
+    const r = await fetch('/api/cw/state').then(x=>x.json()).catch(e=>({error:e.message}));
+    setCwState(r); setCwLoading(false);
+  };
+  const cwSnapshotNow = async (deep = false) => {
+    setCwLoading(true);
+    const url = deep ? '/api/cw/snapshot?deep=1' : '/api/cw/snapshot';
+    const r = await fetch(url, { method: 'POST' }).then(x=>x.json()).catch(e=>({error:e.message}));
+    if (r.success) showToast(`${deep?'Deep-scan':'Snapshot'}: ${r.saved} item${r.saved!==1?'s':''}`);
+    else showToast('Snapshot failed: ' + (r.error||'Unknown'), 'error');
+    await loadCwState();
+  };
+  const cwUpdateSettings = async (patch) => {
+    const r = await fetch('/api/cw/settings', {
+      method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(patch)
+    }).then(x=>x.json()).catch(e=>({error:e.message}));
+    if (r.success) { showToast('CW settings updated'); loadCwState(); }
+    else showToast('Update failed: ' + (r.error||'Unknown'), 'error');
+  };
+  const cwRestoreOne = async (rk) => {
+    setCwBusyKey(rk);
+    const r = await fetch(`/api/cw/restore/${rk}`, { method: 'POST' }).then(x=>x.json()).catch(e=>({error:e.message}));
+    setCwBusyKey(null);
+    if (r.success) { showToast('Restored — may take a minute to reappear in Plex'); loadCwState(); }
+    else showToast('Restore failed: ' + (r.error||'Unknown'), 'error');
+  };
+  const cwRestoreAll = async () => {
+    if (!cwState?.snapshots) return;
+    const missing = cwState.snapshots.filter(s => s.isLive === false).map(s => s.rating_key);
+    if (missing.length === 0) return showToast('Nothing to restore', 'info');
+    if (!confirm(`Restore ${missing.length} missing item${missing.length!==1?'s':''}?`)) return;
+    setCwLoading(true);
+    const r = await fetch('/api/cw/restore-bulk', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ rating_keys: missing })
+    }).then(x=>x.json()).catch(e=>({error:e.message}));
+    if (r.success) showToast(`Restored ${r.restored}${r.failed?`, ${r.failed} failed`:''}`);
+    else showToast('Bulk restore failed: ' + (r.error||'Unknown'), 'error');
+    await loadCwState();
+  };
+  const cwForget = async (rk) => {
+    if (!confirm('Forget this snapshot? (cannot be restored after this)')) return;
+    await fetch(`/api/cw/snapshot/${rk}`, { method: 'DELETE' });
+    loadCwState();
+  };
 
   const loadAdminUsers = async () => { const r = await fetch('/api/admin/users').then(x=>x.json()).catch(()=>[]); setAdminUsers(r); };
   const createUser = async () => {
@@ -1646,6 +1742,7 @@ function App() {
             <button className={`nav-btn ${tab==='tools'?'active':''}`} onClick={()=>setTab('tools')}>Tools</button>
             {currentUser?.role==='admin' && <button className={`nav-btn ${tab==='security'?'active':''}`} onClick={()=>{setTab('security');loadSecLive();loadSecBlocked();loadRegSettings();loadRegAlerts();loadRegWhitelist();}}>Security</button>}
             {currentUser?.role==='admin' && <button className={`nav-btn ${tab==='admin'?'active':''}`} onClick={()=>{setTab('admin');loadAdminUsers();loadSubSettings();}}>Admin</button>}
+            {currentUser?.role==='admin' && <button className={`nav-btn ${tab==='settings'?'active':''}`} onClick={()=>{setTab('settings');loadSettings();}}>Settings</button>}
             <button className={`nav-btn ${tab==='livetv'?'active':''}`} onClick={()=>setTab('livetv')}>Live TV</button>
             <button className={`nav-btn ${tab==='subs'?'active':''}`} onClick={()=>setTab('subs')}>Missing Subs</button>
             <div style={{display:'flex',alignItems:'center',gap:'.5rem',marginLeft:'.5rem',paddingLeft:'.75rem',borderLeft:'1px solid rgba(100,116,139,.2)'}}>
@@ -2105,8 +2202,9 @@ function App() {
                 {icon:'📈',title:'Analytics Export',desc:'Export watch statistics with date range filtering',action:()=>{setAnalyticsModal(true);loadAnalytics(7);}},
                 {icon:'🔍',title:'Duplicate Finder',desc:'Find duplicate media files across your libraries',action:()=>{setDuplicateModal(true);setDupData(null);}},
                 {icon:'🩺',title:'Library Health Check',desc:'Scan for missing thumbnails, metadata issues, and more',action:()=>{setHealthModal(true);setHealthData(null);}},
-                {icon:'👥',title:'Copy Watch History',desc:'Copy watched status between users via Plex',action:openCopyWatch}
-              ].map((t,i)=>(
+                {icon:'👥',title:'Copy Watch History',desc:'Copy watched status between users via Plex',action:openCopyWatch},
+                {icon:'🧹',title:'Continue Watching Restore',desc:'Find items Plex aged out of Continue Watching and put them back',action:()=>{setCwModal(true);loadCwState();},adminOnly:true}
+              ].filter(t => !t.adminOnly || currentUser?.role === 'admin').map((t,i)=>(
                 <div key={i} className="tool-card" onClick={t.action}>
                   <div className="tool-icon">{t.icon}</div>
                   <div className="tool-title">{t.title}</div>
@@ -2568,6 +2666,243 @@ function App() {
             </div>
           </div>
         )}
+
+        {/* ============ SETTINGS (admin) — ported from public/index.html ============ */}
+        {tab==='settings' && currentUser?.role==='admin' && (
+          <div>
+            <div className="page-title">
+              <span>Integrations & Tokens</span>
+              <button className="btn btn-outline btn-sm" onClick={loadSettings}>Refresh</button>
+            </div>
+            <div style={{fontSize:'.8rem',color:'#94a3b8',marginBottom:'1rem',maxWidth:'780px'}}>
+              Edit connection URLs and API tokens for the tools this app integrates with. Values
+              saved here override the <code>.env</code>/Docker config (DB wins). Clear a field and
+              save to revert to the env value. Changes apply immediately — no restart required.
+            </div>
+            {settingsServices.length === 0 ? (
+              <div className="empty">Loading…</div>
+            ) : (
+              <div style={{display:'grid',gap:'.75rem',maxWidth:'780px'}}>
+                {settingsServices.map(svc => {
+                  const test = settingsTestResults[svc.service];
+                  return (
+                    <div key={svc.service} className="stream-card">
+                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:'1rem'}}>
+                        <div style={{flex:1,minWidth:0}}>
+                          <div style={{fontWeight:600,fontSize:'.95rem'}}>{svc.label}</div>
+                          {svc.description && <div style={{fontSize:'.75rem',color:'#94a3b8',marginTop:'.2rem'}}>{svc.description}</div>}
+                          <div style={{display:'flex',flexWrap:'wrap',gap:'.4rem',marginTop:'.5rem'}}>
+                            {svc.fields.map(f => (
+                              <span key={f.name} className={`status-badge ${f.hasValue ? (f.source==='db'?'status-approved':'status-available') : 'status-declined'}`}
+                                style={{fontSize:'.7rem'}}>
+                                {f.label}: {f.hasValue ? (f.source==='db' ? 'overridden' : f.source) : 'unset'}
+                              </span>
+                            ))}
+                          </div>
+                          {test && !test.testing && (
+                            <div style={{marginTop:'.6rem',padding:'.4rem .6rem',borderRadius:'4px',fontSize:'.75rem',
+                                         background: test.ok ? 'rgba(16,185,129,.12)' : 'rgba(239,68,68,.12)',
+                                         color: test.ok ? '#34d399' : '#f87171'}}>
+                              {test.ok ? `✓ ${test.detail || 'OK'}` : `✗ ${test.error || 'Failed'}`}
+                            </div>
+                          )}
+                        </div>
+                        <div style={{display:'flex',gap:'.4rem',flexShrink:0}}>
+                          <button className="btn-sm btn-outline" onClick={()=>testService(svc.service)} disabled={test?.testing}>
+                            {test?.testing ? 'Testing…' : 'Test'}
+                          </button>
+                          <button className="btn-sm btn-primary" onClick={()=>openSettingsEdit(svc)}>Edit</button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Settings Edit Modal */}
+        {settingsEdit && (
+          <div className="overlay" onClick={()=>!settingsSaving && setSettingsEdit(null)}>
+            <div className="modal" onClick={e=>e.stopPropagation()} style={{width:'480px',maxHeight:'85vh',overflowY:'auto'}}>
+              <div className="modal-head">
+                <div className="modal-title">{settingsEdit.label}</div>
+                <button className="modal-close" onClick={()=>setSettingsEdit(null)} disabled={settingsSaving}>×</button>
+              </div>
+              <div style={{fontSize:'.75rem',color:'#94a3b8',marginBottom:'.75rem'}}>
+                Leave a field blank and save to clear the override (reverts to env / default).
+                Secret fields show <code>••••</code> placeholder — type a new value to replace.
+              </div>
+              {settingsEdit.fields.map((f, idx) => (
+                <div key={f.name} className="form-row">
+                  <label className="form-label" style={{display:'flex',justifyContent:'space-between',alignItems:'baseline'}}>
+                    <span>{f.label}</span>
+                    <span style={{fontSize:'.65rem',color:'#94a3b8',fontWeight:400}}>env: <code>{f.envKey}</code> · src: {f.source}</span>
+                  </label>
+                  {f.type === 'secret' ? (
+                    <div style={{display:'flex',gap:'.4rem'}}>
+                      <input
+                        className="form-input"
+                        type={settingsRevealSecret[f.name] ? 'text' : 'password'}
+                        placeholder={f.hasValue ? '•••••••• (saved — type to replace)' : 'not set'}
+                        value={f.value}
+                        onChange={e=>{
+                          const nf = [...settingsEdit.fields];
+                          nf[idx] = { ...nf[idx], value: e.target.value };
+                          setSettingsEdit({ ...settingsEdit, fields: nf });
+                        }}/>
+                      <button className="btn-sm btn-outline" onClick={()=>setSettingsRevealSecret(prev=>({...prev,[f.name]:!prev[f.name]}))}>
+                        {settingsRevealSecret[f.name] ? 'Hide' : 'Show'}
+                      </button>
+                    </div>
+                  ) : (
+                    <input
+                      className="form-input"
+                      type={f.type === 'url' ? 'url' : 'text'}
+                      placeholder={f.type === 'url' ? 'http://host:port' : ''}
+                      value={f.value}
+                      onChange={e=>{
+                        const nf = [...settingsEdit.fields];
+                        nf[idx] = { ...nf[idx], value: e.target.value };
+                        setSettingsEdit({ ...settingsEdit, fields: nf });
+                      }}/>
+                  )}
+                </div>
+              ))}
+              <div style={{display:'flex',gap:'.5rem',marginTop:'.75rem'}}>
+                <button className="btn btn-outline" style={{flex:1}} onClick={()=>setSettingsEdit(null)} disabled={settingsSaving}>Cancel</button>
+                <button className="btn btn-primary" style={{flex:2}} onClick={saveSettings} disabled={settingsSaving}>
+                  {settingsSaving ? 'Saving…' : 'Save changes'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Continue Watching Restore Modal (admin) — ported from public/index.html */}
+        {cwModal && currentUser?.role === 'admin' && (() => {
+          const s = cwState?.settings || {};
+          const snaps = cwState?.snapshots || [];
+          const missing = snaps.filter(x => x.isLive === false);
+          const live = snaps.filter(x => x.isLive === true);
+          const unknown = snaps.filter(x => x.isLive === null || x.isLive === undefined);
+          const listFor = cwShowLive ? live : missing;
+          const renderRow = (item) => {
+            const subtitle = item.show_title
+              ? `${item.show_title} · S${String(item.season_num||0).padStart(2,'0')}E${String(item.episode_num||0).padStart(2,'0')}`
+              : (item.year ? `${item.item_type || 'movie'} · ${item.year}` : (item.item_type || ''));
+            const offsetMin = Math.floor((item.view_offset||0) / 60000);
+            const durMin = Math.floor((item.duration||0) / 60000);
+            const seenAgo = item.last_in_hub_at ? (typeof ago==='function'?ago(item.last_in_hub_at):item.last_in_hub_at) : '';
+            return (
+              <div key={item.rating_key} className="stream-card" style={{display:'flex',alignItems:'center',gap:'.75rem'}}>
+                {item.thumb ? (
+                  <img src={item.thumb} alt="" style={{width:'44px',height:'66px',objectFit:'cover',borderRadius:'4px',flexShrink:0,background:'#0f172a'}} onError={e=>{e.target.style.display='none';}}/>
+                ) : (
+                  <div style={{width:'44px',height:'66px',borderRadius:'4px',background:'linear-gradient(135deg,#1e3a5f,#2d1f6e)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'1.4rem',flexShrink:0}}>
+                    {item.item_type==='episode'?'📺':'🎬'}
+                  </div>
+                )}
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontWeight:500,fontSize:'.85rem',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{item.title || '(untitled)'}</div>
+                  <div style={{fontSize:'.7rem',color:'#94a3b8'}}>{subtitle}</div>
+                  <div className="progress-wrap" style={{marginTop:'.25rem'}}>
+                    <div className="progress-bar" style={{width:`${item.progress_pct||0}%`}}></div>
+                  </div>
+                  <div style={{fontSize:'.65rem',color:'#94a3b8',marginTop:'.2rem'}}>
+                    {offsetMin}m / {durMin}m ({item.progress_pct||0}%)
+                    {seenAgo && <span> · last in hub {seenAgo}</span>}
+                  </div>
+                </div>
+                <div style={{display:'flex',gap:'.3rem',flexShrink:0}}>
+                  {item.isLive === false && (
+                    <button className="btn-sm btn-primary" onClick={()=>cwRestoreOne(item.rating_key)} disabled={cwBusyKey===item.rating_key}>
+                      {cwBusyKey===item.rating_key ? '…' : 'Restore'}
+                    </button>
+                  )}
+                  <button className="btn-sm btn-delete" onClick={()=>cwForget(item.rating_key)}>Forget</button>
+                </div>
+              </div>
+            );
+          };
+          return (
+            <div className="overlay" onClick={()=>setCwModal(false)}>
+              <div className="modal" onClick={e=>e.stopPropagation()} style={{width:'720px',maxWidth:'95vw',maxHeight:'90vh',overflowY:'auto'}}>
+                <div className="modal-head">
+                  <div className="modal-title">Continue Watching Restore</div>
+                  <button className="modal-close" onClick={()=>setCwModal(false)}>×</button>
+                </div>
+                <div style={{fontSize:'.75rem',color:'#94a3b8',marginBottom:'.75rem'}}>
+                  Snapshots items currently in your Plex <em>Continue Watching</em> hub so that anything Plex ages out can be re-pushed via a stopped-timeline event. Restore re-applies the snapshotted <code>viewOffset</code> and updates <code>lastViewedAt</code> — Plex's hub may take a minute to refresh.
+                </div>
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'.75rem',marginBottom:'1rem'}}>
+                  <div className="card" style={{padding:'.75rem'}}>
+                    <div style={{fontWeight:600,fontSize:'.85rem',marginBottom:'.5rem'}}>Snapshotter</div>
+                    <label style={{display:'flex',alignItems:'center',gap:'.4rem',fontSize:'.8rem',marginBottom:'.4rem'}}>
+                      <input type="checkbox" checked={!!s.enabled} onChange={e=>cwUpdateSettings({enabled:e.target.checked})}/>
+                      Enabled
+                    </label>
+                    <label style={{display:'flex',alignItems:'center',gap:'.4rem',fontSize:'.8rem',marginBottom:'.4rem'}}>
+                      Interval
+                      <input type="number" min="1" max="1440" className="form-input" style={{width:'70px',padding:'.2rem .4rem'}}
+                        value={s.interval_minutes ?? 15}
+                        onChange={e=>cwUpdateSettings({interval_minutes:parseInt(e.target.value)||15})}/>
+                      <span style={{fontSize:'.7rem',color:'#94a3b8'}}>minutes</span>
+                    </label>
+                    <label style={{display:'flex',alignItems:'center',gap:'.4rem',fontSize:'.8rem'}}>
+                      <input type="checkbox" checked={!!s.auto_restore} onChange={e=>cwUpdateSettings({auto_restore:e.target.checked})}/>
+                      Auto-restore missing items each cycle
+                    </label>
+                  </div>
+                  <div className="card" style={{padding:'.75rem'}}>
+                    <div style={{fontWeight:600,fontSize:'.85rem',marginBottom:'.5rem'}}>Status</div>
+                    <div style={{fontSize:'.75rem',color:'#94a3b8',lineHeight:1.6}}>
+                      Snapshots: <strong style={{color:'#cbd5e1'}}>{cwState?.snapshotCount ?? '–'}</strong><br/>
+                      Live in hub: <strong style={{color:'#cbd5e1'}}>{cwState?.liveCount ?? '–'}</strong><br/>
+                      Missing (recoverable): <strong style={{color:'#f87171'}}>{cwState?.missingCount ?? '–'}</strong>
+                      {cwState?.plexError && <div style={{color:'#f87171',marginTop:'.25rem'}}>Plex error: {cwState.plexError}</div>}
+                    </div>
+                  </div>
+                </div>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'.75rem',flexWrap:'wrap',gap:'.5rem'}}>
+                  <div className="toggle">
+                    <button className={`toggle-opt ${!cwShowLive?'active':''}`} onClick={()=>setCwShowLive(false)}>
+                      Missing ({missing.length})
+                    </button>
+                    <button className={`toggle-opt ${cwShowLive?'active':''}`} onClick={()=>setCwShowLive(true)}>
+                      Live ({live.length})
+                    </button>
+                  </div>
+                  <div style={{display:'flex',gap:'.4rem'}}>
+                    <button className="btn-sm btn-outline" onClick={loadCwState} disabled={cwLoading}>{cwLoading?'…':'Refresh'}</button>
+                    <button className="btn-sm btn-outline" onClick={()=>cwSnapshotNow(false)} disabled={cwLoading}>Snapshot now</button>
+                    <button className="btn-sm btn-outline" onClick={()=>cwSnapshotNow(true)} disabled={cwLoading} title="Walk every library for items with progress > 0 — catches items Plex's onDeck hub has aged out.">Deep scan</button>
+                    {!cwShowLive && missing.length > 0 && (
+                      <button className="btn-sm btn-primary" onClick={cwRestoreAll} disabled={cwLoading}>Restore all ({missing.length})</button>
+                    )}
+                  </div>
+                </div>
+                {cwLoading && snaps.length === 0 ? (
+                  <div className="empty">Loading…</div>
+                ) : listFor.length === 0 ? (
+                  <div className="empty">
+                    {cwShowLive
+                      ? 'No items currently live in Continue Watching.'
+                      : (snaps.length === 0
+                          ? 'No snapshots yet. Click "Snapshot now" — the cron will then track items over time.'
+                          : 'Nothing missing. Plex still has all snapshotted items in its Continue Watching hub.')}
+                  </div>
+                ) : (
+                  <div>{listFor.map(renderRow)}</div>
+                )}
+                {unknown.length > 0 && !cwState?.plexError && (
+                  <div style={{fontSize:'.7rem',color:'#94a3b8',marginTop:'.5rem'}}>{unknown.length} snapshot{unknown.length!==1?'s':''} with unknown live status (Plex unreachable for this lookup).</div>
+                )}
+              </div>
+            </div>
+          );
+        })()}
 
         {tab==='livetv' && (
           <div>
