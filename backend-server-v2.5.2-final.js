@@ -1950,6 +1950,13 @@ const AUTH_EXEMPT = new Set([
 const AUTH_EXEMPT_PREFIXES = [
   '/api/livetv/stream/', '/api/livetv/m3u', '/api/livetv/xmltv', '/api/livetv/logos/'
 ];
+// Fully-public matchers (no tuner key, no session). Only the cached VTT file URLs —
+// the <track> element can't attach session headers from file://→http:// in Electron and
+// the sub text is just dialog, not secret. KEEP NARROW: must not eclipse sibling routes
+// like /api/livetv/subs/status that need admin gating.
+const AUTH_PUBLIC_MATCHERS = [
+  (p) => /^\/api\/livetv\/subs\/\d+\/[a-z]+\.vtt$/i.test(p)
+];
 const TUNER_PATHS = new Set([
   '/discover.json', '/lineup.json', '/lineup_status.json', '/lineup.post', '/device.xml'
 ]);
@@ -1983,6 +1990,7 @@ function checkTunerKey(req) {
 function requireAuth(req, res, next) {
   // Skip auth for exempt routes
   if (AUTH_EXEMPT.has(req.path)) return next();
+  if (AUTH_PUBLIC_MATCHERS.some(m => m(req.path))) return next();
   if (TUNER_PATHS.has(req.path)) {
     if (!checkTunerKey(req)) return res.status(401).json({ error: 'Tuner key required' });
     return next();
@@ -5837,6 +5845,7 @@ app.get('/api/livetv/watch/:channelId', async (req, res) => {
   // Look up media info from Plex to determine best playback method
   let streamUrl, streamType = 'direct', sessionId = null;
   let pickedMediaIndex = '0'; // visible to transcodeParams below so we hand Plex the working entry
+  let sidecarTrack = null;    // populated by the OpenSubtitles fallback inside the try; read by res.json below
   try {
     const metaRes = await axios.get(`${config.plex.url}/library/metadata/${ratingKey}`, {
       params: { 'X-Plex-Token': config.plex.token },
@@ -5903,14 +5912,47 @@ app.get('/api/livetv/watch/:channelId', async (req, res) => {
     const chromiumSafeAudio = ['aac', 'mp3', 'opus', 'flac', 'vorbis'];
     const audioOk = chromiumSafeAudio.includes(audioCodec);
 
-    // Desktop app (Electron/Chromium) can direct-play H264 and HEVC in MP4/MKV
-    // Browser can only direct-play H264 in MP4/M4V/MOV
-    // Both require Chromium-compatible audio
-    // Direct play bypasses Plex's transcoder entirely, so it can't burn in subtitles. When the
-    // user has a sub language configured we force transcode so the sub picker logic below can run.
+    // Resolve subtitle source up front so the direct-play decision can account for it.
+    //   * Plex-native sub stream: requires Plex transcode + burn (only path to get subs into
+    //     a <video> via Plex's pipeline).
+    //   * OpenSubtitles SRT sidecar: rendered client-side as <track>, so direct-play is fine.
     const _subPref = readSubtitleSettings();
-    const subsRequested = !!(_subPref.language && _subPref.mode === 'burn');
-    const canDirectPlay = !subsRequested && audioOk && (isDesktopApp
+    const wantsSubs = !!(_subPref.language && _subPref.mode === 'burn');
+    let plexSubStreamId = null;
+    if (wantsSubs && !isFiller) {
+      plexSubStreamId = pickPlexSubtitleStreamId(media, _subPref.language, { textOnly: true });
+      if (!plexSubStreamId) {
+        // Fire-and-forget Bazarr search so future airings get a permanent Plex-native sub.
+        // We don't await — Bazarr + Plex scan latency is way longer than the watch RTT.
+        // Prefer Plex metadata (grandparentTitle/parentIndex/index) over our local programs row:
+        // the LiveTV scanner sometimes leaves season_num null for older series, which would
+        // cause findBazarrEpisodeId to bail before even looking.
+        try {
+          const dbProg = db.prepare('SELECT show_title, season_num, episode_num FROM programs WHERE plex_rating_key = ?').get(String(ratingKey)) || {};
+          const prog = {
+            show_title: metadata?.grandparentTitle || dbProg.show_title || null,
+            season_num: (metadata?.parentIndex != null ? metadata.parentIndex : dbProg.season_num),
+            episode_num: (metadata?.index != null ? metadata.index : dbProg.episode_num)
+          };
+          if (prog.show_title) kickBazarrSearch(ratingKey, prog, _subPref.language);
+        } catch(e) { /* ignore */ }
+
+        // Immediate-gratification fallback: OpenSubtitles sidecar SRT for THIS airing.
+        try {
+          const os = await findOpenSubtitlesSubtitle(ratingKey, _subPref.language);
+          if (os) {
+            const lc = osLangCode(_subPref.language);
+            sidecarTrack = { url: `/api/livetv/subs/${ratingKey}/${lc}.vtt`, srclang: lc, label: lc.toUpperCase() };
+            console.log(`LiveTV Watch: OpenSubtitles sidecar for "${title}" rk=${ratingKey} lang=${lc}`);
+          }
+        } catch(e) { /* swallow — playback continues without subs */ }
+      }
+    }
+    // Desktop app (Electron/Chromium) can direct-play H264 and HEVC in MP4/MKV;
+    // browser can only direct-play H264 in MP4/M4V/MOV. Plex-burn subs force transcode;
+    // sidecar subs do not.
+    const needsBurnTranscode = !!plexSubStreamId;
+    const canDirectPlay = !needsBurnTranscode && audioOk && (isDesktopApp
       ? ['h264', 'hevc', 'h265'].includes(videoCodec) && ['mp4', 'm4v', 'mov', 'mkv'].includes(container)
       : videoCodec === 'h264' && ['mp4', 'm4v', 'mov'].includes(container));
 
@@ -5925,10 +5967,6 @@ app.get('/api/livetv/watch/:channelId', async (req, res) => {
       // Only allow direct stream for Chromium-safe audio; otherwise full transcode
       const chromiumAudio = ['aac', 'mp3', 'opus', 'flac', 'vorbis'];
       const audioSafe = chromiumAudio.includes((media?.audioCodec || '').toLowerCase());
-      const subSettings = readSubtitleSettings();
-      const subStreamId = (subSettings.language && subSettings.mode === 'burn')
-        ? pickPlexSubtitleStreamId(media, subSettings.language)
-        : null;
       const transcodeParams = {
         path: `/library/metadata/${ratingKey}`,
         mediaIndex: pickedMediaIndex,
@@ -5951,14 +5989,14 @@ app.get('/api/livetv/watch/:channelId', async (req, res) => {
         'X-Plex-Client-Identifier': sessionId,
         'X-Plex-Token': config.plex.token
       };
-      if (subStreamId) {
-        transcodeParams.subtitleStream = String(subStreamId);
+      if (plexSubStreamId) {
+        transcodeParams.subtitleStream = String(plexSubStreamId);
         // `subtitles=burn` forces Plex to render the sub into the video frame. Without this,
         // Plex picks per-client capability and for browsers defaults to sidecar SRT — which
         // <video> can't display. Burning is the only way to guarantee subs in our web/desktop
         // player.
         transcodeParams.subtitles = 'burn';
-        console.log(`LiveTV Watch: Burning '${subSettings.language}' subtitle (Plex stream id=${subStreamId}) for ${title}`);
+        console.log(`LiveTV Watch: Burning '${_subPref.language}' subtitle (Plex stream id=${plexSubStreamId}) for ${title}`);
       }
       // Call decision endpoint first to set up the transcode session (required by Plex)
       try {
@@ -6039,7 +6077,8 @@ app.get('/api/livetv/watch/:channelId', async (req, res) => {
     sessionId,
     watchId,
     isFiller,
-    contentType: current.item.program_id ? (current.item.prog_type || 'program') : 'filler'
+    contentType: current.item.program_id ? (current.item.prog_type || 'program') : 'filler',
+    subtitleTrack: sidecarTrack
   });
 });
 
@@ -6063,22 +6102,42 @@ app.get('/api/livetv/watch/:channelId/from-start', async (req, res) => {
   // <video> can't decode those audio codecs. Forcing Plex to transcode audio to AAC fixes that.
   let streamUrl, streamType = 'transcode', sessionId = `PCC-WFS-${Date.now()}`;
   let media = null;
+  let metadata = null;
   let pickedMediaIndex = '0';
   try {
     const metaRes = await axios.get(`${config.plex.url}/library/metadata/${ratingKey}`, {
       params: { 'X-Plex-Token': config.plex.token },
       headers: { Accept: 'application/json' }, timeout: 5000
     });
-    const metadata = metaRes.data?.MediaContainer?.Metadata?.[0];
+    metadata = metaRes.data?.MediaContainer?.Metadata?.[0];
     const picked = await pickPlayableMedia(ratingKey, metadata);
     media = picked?.media || metadata?.Media?.[0];
     if (picked) pickedMediaIndex = String(picked.mediaIdx);
   } catch(e) { /* fall through — we can still build a transcode URL without metadata */ }
 
   const subSettings = readSubtitleSettings();
-  const subStreamId = (subSettings.language && subSettings.mode === 'burn')
-    ? pickPlexSubtitleStreamId(media, subSettings.language)
-    : null;
+  const wantsSubs = !!(subSettings.language && subSettings.mode === 'burn');
+  const subStreamId = wantsSubs ? pickPlexSubtitleStreamId(media, subSettings.language, { textOnly: true }) : null;
+  let sidecarTrack = null;
+  if (wantsSubs && !subStreamId) {
+    try {
+      const dbProg = db.prepare('SELECT show_title, season_num, episode_num FROM programs WHERE plex_rating_key = ?').get(String(ratingKey)) || {};
+      const prog = {
+        show_title: metadata?.grandparentTitle || dbProg.show_title || null,
+        season_num: (metadata?.parentIndex != null ? metadata.parentIndex : dbProg.season_num),
+        episode_num: (metadata?.index != null ? metadata.index : dbProg.episode_num)
+      };
+      if (prog.show_title) kickBazarrSearch(ratingKey, prog, subSettings.language);
+    } catch(e) { /* ignore */ }
+    try {
+      const os = await findOpenSubtitlesSubtitle(ratingKey, subSettings.language);
+      if (os) {
+        const lc = osLangCode(subSettings.language);
+        sidecarTrack = { url: `/api/livetv/subs/${ratingKey}/${lc}.vtt`, srclang: lc, label: lc.toUpperCase() };
+        console.log(`[LiveTV/from-start] OpenSubtitles sidecar for "${title}" rk=${ratingKey} lang=${lc}`);
+      }
+    } catch(e) { /* swallow */ }
+  }
 
   const params = {
     path: `/library/metadata/${ratingKey}`, mediaIndex: pickedMediaIndex, partIndex: '0',
@@ -6112,8 +6171,153 @@ app.get('/api/livetv/watch/:channelId/from-start', async (req, res) => {
     seasonNum: current.item.season_num || null,
     episodeNum: current.item.episode_num || null,
     channelId: ch.id, channelName: ch.name, channelNumber: ch.number,
-    offsetSec: 0, sessionId, watchId, fromStart: true
+    offsetSec: 0, sessionId, watchId, fromStart: true,
+    subtitleTrack: sidecarTrack
   });
+});
+
+// --- LiveTV subtitle pre-cache scanner ---
+// Walks every program in enabled channels, checks Plex for the configured-language sub,
+// and asks OpenSubtitles to fetch missing ones. The point: by the time you tune to an
+// episode, the SRT is already on PCC's disk (and ideally already uploaded to Plex) so the
+// first watch is instant — no live 2-4s OS round-trip in the play path.
+let _subScanState = { running: false, total: 0, done: 0, fetched: 0, plexHad: 0, alreadyCached: 0, uploaded: 0, noMatch: 0, errors: 0, startedAt: null, finishedAt: null, lastError: null };
+
+async function scanLiveTVForMissingSubs(opts = {}) {
+  if (_subScanState.running) throw new Error('scan already running');
+  const { language } = readSubtitleSettings();
+  if (!language) throw new Error('no subtitle_language configured');
+  if (!config.opensubtitles.apiKey) throw new Error('OpenSubtitles not configured');
+  const throttleMs = Math.max(500, opts.throttleMs || 3000); // delay between OS network hits
+  const limit = opts.limit > 0 ? opts.limit : null;
+  const lc = osLangCode(language);
+
+  // De-dupe by rkey so a program that appears on multiple channels is only checked once.
+  let rows = db.prepare(`
+    SELECT DISTINCT p.plex_rating_key as rkey, p.show_title, p.season_num, p.episode_num
+    FROM channel_programming cp
+    JOIN channels c ON cp.channel_id = c.id
+    JOIN programs p ON cp.program_id = p.id
+    WHERE c.enabled = 1 AND p.plex_rating_key IS NOT NULL
+  `).all();
+  if (limit) rows = rows.slice(0, limit);
+
+  _subScanState = { running: true, total: rows.length, done: 0, fetched: 0, plexHad: 0, alreadyCached: 0, uploaded: 0, noMatch: 0, errors: 0, startedAt: new Date().toISOString(), finishedAt: null, lastError: null };
+  console.log(`[SubScan] starting: ${rows.length} programs, lang=${lc}, throttle=${throttleMs}ms`);
+
+  try {
+    for (const row of rows) {
+      if (!_subScanState.running) break; // allow external cancel
+      try {
+        const destPath = path.join(SUBS_CACHE_DIR, `${row.rkey}.${lc}.srt`);
+        if (fs.existsSync(destPath)) { _subScanState.alreadyCached++; continue; }
+
+        // Quick Plex metadata check first — no network cost on the OS side.
+        let plexHas = false;
+        try {
+          const meta = await axios.get(`${config.plex.url}/library/metadata/${row.rkey}`, {
+            params: { 'X-Plex-Token': config.plex.token },
+            headers: { Accept: 'application/json' }, timeout: 5000
+          });
+          const media = meta.data?.MediaContainer?.Metadata?.[0]?.Media?.[0];
+          if (pickPlexSubtitleStreamId(media, language, { textOnly: true })) plexHas = true;
+        } catch (e) { /* metadata error → still try OS */ }
+
+        if (plexHas) { _subScanState.plexHad++; continue; }
+
+        // Respect cooldown set by OS 429/503 — don't even try if we're throttled.
+        if (Date.now() < _osCooldownUntil) { _subScanState.errors++; continue; }
+
+        const r = await findOpenSubtitlesSubtitle(row.rkey, language);
+        if (r) {
+          _subScanState.fetched++;
+          // findOpenSubtitlesSubtitle already fires Plex upload async; track it best-effort.
+          _subScanState.uploaded++;
+        } else {
+          _subScanState.noMatch++;
+        }
+        // Throttle so we don't blow the daily OS quota in one minute.
+        await new Promise(r => setTimeout(r, throttleMs));
+      } catch (e) {
+        _subScanState.errors++;
+        _subScanState.lastError = e.message;
+      } finally {
+        _subScanState.done++;
+      }
+    }
+  } finally {
+    _subScanState.running = false;
+    _subScanState.finishedAt = new Date().toISOString();
+    console.log(`[SubScan] done: fetched=${_subScanState.fetched} plexHad=${_subScanState.plexHad} cached=${_subScanState.alreadyCached} noMatch=${_subScanState.noMatch} errors=${_subScanState.errors}`);
+  }
+  return _subScanState;
+}
+
+app.post('/api/livetv/subs/scan', requireAdmin, (req, res) => {
+  if (_subScanState.running) return res.status(409).json({ error: 'scan already running', state: _subScanState });
+  const throttleMs = parseInt(req.query.throttleMs) || undefined;
+  const limit = parseInt(req.query.limit) || undefined;
+  scanLiveTVForMissingSubs({ throttleMs, limit }).catch(e => { _subScanState.lastError = e.message; console.warn('[SubScan] error:', e.message); });
+  res.json({ ok: true, state: _subScanState });
+});
+app.post('/api/livetv/subs/scan/stop', requireAdmin, (req, res) => {
+  _subScanState.running = false;
+  res.json({ ok: true, state: _subScanState });
+});
+app.get('/api/livetv/subs/status', requireAdmin, (req, res) => {
+  let cacheCount = 0, cacheBytes = 0;
+  try {
+    for (const f of fs.readdirSync(SUBS_CACHE_DIR)) {
+      if (!f.endsWith('.srt')) continue;
+      cacheCount++;
+      try { cacheBytes += fs.statSync(path.join(SUBS_CACHE_DIR, f)).size; } catch(e) {}
+    }
+  } catch(e) {}
+  res.json({
+    scan: _subScanState,
+    cache: { count: cacheCount, bytes: cacheBytes, dir: SUBS_CACHE_DIR },
+    quota: _osQuotaState,
+    cooldownUntil: _osCooldownUntil > Date.now() ? new Date(_osCooldownUntil).toISOString() : null,
+    language: readSubtitleSettings().language || null
+  });
+});
+
+// Nightly scan at 03:00 local. setInterval polls each minute and runs once when the hour
+// hits — keeps the cache warm for new episodes added by the channel scanner.
+let _subScanDoneToday = null;
+setInterval(() => {
+  try {
+    if (!config.opensubtitles.apiKey) return;
+    if (!LIVETV_ENABLED) return;
+    if (_subScanState.running) return;
+    const now = new Date();
+    if (now.getHours() !== 3) return;
+    const key = now.toISOString().slice(0, 10);
+    if (_subScanDoneToday === key) return;
+    _subScanDoneToday = key;
+    console.log('[SubScan] cron tick — nightly pre-cache run');
+    scanLiveTVForMissingSubs().catch(e => console.warn('[SubScan] cron error:', e.message));
+  } catch(e) { /* ignore */ }
+}, 60 * 1000);
+
+// Serve a cached OpenSubtitles SRT as WebVTT for <track> playback. Path matches the URL
+// shape returned in the watch response (subtitleTrack.url). Reads from SUBS_CACHE_DIR so
+// only subs already fetched by findOpenSubtitlesSubtitle are served — this endpoint never
+// triggers a download itself.
+app.get('/api/livetv/subs/:rkey/:lang.vtt', (req, res) => {
+  const rkey = String(req.params.rkey).replace(/[^0-9]/g, '');
+  const lang = String(req.params.lang).replace(/[^a-z]/gi, '').toLowerCase();
+  if (!rkey || !lang) return res.status(400).send('bad params');
+  const srtPath = path.join(SUBS_CACHE_DIR, `${rkey}.${lang}.srt`);
+  if (!fs.existsSync(srtPath)) return res.status(404).send('no subs');
+  try {
+    const vtt = srtToWebVTT(fs.readFileSync(srtPath, 'utf8'));
+    res.set('Content-Type', 'text/vtt; charset=utf-8');
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.send(vtt);
+  } catch (e) {
+    res.status(500).send('read failed');
+  }
 });
 
 // Stop a watch session
@@ -6416,24 +6620,33 @@ function readSubtitleSettings() {
 // for many ripped episodes is the pgs/vobsub track.
 const PLEX_PICK_TEXT_SUBS = new Set(['srt', 'ass', 'ssa', 'vtt', 'webvtt', 'ttml', 'subrip', 'mov_text', 'sub']);
 const PLEX_PICK_IMAGE_SUBS = new Set(['pgs', 'pgssub', 'hdmv_pgs', 'vobsub', 'dvdsub', 'dvd_subtitle', 'xsub']);
-function pickPlexSubtitleStreamId(media, langCode) {
+function pickPlexSubtitleStreamId(media, langCode, opts = {}) {
   if (!langCode) return null;
   const target = String(langCode).toLowerCase();
+  // `target.startsWith(lang)` would match an empty `lang` (every string starts with '');
+  // that turned untagged tracks into false-positive matches. Strip trim and require length.
   const matches = []; // collect every language match, then sort by codec preference
   for (const part of (media?.Part || [])) {
     for (const s of (part.Stream || [])) {
       if (s.streamType !== 3) continue; // 1=video, 2=audio, 3=subtitle
-      const lang = (s.languageCode || s.language || s.languageTag || '').toLowerCase();
-      if (lang === target || lang.startsWith(target) || target.startsWith(lang)) {
-        const codec = String(s.codec || '').toLowerCase();
-        // Rank: 0 = text (best for burning), 1 = unknown/other, 2 = image (Plex flakes on these)
-        let rank = 1;
-        if (PLEX_PICK_TEXT_SUBS.has(codec)) rank = 0;
-        else if (PLEX_PICK_IMAGE_SUBS.has(codec)) rank = 2;
-        // Secondary tiebreaker: prefer non-forced, non-hearing-impaired tracks (cleanest subs).
-        const tieBreak = (s.forced ? 2 : 0) + (s.hearingImpaired ? 1 : 0);
-        matches.push({ id: s.id, rank, tieBreak, codec });
-      }
+      const lang = (s.languageCode || s.language || s.languageTag || '').toLowerCase().trim();
+      if (!lang) continue; // untagged stream — can't claim it matches any specific language
+      const matchesLang = lang === target
+        || (target.length > 1 && lang.startsWith(target))
+        || (lang.length > 1 && target.startsWith(lang));
+      if (!matchesLang) continue;
+      const codec = String(s.codec || '').toLowerCase();
+      const isImage = PLEX_PICK_IMAGE_SUBS.has(codec);
+      // Caller can opt out of image-codec results entirely: Plex's burn pipeline often
+      // silently no-ops on PGS/VobSub, so counting them as "Plex has a sub" leaves users
+      // with no subs and OS never gets consulted. The scanner sets textOnly=true.
+      if (opts.textOnly && isImage) continue;
+      // Rank: 0 = text (best for burning), 1 = unknown/other, 2 = image (Plex flakes on these)
+      let rank = 1;
+      if (PLEX_PICK_TEXT_SUBS.has(codec)) rank = 0;
+      else if (isImage) rank = 2;
+      const tieBreak = (s.forced ? 2 : 0) + (s.hearingImpaired ? 1 : 0);
+      matches.push({ id: s.id, rank, tieBreak, codec });
     }
   }
   if (matches.length === 0) return null;
@@ -6450,6 +6663,64 @@ const OPENSUBTITLES_API = 'https://api.opensubtitles.com/api/v1';
 const SUBS_CACHE_DIR = paths.subsCacheDir;
 const OS_USER_AGENT = 'PlexCommandCenter v3.0';
 let _osTokenCache = { token: null, expiresAt: 0 };
+// Hard backoff after OS returns 429 or 503: skip subsequent calls until this timestamp.
+// Set by osRetry on the final failed attempt so the scanner doesn't burn through quota
+// pounding a degraded endpoint.
+let _osCooldownUntil = 0;
+
+// Retry helper. OS frequently returns 429 (quota/rate) and 503 (transient). Retries with
+// jittered backoff, honoring Retry-After when present. Throws the last error if all
+// attempts fail. Updates _osCooldownUntil on terminal 429/503 so callers can skip new work.
+async function osRetry(fn, opName) {
+  const delays = [1500, 4500, 12000];
+  let last;
+  for (let i = 0; i <= delays.length; i++) {
+    try { return await fn(); }
+    catch (e) {
+      last = e;
+      const status = e.response?.status;
+      const retriable = status === 429 || status === 503 || status === 502
+        || (!status && (e.code === 'ECONNRESET' || e.code === 'ETIMEDOUT' || e.code === 'EAI_AGAIN'));
+      if (!retriable || i === delays.length) {
+        if (status === 429 || status === 503) {
+          // Distinguish rate-limit-second (transient, recovers in seconds) from daily-quota /
+          // outage. 429 with Retry-After: cooldown the suggested time. 503 without Retry-After:
+          // OS flaps for short windows — 60s pause is enough, longer just delays first user fetch.
+          const retryAfter = parseInt(e.response?.headers?.['retry-after']);
+          const cooldown = Number.isFinite(retryAfter) ? retryAfter * 1000 : 60 * 1000;
+          _osCooldownUntil = Math.max(_osCooldownUntil, Date.now() + cooldown);
+          const body = typeof e.response?.data === 'string' ? e.response.data.slice(0, 200) : JSON.stringify(e.response?.data || {}).slice(0, 200);
+          console.warn(`[OS] ${opName} terminal ${status}; cooling down ${Math.round(cooldown/1000)}s. body=${body}`);
+        } else if (status === 406) {
+          // OpenSubtitles signals *daily download quota exhausted* with a 406 (NOT a 429) on the
+          // /download endpoint. The body carries `remaining:-1` plus a `reset_time_utc`. Without
+          // handling it here we'd re-hit /download for every watch/scan and get 406 in a tight
+          // loop (observed: ~1700 failures in 18h) while silently showing the user "no subs".
+          // Treat it as a long cooldown until the quota renews, and surface it via _osQuotaState
+          // so the admin panel can explain the silence ("quota exhausted, resets in ...").
+          const data = e.response?.data || {};
+          if (data && (data.remaining === -1 || data.reset_time_utc)) {
+            const resetMs = data.reset_time_utc ? Date.parse(data.reset_time_utc) : NaN;
+            const until = Number.isFinite(resetMs) && resetMs > Date.now() ? resetMs : Date.now() + 60 * 60 * 1000;
+            _osCooldownUntil = Math.max(_osCooldownUntil, until);
+            _osQuotaState = { remaining: 0, resetTime: data.reset_time || null, updatedAt: new Date().toISOString() };
+            console.warn(`[OS] ${opName} quota exhausted (406); cooling down until ${new Date(until).toISOString()} (renews in ${data.reset_time || '?'})`);
+          } else {
+            const body = typeof e.response?.data === 'string' ? e.response.data.slice(0, 200) : JSON.stringify(data).slice(0, 200);
+            console.warn(`[OS] ${opName} terminal 406 (non-quota). body=${body}`);
+          }
+        }
+        throw e;
+      }
+      let wait = delays[i] + Math.floor(Math.random() * 800);
+      const retryAfter = parseInt(e.response?.headers?.['retry-after']);
+      if (Number.isFinite(retryAfter)) wait = Math.max(wait, retryAfter * 1000);
+      console.warn(`[OS] ${opName} attempt ${i+1} ${status||e.code}; retrying in ${wait}ms`);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+  throw last;
+}
 
 // OpenSubtitles uses ISO 639-1 (2-letter); Plex uses 639-2 (3-letter). Map the common ones.
 function osLangCode(code) {
@@ -6464,8 +6735,8 @@ async function osLogin() {
   if (_osTokenCache.token && _osTokenCache.expiresAt > Date.now()) return _osTokenCache.token;
   const apiKey = config.opensubtitles.apiKey, u = config.opensubtitles.username, p = config.opensubtitles.password;
   if (!apiKey || !u || !p) return null;
-  const r = await axios.post(`${OPENSUBTITLES_API}/login`, { username: u, password: p },
-    { headers: { 'Api-Key': apiKey, 'Content-Type': 'application/json', 'User-Agent': OS_USER_AGENT }, timeout: 10000 });
+  const r = await osRetry(() => axios.post(`${OPENSUBTITLES_API}/login`, { username: u, password: p },
+    { headers: { 'Api-Key': apiKey, 'Content-Type': 'application/json', 'User-Agent': OS_USER_AGENT, Accept: 'application/json' }, timeout: 10000 }), 'login');
   _osTokenCache = { token: r.data.token, expiresAt: Date.now() + 23 * 3600 * 1000 };
   return _osTokenCache.token;
 }
@@ -6474,42 +6745,89 @@ async function osSearch(program, langCode) {
   const apiKey = config.opensubtitles.apiKey;
   if (!apiKey) return null;
   const params = { languages: osLangCode(langCode), query: program.show_title || program.title };
-  if (program.type === 'episode') {
+  if (program.type === 'episode' || program.season_num != null) {
     params.type = 'episode';
-    if (program.season_num) params.season_number = program.season_num;
-    if (program.episode_num) params.episode_number = program.episode_num;
+    if (program.season_num != null) params.season_number = program.season_num;
+    if (program.episode_num != null) params.episode_number = program.episode_num;
   } else {
     params.type = 'movie';
     if (program.year) params.year = program.year;
   }
-  const r = await axios.get(`${OPENSUBTITLES_API}/subtitles`, {
+  const r = await osRetry(() => axios.get(`${OPENSUBTITLES_API}/subtitles`, {
     params, headers: { 'Api-Key': apiKey, 'User-Agent': OS_USER_AGENT, Accept: 'application/json' },
     timeout: 10000
-  });
+  }), 'search');
   const data = r.data?.data || [];
   if (!data.length) return null;
   data.sort((a, b) => (b.attributes?.ratings || 0) - (a.attributes?.ratings || 0));
   return data[0]?.attributes?.files?.[0]?.file_id || null;
 }
 
+// Tracked publicly via _osQuotaState so the admin status endpoint can surface it.
+let _osQuotaState = { remaining: null, resetTime: null, updatedAt: null };
 async function osDownload(fileId, destPath) {
   const apiKey = config.opensubtitles.apiKey;
   const token = await osLogin();
   if (!apiKey || !token) return false;
-  const r = await axios.post(`${OPENSUBTITLES_API}/download`, { file_id: fileId },
-    { headers: { 'Api-Key': apiKey, 'Authorization': `Bearer ${token}`, 'User-Agent': OS_USER_AGENT, 'Content-Type': 'application/json' }, timeout: 10000 });
+  const r = await osRetry(() => axios.post(`${OPENSUBTITLES_API}/download`, { file_id: fileId },
+    { headers: { 'Api-Key': apiKey, 'Authorization': `Bearer ${token}`, 'User-Agent': OS_USER_AGENT, 'Content-Type': 'application/json', Accept: 'application/json' }, timeout: 10000 }),
+    'download/link');
   if (!r.data?.link) return false;
-  const fileRes = await axios.get(r.data.link, { responseType: 'arraybuffer', timeout: 15000 });
+  _osQuotaState = { remaining: r.data.remaining ?? null, resetTime: r.data.reset_time || null, updatedAt: new Date().toISOString() };
+  const fileRes = await osRetry(() => axios.get(r.data.link, { responseType: 'arraybuffer', timeout: 15000 }), 'download/file');
   await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
   await fs.promises.writeFile(destPath, Buffer.from(fileRes.data));
   console.log(`[OpenSubtitles] cached -> ${destPath} (${fileRes.data.length}b, quota remaining today: ${r.data.remaining})`);
   return true;
 }
 
+// --- Plex subtitle upload (Plex Pass) ---
+// Push a cached SRT into Plex's library as an external sub stream so EVERY Plex client
+// (web, mobile, TV) sees it, not just LiveTV. After this lands, the next time we hit
+// /api/livetv/watch the existing Plex-native picker finds the new stream and Plex burns
+// it via universal-transcode — no sidecar needed. Plex Pass is required to upload.
+//
+// Endpoint shape lifted from python-plexapi's Video.uploadSubtitles(): POST to
+// /library/metadata/{rk}/subtitles with the SRT as the raw body, ONLY `title` + `format`
+// in the query, and Accept: text/plain. Plex auto-detects language from the filename
+// (e.g. "12119.en.srt" -> English). Adding a language= param or a Content-Type header
+// makes PMS return 500. Adding language to the filename is the documented way.
+async function uploadSubToPlex(rkey, srtPath, langCode) {
+  if (!config.plex.url || !config.plex.token) return false;
+  try {
+    const buf = await fs.promises.readFile(srtPath);
+    const lc = osLangCode(langCode);
+    const filename = `${rkey}.${lc}.srt`;
+    await axios.post(`${config.plex.url}/library/metadata/${rkey}/subtitles`, buf, {
+      params: { title: filename, format: 'srt', 'X-Plex-Token': config.plex.token },
+      headers: { Accept: 'text/plain, */*' },
+      timeout: 15000,
+      maxContentLength: 5 * 1024 * 1024,
+      maxBodyLength: 5 * 1024 * 1024
+    });
+    console.log(`[Plex] uploaded SRT for rk=${rkey} as ${filename} (${buf.length}b)`);
+    // Bust local probe cache so the next watch sees the new Plex stream
+    for (const k of [..._subtitleProbeCache.keys()]) {
+      if (k.startsWith(`${rkey}|`)) _subtitleProbeCache.delete(k);
+    }
+    return true;
+  } catch (e) {
+    const status = e.response?.status;
+    const body = typeof e.response?.data === 'string' ? e.response.data.slice(0, 250) : '';
+    console.warn(`[Plex] subtitle upload failed for rk=${rkey}: ${status||e.code} ${body}`);
+    return false;
+  }
+}
+
 async function findOpenSubtitlesSubtitle(rkey, langCode) {
   if (!config.opensubtitles.apiKey) return null;
   const destPath = path.join(SUBS_CACHE_DIR, `${rkey}.${osLangCode(langCode)}.srt`);
   if (fs.existsSync(destPath)) return { kind: 'external', url: destPath, codec: 'srt' };
+  // Bail if a previous call hit a 429/503 cooldown — coming back too soon just burns more quota.
+  if (Date.now() < _osCooldownUntil) {
+    console.log(`[OpenSubtitles] in cooldown until ${new Date(_osCooldownUntil).toISOString()}, skipping rk=${rkey}`);
+    return null;
+  }
   const program = db.prepare('SELECT * FROM programs WHERE plex_rating_key = ?').get(String(rkey));
   if (!program) return null;
   try {
@@ -6519,11 +6837,95 @@ async function findOpenSubtitlesSubtitle(rkey, langCode) {
       return null;
     }
     const ok = await osDownload(fileId, destPath);
+    if (ok) {
+      // Fire-and-forget Plex upload — pushes the sub into the library for cross-client use
+      // and for future native-burn in LiveTV. Doesn't block the sidecar response for this airing.
+      uploadSubToPlex(rkey, destPath, langCode).catch(()=>{});
+    }
     return ok ? { kind: 'external', url: destPath, codec: 'srt' } : null;
   } catch (e) {
     console.warn(`[OpenSubtitles] fetch failed for rk=${rkey}:`, e.response?.status || e.message);
     return null;
   }
+}
+
+// --- Bazarr search-trigger for LiveTV ---
+// When Plex has no native sub track and the user has a sub language configured, we ask
+// Bazarr to search providers (Sonarr-side) and write the SRT into Plex's library. Bazarr
+// + Plex scan latency means this won't help the *current* airing — that's what the
+// OpenSubtitles sidecar is for. Bazarr is the permanent fix: on the next airing the sub
+// is part of the Plex stream and gets burned in like any other.
+const _bazarrSearchedRecent = new Map(); // key=`${rkey}|${lang}` -> ts (ms)
+function _bazarrSearchedRecently(rkey, lang) {
+  const k = `${rkey}|${lang}`;
+  const ts = _bazarrSearchedRecent.get(k);
+  if (ts && Date.now() - ts < 60 * 60 * 1000) return true;
+  _bazarrSearchedRecent.set(k, Date.now());
+  if (_bazarrSearchedRecent.size > 500) {
+    const cutoff = Date.now() - 60 * 60 * 1000;
+    for (const [kk, vv] of _bazarrSearchedRecent) if (vv < cutoff) _bazarrSearchedRecent.delete(kk);
+  }
+  return false;
+}
+// Cache Bazarr's series list — it can be huge and we look up a series per uncached episode.
+const _bazarrSeriesCache = { rows: null, fetchedAt: 0 };
+async function _bazarrAllSeries() {
+  if (_bazarrSeriesCache.rows && Date.now() - _bazarrSeriesCache.fetchedAt < 30 * 60 * 1000) {
+    return _bazarrSeriesCache.rows;
+  }
+  const d = await bazarrGet('/api/series', { length: 10000 });
+  const rows = Array.isArray(d?.data) ? d.data : [];
+  _bazarrSeriesCache.rows = rows;
+  _bazarrSeriesCache.fetchedAt = Date.now();
+  return rows;
+}
+async function findBazarrEpisodeId(showTitle, seasonNum, episodeNum) {
+  if (!config.bazarr.url || !config.bazarr.apiKey) return null;
+  if (!showTitle || seasonNum == null || episodeNum == null) return null;
+  try {
+    const series = await _bazarrAllSeries();
+    const lt = String(showTitle).toLowerCase();
+    let match = series.find(s => String(s.title || '').toLowerCase() === lt);
+    if (!match) match = series.find(s => {
+      const t = String(s.title || '').toLowerCase();
+      return t && (t.includes(lt) || lt.includes(t));
+    });
+    if (!match) return null;
+    const eps = await bazarrGet('/api/episodes', { seriesid: [match.sonarrSeriesId] });
+    const items = Array.isArray(eps?.data) ? eps.data : [];
+    const want = items.find(e => Number(e.season) === Number(seasonNum) && Number(e.episode) === Number(episodeNum));
+    return want?.sonarrEpisodeId || null;
+  } catch (e) {
+    console.warn('[Bazarr] findBazarrEpisodeId failed:', e.response?.status || e.message);
+    return null;
+  }
+}
+function kickBazarrSearch(rkey, program, langCode) {
+  if (!config.bazarr.url || !config.bazarr.apiKey) return;
+  if (_bazarrSearchedRecently(rkey, langCode)) return;
+  (async () => {
+    try {
+      const epId = await findBazarrEpisodeId(program.show_title, program.season_num, program.episode_num);
+      if (!epId) {
+        console.log(`[Bazarr] no match for "${program.show_title}" S${program.season_num}E${program.episode_num} (rk=${rkey})`);
+        return;
+      }
+      await bazarrPatch('/api/episodes', null, { episodeid: `[${epId}]`, action: 'search-missing' });
+      console.log(`[Bazarr] search kicked for "${program.show_title}" S${program.season_num}E${program.episode_num} rk=${rkey} bazarrEpId=${epId}`);
+    } catch (e) {
+      console.warn(`[Bazarr] kick failed for rk=${rkey}:`, e.response?.status || e.message);
+    }
+  })();
+}
+
+// Convert an SRT subtitle file to WebVTT so the <video> element's <track> can render it.
+// SRT and WebVTT are nearly identical — WebVTT just wants a header line and dot-millisecond
+// timestamps instead of comma-millisecond. Anything more elaborate (styling, cue settings)
+// we leave alone; browsers tolerate plain converted SRT just fine.
+function srtToWebVTT(srtText) {
+  const body = String(srtText || '').replace(/\r\n/g, '\n')
+    .replace(/(\d\d:\d\d:\d\d),(\d\d\d)/g, '$1.$2');
+  return 'WEBVTT\n\n' + body;
 }
 
 const _subtitleProbeCache = new Map();

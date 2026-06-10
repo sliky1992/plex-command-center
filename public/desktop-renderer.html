@@ -1021,6 +1021,25 @@
         video.src = streamUrl;
         video.volume = state.muted ? 0 : state.volume / 100;
 
+        // Attach OpenSubtitles sidecar if the backend cached one for this program. Always
+        // tear down the previous <track> first — leaving stale tracks across tunes would let
+        // the prior episode's subs render over a new program with the same configured language.
+        Array.from(video.querySelectorAll('track')).forEach(t => t.remove());
+        if (watchData.subtitleTrack) {
+          const t = document.createElement('track');
+          t.kind = 'subtitles';
+          t.src = `${state.serverUrl}${watchData.subtitleTrack.url}`;
+          t.srclang = watchData.subtitleTrack.srclang;
+          t.label = watchData.subtitleTrack.label;
+          t.default = true;
+          video.appendChild(t);
+          // `default` only auto-shows the first track ever attached; force showing on every tune.
+          setTimeout(() => {
+            const tracks = video.textTracks;
+            for (let i = 0; i < tracks.length; i++) tracks[i].mode = i === 0 ? 'showing' : 'disabled';
+          }, 0);
+        }
+
         if (streamType === 'direct' && watchData.offsetSec > 0) {
           video.addEventListener('loadedmetadata', () => {
             video.currentTime = watchData.offsetSec;
@@ -1032,13 +1051,18 @@
           reconnectCount = 0;
         }, { once: false });
 
-        // When current program ends, auto-tune to next program
-        video.addEventListener('ended', () => {
+        // When current program ends, auto-tune to next program.
+        // Stash the handler on state so stopPlayer() can detach it — without this,
+        // every tune leaves the previous channel's listener attached and they all
+        // fire on the next 'ended', re-tuning to whichever channel was watched first.
+        if (state._endedHandler) video.removeEventListener('ended', state._endedHandler);
+        state._endedHandler = () => {
           console.log('Program ended, re-tuning...');
           stopPlayer();
           state.currentChannel = null;
           tuneChannel(ch);
-        });
+        };
+        video.addEventListener('ended', state._endedHandler);
 
         video.play().catch(e => console.log('Autoplay blocked:', e.message));
 
@@ -1173,6 +1197,11 @@
       }
       // Also stop native video
       try {
+        if (state._endedHandler) {
+          video.removeEventListener('ended', state._endedHandler);
+          state._endedHandler = null;
+        }
+        Array.from(video.querySelectorAll('track')).forEach(t => t.remove());
         video.pause();
         video.removeAttribute('src');
         video.load();

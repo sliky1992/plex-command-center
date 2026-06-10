@@ -179,10 +179,25 @@ const ago = (dateStr) => {
   return `${mins}m ago`;
 };
 
-function LtvVideoPlayer({ streamUrl, streamType, offsetSec, onEnded }) {
+function LtvVideoPlayer({ streamUrl, streamType, offsetSec, subtitleTrack, onEnded }) {
   const videoRef = React.useRef(null);
   const onEndedRef = React.useRef(onEnded);
   onEndedRef.current = onEnded;
+
+  // Force the sidecar track to "showing" once metadata loads — `default` is only honored on
+  // first attach in Chromium, so a subsequent program with a new track URL would otherwise stay
+  // disabled until the user opens the captions menu.
+  React.useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !subtitleTrack) return;
+    const showFirst = () => {
+      const tt = video.textTracks;
+      for (let i = 0; i < tt.length; i++) tt[i].mode = i === 0 ? 'showing' : 'disabled';
+    };
+    showFirst();
+    video.addEventListener('loadedmetadata', showFirst);
+    return () => video.removeEventListener('loadedmetadata', showFirst);
+  }, [subtitleTrack && subtitleTrack.url]);
 
   React.useEffect(() => {
     const video = videoRef.current;
@@ -249,7 +264,14 @@ function LtvVideoPlayer({ streamUrl, streamType, offsetSec, onEnded }) {
     controls: true,
     autoPlay: true,
     style: { width: '100%', height: '100%', objectFit: 'contain', background: '#000' }
-  });
+  }, subtitleTrack ? React.createElement('track', {
+    key: subtitleTrack.url,
+    kind: 'subtitles',
+    src: subtitleTrack.url,
+    srcLang: subtitleTrack.srclang,
+    label: subtitleTrack.label,
+    default: true
+  }) : null);
 }
 
 function App() {
@@ -314,6 +336,51 @@ function App() {
     } catch(e) { setSubScanError(e.message); }
     finally { setSubScanLoading(false); }
   };
+  // LiveTV pre-cache status (separate from the Plex-library scan above): polls
+  // /api/livetv/subs/status to surface OpenSubtitles quota, cache size, and cooldown so
+  // the user can see when they're rate-limited and when the daily allowance resets.
+  const [ltvSubStatus, setLtvSubStatus] = useState(null);
+  const [ltvSubBusy, setLtvSubBusy] = useState(false);
+  // Track the high-water-mark for daily quota so the UI knows what 'low' looks like
+  // (the API only gives us remaining, never the daily cap directly).
+  const [ltvSubDailyCap, setLtvSubDailyCap] = useState(0);
+  const loadLtvSubStatus = async () => {
+    try {
+      const r = await fetch('/api/livetv/subs/status');
+      if (!r.ok) return; // silently ignore (e.g. non-admin)
+      const d = await r.json();
+      setLtvSubStatus(d);
+      // Daily cap = max(remaining + fetched-this-session, observed_max).
+      // First-seen value after midnight UTC is the freshest indicator of the cap.
+      const seen = (d.quota?.remaining ?? 0) + (d.scan?.fetched || 0);
+      if (seen > 0) setLtvSubDailyCap(prev => Math.max(prev, seen));
+    } catch(e) { /* ignore */ }
+  };
+  const ltvSubScanNow = async (limit) => {
+    setLtvSubBusy(true);
+    try {
+      const q = limit ? `?limit=${limit}` : '';
+      const r = await fetch(`/api/livetv/subs/scan${q}`, { method: 'POST' });
+      const d = await r.json();
+      if (!r.ok) showToast(d.error || `HTTP ${r.status}`, 'error');
+      else { showToast(`Scan started: ${d.state.total} programs`); loadLtvSubStatus(); }
+    } catch(e) { showToast(e.message, 'error'); }
+    finally { setLtvSubBusy(false); }
+  };
+  const ltvSubScanStop = async () => {
+    try {
+      await fetch('/api/livetv/subs/scan/stop', { method: 'POST' });
+      loadLtvSubStatus();
+    } catch(e) {}
+  };
+  // Poll status while subs tab is open AND a scan is running, so user sees progress live.
+  React.useEffect(() => {
+    if (tab !== 'subs') return;
+    loadLtvSubStatus();
+    const iv = setInterval(loadLtvSubStatus, ltvSubStatus?.scan?.running ? 2500 : 15000);
+    return () => clearInterval(iv);
+  }, [tab, ltvSubStatus?.scan?.running]);
+
   const subScanExport = () => {
     if (!subScanResult) return;
     const lines = [`# Missing subtitles (${subScanResult.language}) — ${subScanResult.scannedAt}`, ''];
@@ -2219,6 +2286,117 @@ function App() {
         {tab==='subs' && (
           <div>
             <div className="page-title">Missing Subtitles</div>
+
+            {/* LiveTV auto-cache status panel — surfaces OpenSubtitles quota + scan state
+                so the user knows when they're rate-limited and when daily quota resets.
+                Admin-only because the underlying endpoints are admin-gated; non-admins
+                see no panel rather than a broken one. */}
+            {currentUser?.role==='admin' && !ltvSubStatus && (
+              <div className="card" style={{padding:'.6rem 1rem',marginBottom:'1rem',background:'#0f172a',border:'1px solid #1e293b',fontSize:'.8rem',color:'#94a3b8'}}>
+                LiveTV Auto-Cache: loading status… <button className="btn-sm btn-outline" style={{marginLeft:'.5rem'}} onClick={loadLtvSubStatus}>Retry</button>
+              </div>
+            )}
+            {currentUser?.role==='admin' && ltvSubStatus && (() => {
+              const s = ltvSubStatus.scan || {};
+              const q = ltvSubStatus.quota || {};
+              const cache = ltvSubStatus.cache || {};
+              const cooldownUntil = ltvSubStatus.cooldownUntil;
+              const cooldownLeftS = cooldownUntil ? Math.max(0, Math.round((new Date(cooldownUntil).getTime() - Date.now()) / 1000)) : 0;
+              const pct = s.total ? Math.round((s.done / s.total) * 100) : 0;
+              const quotaPct = (q.remaining != null) ? Math.round((q.remaining / Math.max(q.remaining + (s.fetched||0), 20)) * 100) : null;
+              return (
+                <div className="card" style={{padding:'1rem',marginBottom:'1rem',background:'#0f172a',border:'1px solid #1e293b'}}>
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'.6rem',flexWrap:'wrap',gap:'.5rem'}}>
+                    <div style={{fontWeight:600,fontSize:'.95rem'}}>LiveTV Auto-Cache (OpenSubtitles)</div>
+                    <div style={{display:'flex',gap:'.4rem'}}>
+                      <button className="btn-sm btn-outline" onClick={loadLtvSubStatus}>Refresh</button>
+                      {s.running
+                        ? <button className="btn-sm btn-delete" onClick={ltvSubScanStop}>Stop Scan</button>
+                        : <>
+                            <button className="btn-sm btn-outline" disabled={ltvSubBusy} onClick={()=>ltvSubScanNow(20)}>Scan 20</button>
+                            <button className="btn-sm btn-primary" disabled={ltvSubBusy} onClick={()=>ltvSubScanNow()}>Full Scan</button>
+                          </>
+                      }
+                    </div>
+                  </div>
+
+                  {/* Quota row — the headline number the user asked for. */}
+                  <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(160px,1fr))',gap:'.75rem',marginBottom:'.75rem'}}>
+                    <div>
+                      <div style={{fontSize:'.7rem',color:'#94a3b8',textTransform:'uppercase',letterSpacing:'.05em'}}>OS quota left today</div>
+                      {(() => {
+                        const cap = ltvSubDailyCap || 20;
+                        const lowThreshold = Math.max(3, Math.round(cap * 0.1)); // <10% of cap = yellow
+                        const color = q.remaining === 0 ? '#f87171'
+                          : (q.remaining != null && q.remaining < lowThreshold) ? '#fbbf24'
+                          : '#10b981';
+                        return (
+                          <div style={{fontSize:'1.4rem',fontWeight:600,color}}>
+                            {q.remaining != null ? q.remaining : '—'}{cap ? <span style={{color:'#64748b',fontSize:'.85rem',fontWeight:400}}> / {cap}</span> : null}
+                          </div>
+                        );
+                      })()}
+                      <div style={{fontSize:'.7rem',color:'#94a3b8'}}>
+                        {q.resetTime ? `resets in ${q.resetTime}` : (q.updatedAt ? `last seen ${new Date(q.updatedAt).toLocaleTimeString()}` : 'no quota seen yet')}
+                      </div>
+                    </div>
+                    <div>
+                      <div style={{fontSize:'.7rem',color:'#94a3b8',textTransform:'uppercase',letterSpacing:'.05em'}}>Cached on disk</div>
+                      <div style={{fontSize:'1.4rem',fontWeight:600}}>{(cache.count||0).toLocaleString()}</div>
+                      <div style={{fontSize:'.7rem',color:'#94a3b8'}}>{cache.bytes ? `${(cache.bytes/1024).toFixed(0)} KB` : '0 KB'}</div>
+                    </div>
+                    <div>
+                      <div style={{fontSize:'.7rem',color:'#94a3b8',textTransform:'uppercase',letterSpacing:'.05em'}}>Cooldown</div>
+                      <div style={{fontSize:'1.4rem',fontWeight:600,color: cooldownLeftS > 0 ? '#fbbf24' : '#64748b'}}>
+                        {cooldownLeftS > 0 ? `${cooldownLeftS}s` : '—'}
+                      </div>
+                      <div style={{fontSize:'.7rem',color:'#94a3b8'}}>
+                        {cooldownLeftS > 0 ? 'OS recently 429/503, paused' : 'no rate-limit active'}
+                      </div>
+                    </div>
+                    <div>
+                      <div style={{fontSize:'.7rem',color:'#94a3b8',textTransform:'uppercase',letterSpacing:'.05em'}}>Language</div>
+                      <div style={{fontSize:'1.4rem',fontWeight:600}}>{ltvSubStatus.language || '—'}</div>
+                      <div style={{fontSize:'.7rem',color:'#94a3b8'}}>set via Subtitle Settings</div>
+                    </div>
+                  </div>
+
+                  {/* Scan progress (shown only when there's something to show). */}
+                  {(s.total > 0 || s.running) && (
+                    <div style={{borderTop:'1px solid #1e293b',paddingTop:'.6rem'}}>
+                      <div style={{display:'flex',justifyContent:'space-between',fontSize:'.8rem',marginBottom:'.3rem'}}>
+                        <span style={{color:'#cbd5e1'}}>
+                          {s.running ? 'Scan running' : 'Last scan'} — {s.done.toLocaleString()} / {s.total.toLocaleString()} ({pct}%)
+                        </span>
+                        <span style={{color:'#94a3b8'}}>
+                          {s.startedAt && (s.finishedAt
+                            ? `finished ${new Date(s.finishedAt).toLocaleTimeString()}`
+                            : `started ${new Date(s.startedAt).toLocaleTimeString()}`)}
+                        </span>
+                      </div>
+                      <div style={{height:6,background:'#1e293b',borderRadius:3,overflow:'hidden',marginBottom:'.5rem'}}>
+                        <div style={{height:'100%',width:`${pct}%`,background:s.running?'#3b82f6':'#10b981',transition:'width .3s'}} />
+                      </div>
+                      <div style={{display:'flex',gap:'1rem',flexWrap:'wrap',fontSize:'.75rem',color:'#94a3b8'}}>
+                        <span>✓ fetched <strong style={{color:'#10b981'}}>{s.fetched||0}</strong></span>
+                        <span>↑ uploaded to Plex <strong style={{color:'#10b981'}}>{s.uploaded||0}</strong></span>
+                        <span>Plex already had <strong style={{color:'#cbd5e1'}}>{s.plexHad||0}</strong></span>
+                        <span>already cached <strong style={{color:'#cbd5e1'}}>{s.alreadyCached||0}</strong></span>
+                        <span>no match <strong style={{color:'#fbbf24'}}>{s.noMatch||0}</strong></span>
+                        <span>errors <strong style={{color: s.errors>0?'#f87171':'#94a3b8'}}>{s.errors||0}</strong></span>
+                      </div>
+                      {s.lastError && <div style={{fontSize:'.75rem',color:'#f87171',marginTop:'.3rem'}}>Last error: {s.lastError}</div>}
+                    </div>
+                  )}
+
+                  <div style={{fontSize:'.7rem',color:'#64748b',marginTop:'.6rem',lineHeight:1.4}}>
+                    Daily quota is whatever OpenSubtitles assigns your account (5 anon, 20 free, ~100 verified consumer, 200 Pro, 1000 VIP) — burns one per missing-sub episode the scanner fetches.
+                    Nightly cron runs at 03:00 local. Quota resets at OS server midnight UTC.
+                  </div>
+                </div>
+              );
+            })()}
+
             <div style={{fontSize:'.85rem',color:'#94a3b8',marginBottom:'1rem'}}>
               Scans your Plex library and lists movies/episodes that don't have a subtitle stream in the chosen language.
               Use this to find files that need an SRT dropped next to them.
@@ -5478,7 +5656,7 @@ function App() {
         <div ref={ltvPlayerRef} onMouseMove={ltvPlayerMouseMove} style={{position:'fixed',top:0,left:0,right:0,bottom:0,background:'#000',zIndex:9999,cursor:ltvShowControls?'default':'none'}}>
           {/* Video fills entire screen */}
           <div style={{position:'absolute',top:0,left:0,right:0,bottom:0}}>
-            <LtvVideoPlayer streamUrl={ltvPlayer.streamUrl} streamType={ltvPlayer.streamType} offsetSec={ltvPlayer.offsetSec} onEnded={() => ltvWatch(ltvPlayer.channelId)} />
+            <LtvVideoPlayer streamUrl={ltvPlayer.streamUrl} streamType={ltvPlayer.streamType} offsetSec={ltvPlayer.offsetSec} subtitleTrack={ltvPlayer.subtitleTrack} onEnded={() => ltvWatch(ltvPlayer.channelId)} />
           </div>
 
           {/* Channel logo watermark */}
