@@ -1865,6 +1865,16 @@ pccDb.exec(`
   );
   INSERT OR IGNORE INTO cw_settings (id) VALUES (1);
 `);
+// Episodes' own `thumb` is a still-frame grab that's often unrecognizable in a list; store the
+// show poster (grandparentThumb) too so the UI can show a poster the user actually recognizes.
+try { pccDb.exec("ALTER TABLE cw_snapshots ADD COLUMN grandparent_thumb TEXT"); } catch(e) {}
+// Plex numeric ratingKeys are NOT stable — a library rescan/rebuild reassigns them, leaving the
+// snapshot pointing at a different item (a season, a behind-the-scenes clip, etc). Store the
+// stable `guid` so we can detect a reassigned key and re-resolve the current ratingKey by guid.
+try { pccDb.exec("ALTER TABLE cw_snapshots ADD COLUMN guid TEXT"); } catch(e) {}
+// When on, the snapshotter cron also snapshots (and, if auto_restore is on, restores) every Plex
+// Home user — not just the owner. Default off to avoid extra plex.tv token-mint calls until opted in.
+try { pccDb.exec("ALTER TABLE cw_settings ADD COLUMN snapshot_all_users INTEGER NOT NULL DEFAULT 0"); } catch(e) {}
 
 // Seed default admin if no users exist — flagged so the first login is forced to rotate password.
 const userCount = pccDb.prepare('SELECT COUNT(*) as cnt FROM users').get().cnt;
@@ -2349,30 +2359,41 @@ app.get('/api/settings/audit', requireAdmin, (req, res) => {
 app.get('/api/cw/state', requireAdmin, async (req, res) => {
   const settings = pccDb.prepare('SELECT * FROM cw_settings WHERE id=1').get();
 
-  let liveKeys = null, plexError = null;
+  // Which account's Continue Watching are we viewing? Defaults to the owner.
+  let account, accountError = null;
+  try { account = await _cwResolveAccount(req.query.account, req.query.pin); }
+  catch (e) {
+    if (e.code === 'PIN_REQUIRED') return res.status(409).json({ error: e.message, code: 'PIN_REQUIRED' });
+    account = _cwOwnerAccount(); accountError = e.message;
+  }
+
+  let liveKeys = null, plexError = accountError;
   try {
-    const live = await _cwFetchOnDeck();
+    const live = await _cwFetchOnDeck(account.token);
     liveKeys = new Set(live.filter(i => (Number(i.viewOffset)||0) > 0).map(i => String(i.ratingKey)));
     // Prune watched/deleted items inline so the user sees a clean list immediately. Best-
     // effort: an error here just leaves the rows in place until the next snapshot tick.
-    try { await _cwPruneCompleted(liveKeys); } catch (e) { /* swallow — non-fatal */ }
+    try { await _cwPruneCompleted(liveKeys, account); } catch (e) { /* swallow — non-fatal */ }
   } catch (e) { plexError = e.message; }
 
   const snaps = pccDb.prepare(`
     SELECT rating_key, title, show_title, season_num, episode_num, year, item_type, thumb,
-           view_offset, duration, last_viewed_at, first_seen_at, last_seen_at, last_in_hub_at,
-           restored_at, restored_by
-    FROM cw_snapshots WHERE account_id='owner' ORDER BY last_in_hub_at DESC
-  `).all();
+           grandparent_thumb, view_offset, duration, last_viewed_at, first_seen_at, last_seen_at,
+           last_in_hub_at, restored_at, restored_by
+    FROM cw_snapshots WHERE account_id = ? ORDER BY last_in_hub_at DESC
+  `).all(account.id);
 
+  const mkThumb = (path) => path && config.plex.url && config.plex.token
+    ? `${config.plex.url}${path}?X-Plex-Token=${config.plex.token}`
+    : null;
   const annotated = snaps.map(s => ({
     ...s,
     // Existing convention across the app: backend returns fully-qualified thumb URLs because
     // Plex doesn't accept anonymous access. The browser hits Plex directly. Works on LAN /
     // tailscale; for stricter setups a future server-side proxy could be substituted.
-    thumb: s.thumb && config.plex.url && config.plex.token
-      ? `${config.plex.url}${s.thumb}?X-Plex-Token=${config.plex.token}`
-      : null,
+    // For episodes prefer the show poster (grandparent_thumb) — the episode's own thumb is a
+    // still-frame that reads as a "wrong"/unrecognizable cover in a list.
+    thumb: mkThumb((s.item_type === 'episode' && s.grandparent_thumb) ? s.grandparent_thumb : s.thumb),
     isLive: liveKeys ? liveKeys.has(s.rating_key) : null,
     progress_pct: s.duration > 0 ? Math.min(99, Math.round((s.view_offset / s.duration) * 100)) : 0
   }));
@@ -2380,6 +2401,7 @@ app.get('/api/cw/state', requireAdmin, async (req, res) => {
   res.json({
     settings,
     plexError,
+    account: { id: account.id, title: account.title, kind: account.kind },
     snapshots: annotated,
     liveCount: liveKeys ? liveKeys.size : null,
     snapshotCount: snaps.length,
@@ -2387,17 +2409,43 @@ app.get('/api/cw/state', requireAdmin, async (req, res) => {
   });
 });
 
+// List the accounts whose Continue Watching can be viewed/restored: the owner plus every Plex
+// Home (managed) user. External shared friends are not Home members and have no obtainable token,
+// so they are intentionally excluded. `protected` flags PIN-gated profiles so the UI can prompt.
+app.get('/api/cw/users', requireAdmin, async (req, res) => {
+  const accounts = [{ id: 'owner', title: 'Owner', kind: 'owner', protected: false }];
+  try {
+    const users = await cwFetchHomeUsers(req.query.refresh === '1');
+    for (const u of users) {
+      if (u.admin) continue; // the owner is already represented by the 'owner' entry
+      accounts.push({
+        id: String(u.uuid),
+        title: u.title || u.username || u.friendlyName || 'User',
+        kind: 'home',
+        restricted: !!u.restricted,
+        protected: !!u.protected,
+        thumb: u.thumb || null
+      });
+    }
+    res.json({ accounts });
+  } catch (e) {
+    // Couldn't reach plex.tv — still let the UI work with the owner account.
+    res.json({ accounts, error: e.message });
+  }
+});
+
 app.put('/api/cw/settings', requireAdmin, (req, res) => {
   const cur = pccDb.prepare('SELECT * FROM cw_settings WHERE id=1').get();
-  const { enabled, interval_minutes, auto_restore, stale_after_hours } = req.body || {};
+  const { enabled, interval_minutes, auto_restore, stale_after_hours, snapshot_all_users } = req.body || {};
   const newEnabled = enabled === undefined ? cur.enabled : (enabled ? 1 : 0);
   const newInterval = interval_minutes === undefined ? cur.interval_minutes : Math.max(1, Math.min(1440, parseInt(interval_minutes) || cur.interval_minutes));
   const newAuto = auto_restore === undefined ? cur.auto_restore : (auto_restore ? 1 : 0);
   const newStale = stale_after_hours === undefined ? cur.stale_after_hours : Math.max(1, parseInt(stale_after_hours) || cur.stale_after_hours);
-  pccDb.prepare('UPDATE cw_settings SET enabled=?, interval_minutes=?, auto_restore=?, stale_after_hours=? WHERE id=1')
-    .run(newEnabled, newInterval, newAuto, newStale);
+  const newAllUsers = snapshot_all_users === undefined ? cur.snapshot_all_users : (snapshot_all_users ? 1 : 0);
+  pccDb.prepare('UPDATE cw_settings SET enabled=?, interval_minutes=?, auto_restore=?, stale_after_hours=?, snapshot_all_users=? WHERE id=1')
+    .run(newEnabled, newInterval, newAuto, newStale, newAllUsers);
   scheduleCwSnapshotter();
-  settingsAudit(req.user?.username, 'cw', '*', 'update', `enabled=${newEnabled} interval=${newInterval}m auto=${newAuto}`);
+  settingsAudit(req.user?.username, 'cw', '*', 'update', `enabled=${newEnabled} interval=${newInterval}m auto=${newAuto} allUsers=${newAllUsers}`);
   res.json({ success: true });
 });
 
@@ -2407,9 +2455,15 @@ app.post('/api/cw/snapshot', requireAdmin, async (req, res) => {
     // Plex's /library/onDeck endpoint. Slower but catches items Plex has aged out of the
     // CW hub — those are exactly the items the user wants to be able to restore.
     const deep = req.query.deep === '1' || req.body?.deep === true;
-    const r = await cwSnapshot(deep);
-    pccDb.prepare("UPDATE cw_settings SET last_run = datetime('now'), last_snapshot_count = ?, last_error = NULL WHERE id = 1").run(r.saved);
-    res.json({ success: true, deep, ...r });
+    let account;
+    try { account = await _cwResolveAccount(req.query.account || req.body?.account, req.query.pin || req.body?.pin); }
+    catch (e) {
+      if (e.code === 'PIN_REQUIRED') return res.status(409).json({ error: e.message, code: 'PIN_REQUIRED' });
+      return res.status(400).json({ error: e.message });
+    }
+    const r = await cwSnapshot(deep, account);
+    if (account.id === 'owner') pccDb.prepare("UPDATE cw_settings SET last_run = datetime('now'), last_snapshot_count = ?, last_error = NULL WHERE id = 1").run(r.saved);
+    res.json({ success: true, deep, account: { id: account.id, title: account.title }, ...r });
   } catch (e) {
     pccDb.prepare("UPDATE cw_settings SET last_run = datetime('now'), last_error = ? WHERE id = 1").run((e.message||'').slice(0, 500));
     res.status(500).json({ error: e.message });
@@ -2417,18 +2471,30 @@ app.post('/api/cw/snapshot', requireAdmin, async (req, res) => {
 });
 
 app.post('/api/cw/restore/:rating_key', requireAdmin, async (req, res) => {
-  const r = await cwRestoreItem(req.params.rating_key, req.user?.username || 'admin');
-  if (r.ok) res.json({ success: true });
+  let account;
+  try { account = await _cwResolveAccount(req.query.account || req.body?.account, req.query.pin || req.body?.pin); }
+  catch (e) {
+    if (e.code === 'PIN_REQUIRED') return res.status(409).json({ error: e.message, code: 'PIN_REQUIRED' });
+    return res.status(400).json({ error: e.message });
+  }
+  const r = await cwRestoreItem(req.params.rating_key, req.user?.username || 'admin', account);
+  if (r.ok) res.json({ success: true, applied: r.applied, note: r.note, plexOffset: r.plexOffset });
   else res.status(400).json({ error: r.error });
 });
 
 app.post('/api/cw/restore-bulk', requireAdmin, async (req, res) => {
   const keys = Array.isArray(req.body?.rating_keys) ? req.body.rating_keys : [];
   if (!keys.length) return res.status(400).json({ error: 'rating_keys array required' });
+  let account;
+  try { account = await _cwResolveAccount(req.body?.account, req.body?.pin); }
+  catch (e) {
+    if (e.code === 'PIN_REQUIRED') return res.status(409).json({ error: e.message, code: 'PIN_REQUIRED' });
+    return res.status(400).json({ error: e.message });
+  }
   const actor = req.user?.username || 'admin';
   const results = { restored: 0, failed: 0, errors: [] };
   for (const k of keys) {
-    const r = await cwRestoreItem(k, actor);
+    const r = await cwRestoreItem(k, actor, account);
     if (r.ok) results.restored++;
     else { results.failed++; results.errors.push({ rating_key: k, error: r.error }); }
   }
@@ -2436,7 +2502,9 @@ app.post('/api/cw/restore-bulk', requireAdmin, async (req, res) => {
 });
 
 app.delete('/api/cw/snapshot/:rating_key', requireAdmin, (req, res) => {
-  pccDb.prepare("DELETE FROM cw_snapshots WHERE account_id='owner' AND rating_key = ?").run(req.params.rating_key);
+  // account here is just the snapshot owner key (no token needed); 'owner' uuid maps to 'owner'.
+  const acctId = (!req.query.account || req.query.account === 'owner') ? 'owner' : String(req.query.account);
+  pccDb.prepare("DELETE FROM cw_snapshots WHERE account_id = ? AND rating_key = ?").run(acctId, req.params.rating_key);
   res.json({ success: true });
 });
 
@@ -2892,6 +2960,22 @@ async function sendTelegramAlert(settings, alert) {
   } catch(e) {
     console.warn('[REGIONAL] Telegram sendMessage failed:', e.message);
     return null;
+  }
+}
+
+// Generic one-way Telegram push (no buttons). Reuses the regional_settings bot token/chat that
+// the security alerts already use. Returns true on success. Used by the channel-exhaustion alert.
+async function sendTelegramMessage(text) {
+  const s = readRegionalSettings();
+  if (!s.telegram_bot_token || !s.telegram_chat_id) return false;
+  try {
+    await axios.post(`https://api.telegram.org/bot${s.telegram_bot_token}/sendMessage`, {
+      chat_id: s.telegram_chat_id, text, parse_mode: 'Markdown'
+    }, { timeout: 8000 });
+    return true;
+  } catch (e) {
+    console.warn('[LiveTV] Telegram exhaustion alert failed:', e.message);
+    return false;
   }
 }
 
@@ -3446,10 +3530,151 @@ setTimeout(() => scheduleAutoCollections(), 5000);
 // CONTINUE WATCHING SNAPSHOTTER + RESTORER
 // ============================================
 
-async function _cwFetchOnDeck() {
-  if (!config.plex.url || !config.plex.token) throw new Error('Plex not configured');
-  const r = await axios.get(`${config.plex.url}/library/onDeck`, {
+// ============================================
+// Multi-user support for Continue Watching
+// ============================================
+// Plex stores onDeck / viewOffset state PER ACCOUNT, so snapshotting or restoring another user's
+// Continue Watching requires talking to Plex AS that user (with their token). For Plex Home /
+// managed users the owner can mint a per-user token via the Home "switch" API. External shared
+// friends are NOT Home members and have no obtainable token, so they are intentionally out of
+// scope — only Home users appear. Per the design decision, user tokens are minted FRESH on demand
+// and never persisted.
+const PCC_CW_CLIENT_ID = 'pcc-continue-watching-restore';
+
+// The owner/admin account context. account_id stays 'owner' to keep the original single-user rows.
+function _cwOwnerAccount() {
+  return { id: 'owner', token: config.plex.token, title: 'Owner', kind: 'owner' };
+}
+
+// List the Plex Home users (owner + managed profiles) via plex.tv. Short in-memory cache so the
+// snapshotter and the UI don't hammer plex.tv. Returns the raw v2 user objects.
+let _cwHomeUsersCache = { at: 0, data: null };
+async function cwFetchHomeUsers(force = false) {
+  if (!config.plex.token) throw new Error('Plex not configured');
+  if (!force && _cwHomeUsersCache.data && (Date.now() - _cwHomeUsersCache.at) < 60000) {
+    return _cwHomeUsersCache.data;
+  }
+  const r = await axios.get('https://plex.tv/api/v2/home/users', {
     params: { 'X-Plex-Token': config.plex.token },
+    headers: {
+      Accept: 'application/json',
+      'X-Plex-Client-Identifier': PCC_CW_CLIENT_ID,
+      'X-Plex-Product': 'Plex Command Center'
+    },
+    timeout: 12000
+  });
+  // v2 shape: { id, name, ..., users: [ {id, uuid, title, username, admin, restricted, protected, ...} ] }
+  const users = Array.isArray(r.data?.users) ? r.data.users : [];
+  _cwHomeUsersCache = { at: Date.now(), data: users };
+  return users;
+}
+
+// Mint a fresh plex.tv token for a Home user via the switch API. Tries the v2 JSON endpoint
+// (keyed by uuid) first, falls back to the legacy v1 XML endpoint (keyed by numeric id). Note:
+// this returns a plex.tv ACCOUNT token, which the local PMS rejects on its own — it must then be
+// exchanged for a per-server access token via _cwServerAccessToken (see _cwResolveAccount).
+// PIN-protected profiles (`user.protected`) require a valid `pin`; without one Plex returns 401,
+// which we surface as PIN_REQUIRED so the UI can prompt. A 401 for a NON-protected user is a real
+// error (never masked as a PIN prompt).
+async function cwSwitchUserToken(user, pin) {
+  const params = { 'X-Plex-Token': config.plex.token };
+  if (pin) params.pin = pin;
+  const headers = {
+    Accept: 'application/json',
+    'X-Plex-Client-Identifier': PCC_CW_CLIENT_ID,
+    'X-Plex-Product': 'Plex Command Center'
+  };
+  const classifyErr = (e) => {
+    if ((e.response?.status === 401 || e.response?.status === 403) && user.protected) {
+      return Object.assign(new Error('This profile is PIN-protected — enter its Plex Home PIN to act as this user.'), { code: 'PIN_REQUIRED' });
+    }
+    return e;
+  };
+  let v2Err = null;
+  try {
+    const r = await axios.post(`https://plex.tv/api/v2/home/users/${user.uuid}/switch`, null, {
+      params, headers, timeout: 12000
+    });
+    const tok = r.data?.authToken || r.data?.authenticationToken;
+    if (tok) return tok;
+    // Some plex.tv builds return the switched user object without the token on v2 — fall through.
+  } catch (e) {
+    v2Err = classifyErr(e);
+    if (v2Err.code === 'PIN_REQUIRED') throw v2Err;
+    // otherwise fall through to the v1 fallback
+  }
+  // Legacy v1 XML endpoint keyed by numeric id; returns authenticationToken="..." attribute.
+  try {
+    const r2 = await axios.post(`https://plex.tv/api/home/users/${user.id}/switch`, null, {
+      params, headers: { ...headers, Accept: 'application/xml' }, timeout: 12000
+    });
+    const xml = typeof r2.data === 'string' ? r2.data : '';
+    const m = xml.match(/authenticationToken="([^"]+)"/);
+    if (m && m[1]) return m[1];
+  } catch (e) {
+    const err = classifyErr(e);
+    throw err;
+  }
+  throw v2Err || new Error('Plex did not return a token for this Home user');
+}
+
+// The local PMS's machineIdentifier (clientIdentifier in plex.tv resources). Cached for the
+// process — it never changes for a given server. Used to pick the right server's access token
+// out of a user's resource list.
+let _cwServerMachineId = null;
+async function _cwGetServerMachineId() {
+  if (_cwServerMachineId) return _cwServerMachineId;
+  const r = await axios.get(`${config.plex.url}/identity`, {
+    params: { 'X-Plex-Token': config.plex.token },
+    headers: { Accept: 'application/json' },
+    timeout: 8000
+  });
+  _cwServerMachineId = r.data?.MediaContainer?.machineIdentifier || null;
+  if (!_cwServerMachineId) throw new Error('Could not determine Plex server machineIdentifier');
+  return _cwServerMachineId;
+}
+
+// Exchange a user's plex.tv token for THIS server's per-user access token. A plex.tv account token
+// (e.g. from the Home switch) is not accepted by the PMS directly — the server returns 401. The
+// server-scoped accessToken lives in the user's plex.tv resource list, keyed by clientIdentifier.
+async function _cwServerAccessToken(userPlexToken) {
+  const machineId = await _cwGetServerMachineId();
+  const r = await axios.get('https://plex.tv/api/v2/resources', {
+    params: { 'X-Plex-Token': userPlexToken, includeHttps: 1 },
+    headers: {
+      Accept: 'application/json',
+      'X-Plex-Client-Identifier': PCC_CW_CLIENT_ID,
+      'X-Plex-Product': 'Plex Command Center'
+    },
+    timeout: 12000
+  });
+  const resources = Array.isArray(r.data) ? r.data : [];
+  const srv = resources.find(x => x.clientIdentifier === machineId);
+  if (!srv || !srv.accessToken) {
+    throw new Error('This Plex Home user does not have access to this server (no access token issued)');
+  }
+  return srv.accessToken;
+}
+
+// Resolve an account selector (from ?account= / body.account) to a usable context {id, token,
+// title, kind}. 'owner' / empty → owner token. Anything else is a Home user uuid|id: the admin
+// entry maps back to 'owner' (shared rows); other Home users get a freshly-minted token, then
+// exchanged for this server's per-user access token (the PMS rejects raw plex.tv tokens).
+async function _cwResolveAccount(accountId, pin) {
+  if (!accountId || accountId === 'owner') return _cwOwnerAccount();
+  const users = await cwFetchHomeUsers();
+  const u = users.find(x => String(x.uuid) === String(accountId) || String(x.id) === String(accountId));
+  if (!u) throw Object.assign(new Error('Unknown Plex Home user'), { code: 'NO_USER' });
+  if (u.admin) return { id: 'owner', token: config.plex.token, title: u.title || 'Owner', kind: 'owner' };
+  const plexTvToken = await cwSwitchUserToken(u, pin);
+  const token = await _cwServerAccessToken(plexTvToken);
+  return { id: String(u.uuid), token, title: u.title || u.username || 'User', kind: 'home' };
+}
+
+async function _cwFetchOnDeck(token = config.plex.token) {
+  if (!config.plex.url || !token) throw new Error('Plex not configured');
+  const r = await axios.get(`${config.plex.url}/library/onDeck`, {
+    params: { 'X-Plex-Token': token },
     // Plex's onDeck defaults to a small page (~20). Ask for up to 200 explicitly so users with
     // a lot of in-progress content don't silently miss items.
     headers: {
@@ -3464,10 +3689,10 @@ async function _cwFetchOnDeck() {
 
 // Fetch a single item's current Plex metadata. Used to detect items that have been watched
 // (viewCount > 0) or deleted (404), so we can prune them from the snapshots.
-async function _cwFetchMetadata(ratingKey) {
+async function _cwFetchMetadata(ratingKey, token = config.plex.token) {
   try {
     const r = await axios.get(`${config.plex.url}/library/metadata/${ratingKey}`, {
-      params: { 'X-Plex-Token': config.plex.token },
+      params: { 'X-Plex-Token': token },
       headers: { Accept: 'application/json' },
       timeout: 10000
     });
@@ -3477,7 +3702,10 @@ async function _cwFetchMetadata(ratingKey) {
       viewCount: Number(md.viewCount) || 0,
       viewOffset: Number(md.viewOffset) || 0,
       duration: Number(md.duration) || 0,
-      lastViewedAt: Number(md.lastViewedAt) || 0
+      lastViewedAt: Number(md.lastViewedAt) || 0,
+      type: md.type || null,
+      title: md.title || null,
+      guid: md.guid || null
     };
   } catch (e) {
     if (e.response?.status === 404) return { gone: true };
@@ -3485,43 +3713,86 @@ async function _cwFetchMetadata(ratingKey) {
   }
 }
 
+// Look up the CURRENT ratingKey for a stable Plex guid (e.g. plex://episode/abc123). Used to
+// recover snapshots whose numeric ratingKey was reassigned by a library rescan. Returns the live
+// item ({ ratingKey, thumb, grandparentThumb, type }) or null if not found / not searchable.
+async function _cwResolveByGuid(guid, token = config.plex.token) {
+  if (!guid || !config.plex.url || !token) return null;
+  try {
+    const r = await axios.get(`${config.plex.url}/library/all`, {
+      params: { 'X-Plex-Token': token, guid },
+      headers: { Accept: 'application/json' },
+      timeout: 10000
+    });
+    const m = r.data?.MediaContainer?.Metadata?.[0];
+    if (!m) return null;
+    return { ratingKey: String(m.ratingKey), thumb: m.thumb || null, grandparentThumb: m.grandparentThumb || null, type: m.type || null };
+  } catch (e) {
+    return null;
+  }
+}
+
+// A snapshot row is "stale" when its stored ratingKey no longer resolves to the same content —
+// either the item is gone, its type is no longer a playable movie/episode (key reassigned to a
+// season/clip/show), or its guid changed. Used to prune the list and to gate restores.
+function _cwMetaIsStale(snap, md) {
+  if (!md || md.error) return false;          // transient error — don't treat as stale
+  if (md.gone) return true;
+  if (md.type && md.type !== 'movie' && md.type !== 'episode') return true;
+  if (snap.guid && md.guid && md.guid !== snap.guid) return true;
+  return false;
+}
+
 // For every snapshot row that is NOT currently in Plex's onDeck, check its real metadata. If
 // it's been fully watched (viewCount>0 AND viewOffset cleared) OR the item was deleted from
 // the library, drop it from the snapshots — otherwise it pollutes the "missing" list with
 // items the user has actually finished. Returns counts for logging.
-async function _cwPruneCompleted(liveKeys) {
+async function _cwPruneCompleted(liveKeys, account = _cwOwnerAccount()) {
+  const acctId = account.id, token = account.token;
   const missing = pccDb.prepare(`
-    SELECT rating_key FROM cw_snapshots WHERE account_id='owner'
-  `).all().map(r => r.rating_key).filter(k => !liveKeys.has(k));
-  if (!missing.length) return { checked: 0, pruned: 0 };
+    SELECT rating_key, guid FROM cw_snapshots WHERE account_id = ?
+  `).all(acctId).filter(r => !liveKeys.has(r.rating_key));
+  if (!missing.length) return { checked: 0, pruned: 0, healed: 0 };
 
-  let pruned = 0;
-  const del = pccDb.prepare("DELETE FROM cw_snapshots WHERE account_id='owner' AND rating_key = ?");
+  let pruned = 0, healed = 0;
+  const del = pccDb.prepare("DELETE FROM cw_snapshots WHERE account_id = ? AND rating_key = ?");
+  const heal = pccDb.prepare("UPDATE cw_snapshots SET rating_key = ?, thumb = ?, grandparent_thumb = ? WHERE account_id = ? AND rating_key = ?");
   // Lightly throttled: 5 concurrent metadata fetches at a time.
   for (let i = 0; i < missing.length; i += 5) {
     const batch = missing.slice(i, i + 5);
-    const results = await Promise.all(batch.map(async (rk) => ({ rk, md: await _cwFetchMetadata(rk) })));
-    for (const { rk, md } of results) {
+    const results = await Promise.all(batch.map(async (snap) => ({ snap, md: await _cwFetchMetadata(snap.rating_key, token) })));
+    for (const { snap, md } of results) {
       if (!md || md.error) continue; // transient Plex error — try again next cycle
+      const rk = snap.rating_key;
       // Treat as completed when: explicitly viewed and no significant remaining progress, OR
       // the item is gone from Plex entirely. Some Plex versions clear viewOffset to 0 after
       // a finish; others leave it unset. A viewCount>0 with viewOffset under 30s is a safe
       // "watched it" signal.
       const watched = md.gone || (md.viewCount > 0 && md.viewOffset < 30000);
-      if (watched) { del.run(rk); pruned++; }
+      if (watched) { del.run(acctId, rk); pruned++; continue; }
+      // Stale: the numeric ratingKey was reassigned (now a season/clip, or guid changed). If we
+      // know the guid, re-resolve the current key and heal the row; otherwise drop it so it stops
+      // showing a wrong cover and failing to restore.
+      if (_cwMetaIsStale(snap, md)) {
+        const resolved = snap.guid ? await _cwResolveByGuid(snap.guid, token) : null;
+        if (resolved && resolved.ratingKey && resolved.ratingKey !== rk && !liveKeys.has(resolved.ratingKey)) {
+          try { heal.run(resolved.ratingKey, resolved.thumb, resolved.grandparentThumb, acctId, rk); healed++; }
+          catch (e) { del.run(acctId, rk); pruned++; } // UNIQUE collision etc — safe to drop
+        } else { del.run(acctId, rk); pruned++; }
+      }
     }
   }
-  return { checked: missing.length, pruned };
+  return { checked: missing.length, pruned, healed };
 }
 
 // Walks every TV-show and Movie library and returns items with viewOffset > 0. Used by the
 // deep-scan path because Plex's /library/onDeck endpoint silently caps its response and ages
 // items out — that's exactly the failure mode the user reports as "Fallout/Sleepy Hollow/etc.
 // not showing up". Shape mirrors what _cwFetchOnDeck returns so downstream code is the same.
-async function _cwFetchAllInProgress() {
-  if (!config.plex.url || !config.plex.token) throw new Error('Plex not configured');
+async function _cwFetchAllInProgress(token = config.plex.token) {
+  if (!config.plex.url || !token) throw new Error('Plex not configured');
   const sec = await axios.get(`${config.plex.url}/library/sections`, {
-    params: { 'X-Plex-Token': config.plex.token },
+    params: { 'X-Plex-Token': token },
     headers: { Accept: 'application/json' },
     timeout: 15000
   });
@@ -3535,7 +3806,7 @@ async function _cwFetchAllInProgress() {
     try {
       const r = await axios.get(`${config.plex.url}/library/sections/${s.key}/all`, {
         params: {
-          'X-Plex-Token': config.plex.token,
+          'X-Plex-Token': token,
           ...(isShow ? { type: 4 } : {}) // episodes for show libs
         },
         headers: {
@@ -3558,14 +3829,14 @@ async function _cwFetchAllInProgress() {
 
 // Snapshot: upsert all live onDeck items with viewOffset>0. Items whose ratingKey is no
 // longer in the live response stay in the table — that's how we detect "missing" items.
-async function cwSnapshot(deep = false) {
-  const items = deep ? await _cwFetchAllInProgress() : await _cwFetchOnDeck();
+async function cwSnapshot(deep = false, account = _cwOwnerAccount()) {
+  const items = deep ? await _cwFetchAllInProgress(account.token) : await _cwFetchOnDeck(account.token);
   const now = new Date().toISOString();
   let saved = 0;
   const upsert = pccDb.prepare(`
     INSERT INTO cw_snapshots
-      (account_id, rating_key, title, show_title, season_num, episode_num, year, item_type, thumb, view_offset, duration, last_viewed_at, last_seen_at, last_in_hub_at)
-    VALUES ('owner', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+      (account_id, rating_key, title, show_title, season_num, episode_num, year, item_type, thumb, grandparent_thumb, guid, view_offset, duration, last_viewed_at, last_seen_at, last_in_hub_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
     ON CONFLICT(account_id, rating_key) DO UPDATE SET
       title = excluded.title,
       show_title = excluded.show_title,
@@ -3574,6 +3845,8 @@ async function cwSnapshot(deep = false) {
       year = excluded.year,
       item_type = excluded.item_type,
       thumb = excluded.thumb,
+      grandparent_thumb = excluded.grandparent_thumb,
+      guid = excluded.guid,
       view_offset = excluded.view_offset,
       duration = excluded.duration,
       last_viewed_at = excluded.last_viewed_at,
@@ -3588,6 +3861,7 @@ async function cwSnapshot(deep = false) {
       if (offset <= 0) continue;
       const isEp = it.type === 'episode';
       upsert.run(
+        account.id,
         String(it.ratingKey),
         it.title || null,
         isEp ? (it.grandparentTitle || it.parentTitle || null) : null,
@@ -3596,6 +3870,8 @@ async function cwSnapshot(deep = false) {
         Number.isFinite(it.year) ? it.year : null,
         it.type || null,
         it.thumb || null,
+        isEp ? (it.grandparentThumb || null) : null,
+        it.guid || null,
         offset,
         Number(it.duration) || 0,
         Number(it.lastViewedAt) || null
@@ -3607,42 +3883,114 @@ async function cwSnapshot(deep = false) {
   return { fetched: items.length, saved };
 }
 
-// Restore one item by pushing a /:/timeline event with state=stopped. That updates BOTH
-// viewOffset and lastViewedAt, which is what Plex's Continue Watching hub uses to decide
-// membership. Single timeline call is what mobile clients send when they stop playback.
-async function cwRestoreItem(ratingKey, actor) {
-  const snap = pccDb.prepare("SELECT * FROM cw_snapshots WHERE account_id='owner' AND rating_key = ?").get(String(ratingKey));
+// Push a single stopped /:/timeline event. This is what a mobile client sends when it stops
+// playback; it carries an X-Plex-Client-Identifier (Plex 400s without one) so the event is
+// attributed to a "client" in Plex's session list / Tautulli history. Used as a secondary
+// nudge to refresh lastViewedAt after /:/progress sets the offset.
+async function _cwPushTimeline(snap, token = config.plex.token) {
+  await axios.get(`${config.plex.url}/:/timeline`, {
+    params: {
+      ratingKey: snap.rating_key,
+      key: `/library/metadata/${snap.rating_key}`,
+      identifier: 'com.plexapp.plugins.library',
+      state: 'stopped',
+      time: snap.view_offset,
+      duration: snap.duration || (snap.view_offset + 1),
+      'X-Plex-Token': token,
+      'X-Plex-Client-Identifier': 'pcc-cw-restore',
+      'X-Plex-Product': 'Plex Command Center',
+      'X-Plex-Version': '4.0.5',
+      'X-Plex-Device-Name': 'PCC Continue-Watching Restore',
+      'X-Plex-Platform': 'PCC'
+    },
+    headers: { Accept: 'application/json' },
+    timeout: 10000
+  });
+}
+
+// Restore one item so it reappears in Plex's Continue Watching hub. The previous build used a
+// lone /:/timeline `stopped` event, which Plex silently drops when there's no live play session
+// behind the client id — the call returned 200 but viewOffset never changed (the "restore does
+// nothing" symptom). /:/progress writes the view offset directly (same shape as the working
+// /:/scrobble call) and does not depend on a session. We push that, then VERIFY by re-reading the
+// item's metadata so the result reflects what Plex actually stored rather than just "request sent".
+async function cwRestoreItem(ratingKey, actor, account = _cwOwnerAccount()) {
+  const acctId = account.id, token = account.token;
+  const snap = pccDb.prepare("SELECT * FROM cw_snapshots WHERE account_id = ? AND rating_key = ?").get(acctId, String(ratingKey));
   if (!snap) return { ok: false, error: 'No snapshot for this item' };
   if (!snap.view_offset || snap.view_offset <= 0) return { ok: false, error: 'Snapshot has no progress to restore' };
-  if (!config.plex.url || !config.plex.token) return { ok: false, error: 'Plex not configured' };
+  if (!config.plex.url || !token) return { ok: false, error: 'Plex not configured' };
 
+  // Guard against stale/reassigned ratingKeys. Plex reassigns numeric keys on a library rescan,
+  // leaving the snapshot pointing at an unrelated item (a season, a behind-the-scenes clip…).
+  // Verify the stored key still resolves to our content; if stale, re-resolve the CURRENT key by
+  // guid and heal the row — never push progress to whatever item now occupies the old key.
+  // (Metadata is read with the owner token; it's library-global and the user token may lack scope.)
+  let targetKey = String(snap.rating_key);
+  const pre = await _cwFetchMetadata(targetKey);
+  if (_cwMetaIsStale(snap, pre)) {
+    const resolved = snap.guid ? await _cwResolveByGuid(snap.guid) : null;
+    if (resolved && resolved.ratingKey) {
+      try {
+        pccDb.prepare("UPDATE cw_snapshots SET rating_key = ?, thumb = ?, grandparent_thumb = ? WHERE account_id = ? AND rating_key = ?")
+          .run(resolved.ratingKey, resolved.thumb, resolved.grandparentThumb, acctId, targetKey);
+      } catch (e) { /* UNIQUE collision with an existing row — fall through and push on resolved key */ }
+      targetKey = resolved.ratingKey;
+    } else {
+      pccDb.prepare("DELETE FROM cw_snapshots WHERE account_id = ? AND rating_key = ?").run(acctId, targetKey);
+      return { ok: false, error: "This item's Plex ID was reassigned by a library rescan and couldn't be re-matched — removed from the list. Re-snapshot to track it under its new ID." };
+    }
+  }
+
+  // Push targets the (possibly re-resolved) live key. _cwPushTimeline reads rating_key/view_offset/duration.
+  const pushSnap = { rating_key: targetKey, view_offset: snap.view_offset, duration: snap.duration };
+
+  // Both pushes are best-effort and independent — verification below is the source of truth, so
+  // a failure of either (e.g. an older Plex without /:/progress) doesn't abort the restore.
+  let pushErr = null, pushedAny = false;
   try {
-    // Plex's /:/timeline endpoint refuses any request that doesn't identify itself with an
-    // X-Plex-Client-Identifier (returns bare 400 Bad Request HTML — no body). The other
-    // X-Plex-* headers (Product/Version/Device-Name/Platform) aren't strictly required for
-    // the 200 response but Plex attributes the event to a "Client" in its session list, so
-    // sending them makes the activity legible in Plex's own logs / Tautulli history.
-    await axios.get(`${config.plex.url}/:/timeline`, {
+    // Primary: /:/progress sets the partial view offset directly and reliably. Pushed with the
+    // TARGET user's token so the offset lands on their account, not the owner's.
+    await axios.get(`${config.plex.url}/:/progress`, {
       params: {
-        ratingKey: snap.rating_key,
-        key: `/library/metadata/${snap.rating_key}`,
+        key: targetKey,
         identifier: 'com.plexapp.plugins.library',
-        state: 'stopped',
         time: snap.view_offset,
-        duration: snap.duration || (snap.view_offset + 1),
-        'X-Plex-Token': config.plex.token,
-        'X-Plex-Client-Identifier': 'pcc-cw-restore',
-        'X-Plex-Product': 'Plex Command Center',
-        'X-Plex-Version': '4.0.5',
-        'X-Plex-Device-Name': 'PCC Continue-Watching Restore',
-        'X-Plex-Platform': 'PCC'
+        state: 'stopped',
+        'X-Plex-Token': token
       },
       headers: { Accept: 'application/json' },
       timeout: 10000
     });
-    pccDb.prepare("UPDATE cw_snapshots SET restored_at = datetime('now'), restored_by = ? WHERE account_id='owner' AND rating_key = ?")
-      .run(actor || 'system', String(ratingKey));
-    return { ok: true };
+    pushedAny = true;
+  } catch (e) { pushErr = e; }
+  // Secondary: a stopped-timeline event (also bumps lastViewedAt for hub ordering).
+  try { await _cwPushTimeline(pushSnap, token); pushedAny = true; } catch (e) { if (!pushErr) pushErr = e; }
+
+  try {
+    // Verify against Plex's actual stored state for THIS user (viewOffset is per-account, so the
+    // read must use the user's token). Plex may clamp/round the offset slightly, so accept
+    // anything within 5s of the target (or a non-zero offset where we expected one).
+    const after = await _cwFetchMetadata(targetKey, token);
+    const plexOffset = after && !after.gone && !after.error ? Number(after.viewOffset) || 0 : 0;
+    const applied = !after?.error && !after?.gone && (Math.abs(plexOffset - snap.view_offset) <= 5000 || plexOffset > 0);
+
+    if (applied) {
+      pccDb.prepare("UPDATE cw_snapshots SET restored_at = datetime('now'), restored_by = ? WHERE account_id = ? AND rating_key = ?")
+        .run(actor || 'system', acctId, targetKey);
+      return { ok: true, applied: true, plexOffset, expected: snap.view_offset };
+    }
+    if (after?.gone) return { ok: false, error: 'Item no longer exists in Plex' };
+    if (after?.error) {
+      // Couldn't read it back. If at least one push went through, treat as best-effort success.
+      if (pushedAny) {
+        pccDb.prepare("UPDATE cw_snapshots SET restored_at = datetime('now'), restored_by = ? WHERE account_id = ? AND rating_key = ?")
+          .run(actor || 'system', acctId, targetKey);
+        return { ok: true, applied: null, note: `pushed, but could not verify (${after.error})` };
+      }
+      return { ok: false, error: pushErr ? (pushErr.response?.status ? `Plex ${pushErr.response.status}: ${pushErr.response.statusText}` : pushErr.message) : after.error };
+    }
+    return { ok: false, error: `Plex did not store the offset (viewOffset is ${Math.round(plexOffset/1000)}s after push). The item may be marked fully watched.`, plexOffset };
   } catch (e) {
     return { ok: false, error: e.response?.status ? `Plex ${e.response.status}: ${e.response.statusText}` : e.message };
   }
@@ -3650,17 +3998,17 @@ async function cwRestoreItem(ratingKey, actor) {
 
 // Auto-restore tick: for every snapshot item NOT in the current live hub AND not restored
 // recently, push the timeline event. Runs as part of each snapshot cycle when enabled.
-async function cwAutoRestoreCycle(liveKeys) {
+async function cwAutoRestoreCycle(liveKeys, account = _cwOwnerAccount()) {
   // Only consider items snapshotted at least once before this cycle (i.e., last_in_hub_at < a moment ago).
   const candidates = pccDb.prepare(`
     SELECT rating_key, view_offset, title FROM cw_snapshots
-    WHERE account_id='owner' AND view_offset > 0
+    WHERE account_id = ? AND view_offset > 0
       AND (restored_at IS NULL OR restored_at < datetime('now','-1 day'))
-  `).all();
+  `).all(account.id);
   let restored = 0, failed = 0;
   for (const c of candidates) {
     if (liveKeys.has(c.rating_key)) continue;
-    const r = await cwRestoreItem(c.rating_key, 'auto-restore');
+    const r = await cwRestoreItem(c.rating_key, 'auto-restore', account);
     if (r.ok) restored++; else failed++;
   }
   return { restored, failed };
@@ -3674,26 +4022,52 @@ function scheduleCwSnapshotter() {
   const minutes = Math.max(1, Number(s.interval_minutes) || 15);
   console.log(`[CW] Snapshotter scheduled every ${minutes}m (auto_restore=${s.auto_restore ? 'on' : 'off'})`);
 
+  // Snapshot + prune (+ optional auto-restore) for one account. Returns per-account counts.
+  const runForAccount = async (account, autoRestore) => {
+    const result = await cwSnapshot(false, account);
+    const live = await _cwFetchOnDeck(account.token);
+    const liveKeys = new Set(live.filter(i => (Number(i.viewOffset)||0) > 0).map(i => String(i.ratingKey)));
+    const prune = await _cwPruneCompleted(liveKeys, account);
+    let restoreResult = { restored: 0, failed: 0 };
+    if (autoRestore) restoreResult = await cwAutoRestoreCycle(liveKeys, account);
+    return { saved: result.saved, pruned: prune.pruned, ...restoreResult };
+  };
+
   const tick = async () => {
     try {
       const cur = pccDb.prepare('SELECT * FROM cw_settings WHERE id=1').get();
       if (!cur.enabled) return;
-      const result = await cwSnapshot();
-      // Fetch live once for the rest of the cycle (prune + optional auto-restore).
-      const live = await _cwFetchOnDeck();
-      const liveKeys = new Set(live.filter(i => (Number(i.viewOffset)||0) > 0).map(i => String(i.ratingKey)));
-      // Prune items the user has actually finished watching so they don't pollute the
-      // "missing" list — without this, every completed episode/movie looked recoverable.
-      const prune = await _cwPruneCompleted(liveKeys);
-      let restoreResult = { restored: 0, failed: 0 };
-      if (cur.auto_restore) {
-        restoreResult = await cwAutoRestoreCycle(liveKeys);
+
+      // Always snapshot the owner. When snapshot_all_users is on, also iterate every Plex Home
+      // user (minting a fresh per-user token each time). PIN-protected profiles can't be minted
+      // without a PIN, so the cron skips them — they remain restorable manually from the UI.
+      const accounts = [_cwOwnerAccount()];
+      if (cur.snapshot_all_users) {
+        try {
+          const homeUsers = await cwFetchHomeUsers();
+          for (const u of homeUsers) {
+            if (u.admin) continue;           // the owner is already covered above
+            if (u.protected) continue;       // needs a PIN — skip in the unattended cron
+            try { accounts.push({ id: String(u.uuid), token: await cwSwitchUserToken(u), title: u.title || u.username || 'User', kind: 'home' }); }
+            catch (e) { console.warn(`[CW] Skipping Home user ${u.title||u.uuid}: ${e.message}`); }
+          }
+        } catch (e) { console.warn('[CW] Could not list Home users:', e.message); }
+      }
+
+      let totalSaved = 0, totalRestored = 0, totalFailed = 0, totalPruned = 0;
+      for (const account of accounts) {
+        try {
+          const r = await runForAccount(account, !!cur.auto_restore);
+          totalSaved += r.saved; totalRestored += r.restored; totalFailed += r.failed; totalPruned += r.pruned;
+        } catch (e) {
+          console.warn(`[CW] Tick error for account ${account.title || account.id}:`, e.message);
+        }
       }
       pccDb.prepare(`
         UPDATE cw_settings SET last_run = datetime('now'), last_snapshot_count = ?, last_restore_count = ?, last_error = NULL WHERE id = 1
-      `).run(result.saved, restoreResult.restored);
-      if (restoreResult.restored || restoreResult.failed || prune.pruned) {
-        console.log(`[CW] Tick: snapshotted ${result.saved}, pruned-watched ${prune.pruned}, restored ${restoreResult.restored}, failed ${restoreResult.failed}`);
+      `).run(totalSaved, totalRestored);
+      if (totalRestored || totalFailed || totalPruned) {
+        console.log(`[CW] Tick (${accounts.length} account${accounts.length!==1?'s':''}): snapshotted ${totalSaved}, pruned-watched ${totalPruned}, restored ${totalRestored}, failed ${totalFailed}`);
       }
     } catch (e) {
       pccDb.prepare("UPDATE cw_settings SET last_run = datetime('now'), last_error = ? WHERE id = 1").run((e.message || String(e)).slice(0, 500));
@@ -4249,6 +4623,12 @@ if (LIVETV_ENABLED) {
     // for any show that just completed its full episode run, so the show keeps rotating without
     // requiring the user to hit Renew manually.
     if (!cols2.includes('auto_renew_shows')) db.exec("ALTER TABLE channels ADD COLUMN auto_renew_shows INTEGER DEFAULT 0");
+    // Air-count features (#7): JSON array of program_ids the user "boosted" (get ~2x airtime),
+    // and an auto-retire threshold — drop a program from the pool once it has aired this many
+    // times on the channel (0 = disabled). retire_alerted_at dedupes the Telegram exhaustion ping.
+    if (!cols2.includes('boosted_programs')) db.exec("ALTER TABLE channels ADD COLUMN boosted_programs TEXT DEFAULT '[]'");
+    if (!cols2.includes('retire_after_airings')) db.exec("ALTER TABLE channels ADD COLUMN retire_after_airings INTEGER DEFAULT 0");
+    if (!cols2.includes('exhaustion_alerted_on')) db.exec("ALTER TABLE channels ADD COLUMN exhaustion_alerted_on TEXT");
   } catch(e) {}
   // Plex summary (one-paragraph description) — used by the Add-Programs UI cards. Populated on
   // scan when present; older rows stay NULL and just render without a description.
@@ -4374,7 +4754,10 @@ if (LIVETV_ENABLED) {
       const channels = db.prepare('SELECT id, name FROM channels WHERE enabled = 1').all();
       for (const ch of channels) {
         try {
-          if (!isChannelEffectivelyOnAir(ch.id)) continue;
+          // Strict on-air only: never count air-time during off-hours or the post-boundary
+          // grace tail. The show-completion report and rerun filter consume this log, so
+          // logging off-hours airings would inflate counts and falsely "complete" content.
+          if (!isChannelOnAir(ch.id)) continue;
           const prog = getCurrentProgram(ch.id);
           const pid = prog?.item?.program_id;
           if (!pid) continue; // skip fillers and empty slots
@@ -4386,6 +4769,11 @@ if (LIVETV_ENABLED) {
       }
     } catch(e) { console.warn('[LiveTV] airtime logger error:', e.message); }
   }, 5 * 60 * 1000);
+
+  // Channel-exhaustion alert (#7): check every 6 hours whether any channel has cycled through
+  // most of its pool and push a one-time Telegram renewal nudge. First run shortly after boot.
+  setInterval(() => { checkChannelExhaustion(); }, 6 * 60 * 60 * 1000);
+  setTimeout(() => { checkChannelExhaustion(); }, 60 * 1000);
 }
 
 // --- Virtual Clock Engine ---
@@ -4540,6 +4928,13 @@ async function scanPlexLibraries() {
       title=excluded.title, duration_ms=excluded.duration_ms, genre=excluded.genre,
       year=excluded.year, thumb=excluded.thumb, art=excluded.art, content_rating=excluded.content_rating,
       file_path=excluded.file_path, summary=COALESCE(excluded.summary, programs.summary),
+      -- MUST refresh season/episode/show/type from Plex on every scan. Plex reassigns numeric
+      -- ratingKeys on a library rescan (see api-quirks memory), so a ratingKey that used to be
+      -- S01E01 can come back pointing at S05E03. Without these, the row kept its STALE season/
+      -- episode numbers while its title/duration updated to the new episode — scrambling "by order"
+      -- playlists (the "jumped from season 1 to season 5" + duplicate-SxxExx-rows bug).
+      type=excluded.type, show_title=excluded.show_title,
+      season_num=excluded.season_num, episode_num=excluded.episode_num,
       added_at=COALESCE(programs.added_at, excluded.added_at), updated_at=datetime('now')
   `);
 
@@ -4582,7 +4977,11 @@ async function scanPlexLibraries() {
               const existing = db.prepare('SELECT id FROM programs WHERE plex_rating_key = ?').get(String(ep.ratingKey));
               upsert.run(
                 String(ep.ratingKey), ep.title, 'episode',
-                ep.grandparentTitle || show.title, ep.parentIndex || null, ep.index || null,
+                // Number.isFinite (not `|| null`) so season 0 (specials) / episode 0 are preserved
+                // as 0 instead of collapsing to null and sorting unpredictably.
+                ep.grandparentTitle || show.title,
+                Number.isFinite(ep.parentIndex) ? ep.parentIndex : null,
+                Number.isFinite(ep.index) ? ep.index : null,
                 ep.duration || 0, showGenres, ep.year || show.year || null,
                 ep.thumb || ep.grandparentThumb || null, ep.art || show.art || null,
                 ep.contentRating || show.contentRating || null,
@@ -4915,7 +5314,8 @@ app.get('/api/livetv/programs/search', (req, res) => {
   const q = (req.query.q || '').trim();
   const group = (req.query.group || 'any').toLowerCase();
   const libraryKey = (req.query.library_key || '').trim();
-  const limit = Math.min(100, parseInt(req.query.limit) || 25);
+  const limit = Math.min(100, parseInt(req.query.limit) || 50);
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   // Two-mode trigger: typed search (q>=2) OR browsing a library (library_key set). Neither
   // → empty so the UI doesn't spam huge unfiltered list payloads on first paint.
   if (q.length < 2 && !libraryKey) return res.json({ results: [], group });
@@ -4928,12 +5328,14 @@ app.get('/api/livetv/programs/search', (req, res) => {
   if (group === 'show') {
     // Group by show_title. Pick one representative episode (prefer S01E01) for cover/year/genre.
     let where = "duration_ms > 0 AND type = 'episode' AND show_title IS NOT NULL";
-    const params = [];
-    if (q) { where += ' AND show_title LIKE ?'; params.push(like); }
-    if (libraryKey) { where += ' AND library_key = ?'; params.push(libraryKey); }
+    const whereParams = [];
+    if (q) { where += ' AND show_title LIKE ?'; whereParams.push(like); }
+    if (libraryKey) { where += ' AND library_key = ?'; whereParams.push(libraryKey); }
+    const total = db.prepare(`SELECT COUNT(DISTINCT show_title) AS n FROM programs WHERE ${where}`).get(...whereParams).n;
     const orderBy = q ? 'CASE WHEN show_title LIKE ? THEN 0 ELSE 1 END, show_title' : 'show_title';
+    const params = [...whereParams];
     if (q) params.push(startLike);
-    params.push(limit);
+    params.push(limit, offset);
     const rows = db.prepare(`
       SELECT show_title,
              COUNT(*) AS episode_count,
@@ -4946,7 +5348,7 @@ app.get('/api/livetv/programs/search', (req, res) => {
       WHERE ${where}
       GROUP BY show_title
       ORDER BY ${orderBy}
-      LIMIT ?
+      LIMIT ? OFFSET ?
     `).all(...params);
     const results = rows.map(r => {
       // Representative thumb/summary: the show's pilot if we have one, else any episode.
@@ -4974,23 +5376,25 @@ app.get('/api/livetv/programs/search', (req, res) => {
         episode_ids: epIds
       };
     });
-    return res.json({ results, group });
+    return res.json({ results, group, total, offset });
   }
 
   if (group === 'movie') {
     let where = "duration_ms > 0 AND type = 'movie'";
-    const params = [];
-    if (q) { where += ' AND title LIKE ?'; params.push(like); }
-    if (libraryKey) { where += ' AND library_key = ?'; params.push(libraryKey); }
+    const whereParams = [];
+    if (q) { where += ' AND title LIKE ?'; whereParams.push(like); }
+    if (libraryKey) { where += ' AND library_key = ?'; whereParams.push(libraryKey); }
+    const total = db.prepare(`SELECT COUNT(*) AS n FROM programs WHERE ${where}`).get(...whereParams).n;
     const orderBy = q ? 'CASE WHEN title LIKE ? THEN 0 ELSE 1 END, title' : 'title';
+    const params = [...whereParams];
     if (q) params.push(startLike);
-    params.push(limit);
+    params.push(limit, offset);
     const rows = db.prepare(`
       SELECT id, title, year, duration_ms, genre, thumb, summary, content_rating
       FROM programs
       WHERE ${where}
       ORDER BY ${orderBy}
-      LIMIT ?
+      LIMIT ? OFFSET ?
     `).all(...params);
     const results = rows.map(r => ({
       kind: 'movie',
@@ -5003,24 +5407,26 @@ app.get('/api/livetv/programs/search', (req, res) => {
       cover: thumbUrl(r.thumb),
       summary: r.summary || null
     }));
-    return res.json({ results, group });
+    return res.json({ results, group, total, offset });
   }
 
   // Legacy / mixed mode (one row per program, including each episode individually).
   let where = 'duration_ms > 0';
-  const params = [];
-  if (q) { where += ' AND (title LIKE ? OR show_title LIKE ?)'; params.push(like, like); }
-  if (libraryKey) { where += ' AND library_key = ?'; params.push(libraryKey); }
+  const whereParams = [];
+  if (q) { where += ' AND (title LIKE ? OR show_title LIKE ?)'; whereParams.push(like, like); }
+  if (libraryKey) { where += ' AND library_key = ?'; whereParams.push(libraryKey); }
+  const total = db.prepare(`SELECT COUNT(*) AS n FROM programs WHERE ${where}`).get(...whereParams).n;
   const orderBy = q ? 'CASE WHEN title LIKE ? THEN 0 ELSE 1 END, title' : 'title';
+  const params = [...whereParams];
   if (q) params.push(startLike);
-  params.push(limit);
+  params.push(limit, offset);
   const rows = db.prepare(`
     SELECT id, plex_rating_key, title, type, show_title, season_num, episode_num,
            duration_ms, genre, year, thumb, summary, content_rating
     FROM programs
     WHERE ${where}
     ORDER BY ${orderBy}
-    LIMIT ?
+    LIMIT ? OFFSET ?
   `).all(...params);
   const results = rows.map(r => ({
     kind: r.type === 'episode' ? 'episode' : 'movie',
@@ -5035,7 +5441,7 @@ app.get('/api/livetv/programs/search', (req, res) => {
     cover: thumbUrl(r.thumb),
     summary: r.summary || null
   }));
-  res.json({ results, group: 'any' });
+  res.json({ results, group: 'any', total, offset });
 });
 
 app.post('/api/livetv/channels/:id/rebuild', (req, res) => {
@@ -5092,15 +5498,10 @@ function _gcPlaylog() {
   } catch(e) {}
 }
 
-function buildChannelPlaylist(channelId) {
-  const channel = db.prepare('SELECT * FROM channels WHERE id = ?').get(channelId);
-  if (!channel) return 0;
-
-  // Clear existing programming
-  db.prepare('DELETE FROM channel_programming WHERE channel_id = ?').run(channelId);
-
-  // Find matching programs
-  let programs = [];
+// Resolve a channel's raw source pool — the programs matched by its genre/library/filter source,
+// BEFORE exclusions, anti-rerun, boost or shuffling. Shared by buildChannelPlaylist and the
+// air-count endpoint so both agree on "what content belongs to this channel".
+function _selectChannelBasePrograms(channel) {
   if (channel.source_type === 'library' && channel.source_value && channel.source_value.startsWith('{')) {
     // New filter-based mode: source_value is JSON with filter criteria
     try {
@@ -5114,23 +5515,33 @@ function buildChannelPlaylist(channelId) {
         exclude_genres: filters.exclude_genres || [],
         library_key: channel.library_key || null
       });
-      programs = db.prepare(sql + ' ORDER BY title').all(...params);
+      return db.prepare(sql + ' ORDER BY title').all(...params);
     } catch(e) {
       console.error('LiveTV: Failed to parse channel filters:', e.message);
-      programs = db.prepare('SELECT * FROM programs WHERE library_key = ? AND duration_ms > 0 ORDER BY title')
+      return db.prepare('SELECT * FROM programs WHERE library_key = ? AND duration_ms > 0 ORDER BY title')
         .all(channel.library_key || channel.source_value);
     }
   } else if (channel.source_type === 'genre') {
     // Legacy: primary genre matching
-    programs = db.prepare("SELECT * FROM programs WHERE (genre = ? OR genre LIKE ?) AND duration_ms > 0 ORDER BY title")
+    return db.prepare("SELECT * FROM programs WHERE (genre = ? OR genre LIKE ?) AND duration_ms > 0 ORDER BY title")
       .all(channel.source_value, `${channel.source_value},%`);
   } else if (channel.source_type === 'library') {
     // Legacy: library-only (no JSON filters)
-    programs = db.prepare('SELECT * FROM programs WHERE library_key = ? AND duration_ms > 0 ORDER BY title')
+    return db.prepare('SELECT * FROM programs WHERE library_key = ? AND duration_ms > 0 ORDER BY title')
       .all(channel.library_key || channel.source_value);
-  } else {
-    programs = db.prepare('SELECT * FROM programs WHERE duration_ms > 0 ORDER BY title').all();
   }
+  return db.prepare('SELECT * FROM programs WHERE duration_ms > 0 ORDER BY title').all();
+}
+
+function buildChannelPlaylist(channelId) {
+  const channel = db.prepare('SELECT * FROM channels WHERE id = ?').get(channelId);
+  if (!channel) return 0;
+
+  // Clear existing programming
+  db.prepare('DELETE FROM channel_programming WHERE channel_id = ?').run(channelId);
+
+  // Find matching programs
+  let programs = _selectChannelBasePrograms(channel);
 
   // Apply exclusions, except never exclude programs the user explicitly included. The manual
   // "Add Programs" list is the user's override of every other filter — if it's on that list
@@ -5153,6 +5564,21 @@ function buildChannelPlaylist(channelId) {
       const extras = db.prepare(`SELECT * FROM programs WHERE id IN (${placeholders}) AND duration_ms > 0`).all(...missing);
       programs = programs.concat(extras);
     }
+  }
+
+  // Auto-retire (#7): once a program has aired retire_after_airings times on this channel
+  // (lifetime, from the playlog), drop it from the pool — "don't show after it aired N times".
+  // Non-destructive: recomputed every build, so raising the threshold or clearing the playlog
+  // brings content back. Explicitly-included programs are never auto-retired.
+  const retireAfter = Number(channel.retire_after_airings) || 0;
+  if (retireAfter > 0 && programs.length > 0) {
+    const counts = new Map(
+      db.prepare("SELECT program_id, COUNT(*) c FROM channel_playlog WHERE channel_id = ? AND program_id IS NOT NULL GROUP BY program_id")
+        .all(channelId).map(r => [r.program_id, r.c])
+    );
+    const before = programs.length;
+    programs = programs.filter(p => includedSet.has(p.id) || (counts.get(p.id) || 0) < retireAfter);
+    if (programs.length < before) console.log(`[LiveTV] Channel ${channel.name}: auto-retired ${before - programs.length} program(s) at >=${retireAfter} airings`);
   }
 
   // Anti-rerun: skip programs that aired on this channel within the last N days.
@@ -5227,6 +5653,17 @@ function buildChannelPlaylist(channelId) {
   if (programs.length === 0) {
     invalidatePlaylistCache(channelId);
     return 0;
+  }
+
+  // Boost (#7): give user-boosted programs an extra copy in the pool (~2x airtime). Applied
+  // after anti-rerun so a boosted item that's currently rerun-filtered isn't re-added — only
+  // programs that survived the filters get amplified.
+  let boostedIds = [];
+  try { const v = JSON.parse(channel.boosted_programs || '[]'); if (Array.isArray(v)) boostedIds = v; } catch(e) {}
+  if (boostedIds.length > 0) {
+    const boostedSet = new Set(boostedIds);
+    const extra = programs.filter(p => boostedSet.has(p.id));
+    if (extra.length > 0) programs = programs.concat(extra);
   }
 
   // Apply schedule rules (seasonal genre boost)
@@ -5706,7 +6143,9 @@ app.get('/api/livetv/now-playing', (req, res) => {
   const channels = db.prepare('SELECT * FROM channels WHERE enabled = 1 ORDER BY number').all();
   const baseUrl = getBaseUrl(req);
   const result = channels.map(ch => {
-    const onAir = isChannelEffectivelyOnAir(ch.id);
+    // Strict on-air so the Now-Playing strip agrees with the guide: during off-hours we show
+    // no current program (the stream itself still honors the finish-current-program grace).
+    const onAir = isChannelOnAir(ch.id);
     const rules = db.prepare('SELECT * FROM schedule_rules WHERE channel_id = ?').all(ch.id);
     const nextOnAirTime = onAir ? null : getNextOnAirTime(ch.id);
     // When off-air, don't return current program info
@@ -7288,20 +7727,25 @@ function isChannelOnAir(channelId, atTime) {
   return false; // has time rules but none match now
 }
 
-// Check if channel is effectively on-air, allowing a currently-playing program
-// that started during on-air time to finish before going off-air.
+// Check if channel is effectively on-air, allowing the single program that was airing at
+// the moment the channel went off-air to finish before cutting to off-air. Used by the live
+// stream so a viewer mid-program isn't cut off exactly at the boundary.
 function isChannelEffectivelyOnAir(channelId) {
   if (isChannelOnAir(channelId)) return true;
 
-  // Channel is technically off-air — check if a program started during on-air time
-  // and hasn't finished yet (so we let it complete instead of cutting mid-content)
+  // Off-air now. The previous logic inferred the program's start as (now - offsetMs), but the
+  // virtual playlist clock free-runs through off-hours, so a long program (or even one that
+  // *started* during off-hours) could keep the channel "on-air" for hours. Anchor on the real
+  // off-air boundary instead and only extend grace until the program airing AT that boundary ends.
   try {
-    const current = getCurrentProgram(channelId);
-    if (!current || !current.offsetMs || current.offsetMs <= 0) return false;
-
-    // When did this program start in real time?
-    const programStartTime = Date.now() - current.offsetMs;
-    return isChannelOnAir(channelId, programStartTime);
+    const now = Date.now();
+    const ranges = getOnAirRanges(channelId, now - 24 * 3600 * 1000, now);
+    if (!ranges || ranges.length === 0) return false;
+    const boundary = ranges[ranges.length - 1].end; // end of the most recent on-air block
+    if (boundary >= now) return false;
+    const progAtBoundary = getCurrentProgram(channelId, boundary);
+    if (!progAtBoundary || progAtBoundary.remainingMs <= 0) return false;
+    return now < boundary + progAtBoundary.remainingMs;
   } catch (e) {
     return false;
   }
@@ -9310,6 +9754,173 @@ app.put('/api/livetv/channels/:id/auto-renew', (req, res) => {
   db.prepare("UPDATE channels SET auto_renew_shows = ?, updated_at = datetime('now') WHERE id = ?").run(enabled, req.params.id);
   res.json({ success: true, auto_renew_shows: !!enabled });
 });
+
+// --- Air-count / boost / retire (#7) -------------------------------------------------------
+// Compute, for one channel, every program in its source pool annotated with how many times it
+// has aired (lifetime, from channel_playlog), plus boost/retire state. Episodes are aggregated
+// per show so the list stays readable; movies are listed individually.
+function _channelAirStats(channel) {
+  // Pool = source-matched programs ∪ explicitly-included, minus nothing (we want to SHOW retired
+  // items so the user can un-retire them). Mirrors buildChannelPlaylist's pool assembly.
+  let pool = _selectChannelBasePrograms(channel);
+  let includedIds = [];
+  try { const v = JSON.parse(channel.included_programs || '[]'); if (Array.isArray(v)) includedIds = v; } catch(e) {}
+  if (includedIds.length) {
+    const have = new Set(pool.map(p => p.id));
+    const missing = includedIds.filter(id => !have.has(id));
+    if (missing.length) {
+      const ph = missing.map(() => '?').join(',');
+      pool = pool.concat(db.prepare(`SELECT * FROM programs WHERE id IN (${ph}) AND duration_ms > 0`).all(...missing));
+    }
+  }
+  let excluded = []; try { excluded = JSON.parse(channel.excluded_programs || '[]'); } catch(e) {}
+  let boosted = [];  try { boosted = JSON.parse(channel.boosted_programs || '[]'); } catch(e) {}
+  const exSet = new Set(excluded), boSet = new Set(boosted);
+
+  const countRows = db.prepare(
+    "SELECT program_id, COUNT(*) c, MAX(aired_on) last FROM channel_playlog WHERE channel_id = ? AND program_id IS NOT NULL GROUP BY program_id"
+  ).all(channel.id);
+  const counts = new Map(countRows.map(r => [r.program_id, { c: r.c, last: r.last }]));
+
+  const plexUrl = config.plex.url || '', plexToken = config.plex.token || '';
+  const thumbUrl = t => t && plexUrl ? `${plexUrl}${t}?X-Plex-Token=${plexToken}` : null;
+
+  const movies = [];
+  const showMap = new Map(); // show_title -> aggregate
+  for (const p of pool) {
+    const stat = counts.get(p.id) || { c: 0, last: null };
+    if (p.type === 'episode' && p.show_title) {
+      let s = showMap.get(p.show_title);
+      if (!s) { s = { show_title: p.show_title, type: 'show', thumb: thumbUrl(p.thumb), episode_count: 0, episodes_aired: 0, total_airings: 0, last_aired: null, program_ids: [], boosted_count: 0, retired_count: 0 }; showMap.set(p.show_title, s); }
+      s.episode_count++;
+      s.total_airings += stat.c;
+      if (stat.c > 0) s.episodes_aired++;
+      if (stat.last && (!s.last_aired || stat.last > s.last_aired)) s.last_aired = stat.last;
+      s.program_ids.push(p.id);
+      if (boSet.has(p.id)) s.boosted_count++;
+      if (exSet.has(p.id)) s.retired_count++;
+    } else {
+      movies.push({
+        program_id: p.id, title: p.title, year: p.year, type: p.type || 'movie',
+        thumb: thumbUrl(p.thumb), air_count: stat.c, last_aired: stat.last,
+        boosted: boSet.has(p.id), retired: exSet.has(p.id), program_ids: [p.id]
+      });
+    }
+  }
+  const shows = [...showMap.values()].map(s => ({
+    show_title: s.show_title, type: 'show', thumb: s.thumb,
+    episode_count: s.episode_count, episodes_aired: s.episodes_aired,
+    air_count: s.total_airings, last_aired: s.last_aired, program_ids: s.program_ids,
+    boosted: s.episode_count > 0 && s.boosted_count === s.episode_count,
+    retired: s.episode_count > 0 && s.retired_count === s.episode_count
+  }));
+
+  // Pool-level exhaustion: a program is "exhausted" once it's hit the retire threshold (or, if
+  // no threshold set, once it has aired at least once). Drives the renewal alert + UI summary.
+  const retireAfter = Number(channel.retire_after_airings) || 0;
+  const allItems = [...movies, ...shows.map(s => ({ air_count: s.air_count, retired: s.retired }))];
+  const total = pool.length;
+  let aired = 0, exhausted = 0;
+  for (const p of pool) {
+    const c = (counts.get(p.id) || { c: 0 }).c;
+    if (c > 0) aired++;
+    if (retireAfter > 0 ? c >= retireAfter : c > 0) exhausted++;
+  }
+  const summary = {
+    total_programs: total,
+    aired_programs: aired,
+    never_aired_programs: total - aired,
+    exhausted_programs: exhausted,
+    exhaustion_pct: total > 0 ? Math.round((exhausted / total) * 100) : 0,
+    retire_after_airings: retireAfter
+  };
+  movies.sort((a, b) => b.air_count - a.air_count || (a.title || '').localeCompare(b.title || ''));
+  shows.sort((a, b) => b.air_count - a.air_count || (a.show_title || '').localeCompare(b.show_title || ''));
+  return { summary, movies, shows };
+}
+
+app.get('/api/livetv/channels/:id/airings', (req, res) => {
+  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
+  const ch = db.prepare('SELECT * FROM channels WHERE id = ?').get(req.params.id);
+  if (!ch) return res.status(404).json({ error: 'Channel not found' });
+  try {
+    const data = _channelAirStats(ch);
+    res.json({ channel: { id: ch.id, name: ch.name, retire_after_airings: Number(ch.retire_after_airings) || 0 }, ...data });
+  } catch (e) {
+    console.error('[LiveTV] airings error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Toggle boost (extra airtime) or retire (exclude) for a set of program_ids. Body: { program_ids:[], on:bool }
+function _toggleProgramList(channelId, column, programIds, on) {
+  const ch = db.prepare(`SELECT ${column} AS list FROM channels WHERE id = ?`).get(channelId);
+  if (!ch) return null;
+  let cur = []; try { const v = JSON.parse(ch.list || '[]'); if (Array.isArray(v)) cur = v; } catch(e) {}
+  const set = new Set(cur);
+  const ids = (Array.isArray(programIds) ? programIds : []).map(Number).filter(Number.isFinite);
+  for (const id of ids) { if (on) set.add(id); else set.delete(id); }
+  db.prepare(`UPDATE channels SET ${column} = ?, updated_at = datetime('now') WHERE id = ?`).run(JSON.stringify([...set]), channelId);
+  return [...set];
+}
+
+app.post('/api/livetv/channels/:id/airings/boost', (req, res) => {
+  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
+  const r = _toggleProgramList(req.params.id, 'boosted_programs', req.body?.program_ids, !!req.body?.on);
+  if (r === null) return res.status(404).json({ error: 'Channel not found' });
+  const count = buildChannelPlaylist(parseInt(req.params.id));
+  res.json({ success: true, boosted_programs: r, programCount: count });
+});
+
+app.post('/api/livetv/channels/:id/airings/retire', (req, res) => {
+  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
+  const r = _toggleProgramList(req.params.id, 'excluded_programs', req.body?.program_ids, !!req.body?.on);
+  if (r === null) return res.status(404).json({ error: 'Channel not found' });
+  const count = buildChannelPlaylist(parseInt(req.params.id));
+  res.json({ success: true, excluded_programs: r, programCount: count });
+});
+
+app.put('/api/livetv/channels/:id/airings/settings', (req, res) => {
+  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
+  const ch = db.prepare('SELECT id FROM channels WHERE id = ?').get(req.params.id);
+  if (!ch) return res.status(404).json({ error: 'Channel not found' });
+  const n = Math.max(0, Math.min(1000, parseInt(req.body?.retire_after_airings) || 0));
+  db.prepare("UPDATE channels SET retire_after_airings = ?, updated_at = datetime('now') WHERE id = ?").run(n, req.params.id);
+  const count = buildChannelPlaylist(parseInt(req.params.id));
+  res.json({ success: true, retire_after_airings: n, programCount: count });
+});
+
+// When a channel has cycled through this % of its pool, push a one-time Telegram "needs renewal"
+// alert. exhaustion_alerted_on latches the date so it fires once per exhaustion episode; it's
+// cleared automatically when fresh content drops the channel back below the threshold.
+const EXHAUSTION_ALERT_PCT = 90;
+async function checkChannelExhaustion() {
+  if (!LIVETV_ENABLED || !db) return;
+  try {
+    const channels = db.prepare('SELECT * FROM channels WHERE enabled = 1').all();
+    const today = _todayDateStr();
+    for (const ch of channels) {
+      let summary;
+      try { summary = _channelAirStats(ch).summary; } catch(e) { continue; }
+      if (!summary || summary.total_programs === 0) continue;
+      const exhausted = summary.exhaustion_pct >= EXHAUSTION_ALERT_PCT;
+      if (exhausted && ch.exhaustion_alerted_on !== today) {
+        const sent = await sendTelegramMessage([
+          '📺 *Channel content exhausted*',
+          '',
+          `*Channel:* ${ch.name}`,
+          `*Cycled through:* ${summary.exhausted_programs}/${summary.total_programs} programs (${summary.exhaustion_pct}%)`,
+          `*Never aired:* ${summary.never_aired_programs}`,
+          '',
+          `This channel has aired most of its content${(Number(ch.retire_after_airings)||0) > 0 ? ` (retire-after ${ch.retire_after_airings} airings)` : ''}. Add new programs or renew it to keep variety.`
+        ].join('\n'));
+        if (sent) db.prepare("UPDATE channels SET exhaustion_alerted_on = ? WHERE id = ?").run(today, ch.id);
+      } else if (!exhausted && ch.exhaustion_alerted_on) {
+        db.prepare("UPDATE channels SET exhaustion_alerted_on = NULL WHERE id = ?").run(ch.id);
+      }
+    }
+  } catch (e) { console.warn('[LiveTV] exhaustion check error:', e.message); }
+}
 
 app.post('/api/livetv/new-items/mark-seen', (req, res) => {
   if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });

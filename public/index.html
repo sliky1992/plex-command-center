@@ -322,6 +322,9 @@ function App() {
   const [cwLoading, setCwLoading] = useState(false);
   const [cwBusyKey, setCwBusyKey] = useState(null); // rating_key currently being restored
   const [cwShowLive, setCwShowLive] = useState(false);
+  const [cwAccounts, setCwAccounts] = useState([{ id: 'owner', title: 'Owner', kind: 'owner' }]); // selectable accounts (owner + Plex Home users)
+  const [cwAccount, setCwAccount] = useState('owner'); // currently selected account id
+  const [cwPins, setCwPins] = useState({}); // accountId -> PIN entered this session (memory only, not persisted)
 
   // Missing subtitles modal (admin-only — Bazarr cross-reference, opens from Tools tab)
   const [subsModal, setSubsModal] = useState(false);
@@ -887,6 +890,9 @@ function App() {
   useEffect(() => {
     if (tab === 'settings') loadSettings();
   }, [tab]);
+  // CW modal: load the account list once on open; reload snapshots whenever the chosen account changes.
+  useEffect(() => { if (cwModal) { loadCwUsers(); loadCwState(); } }, [cwModal]);
+  useEffect(() => { if (cwModal) loadCwState(); }, [cwAccount]);
   const openSettingsEdit = (svc) => {
     // Clone fields with editable working copies. Secrets start blank; user types to replace.
     const working = svc.fields.map(f => ({ ...f, value: f.type === 'secret' ? '' : (f.value || '') }));
@@ -921,16 +927,41 @@ function App() {
   };
 
   // --- Continue Watching modal ---
-  const loadCwState = async () => {
+  // Build the ?account=&pin= suffix for the currently selected account. The PIN (for protected
+  // Plex Home profiles) is only held in memory for the session, never persisted.
+  const cwAcctQs = (extra) => {
+    const p = new URLSearchParams(extra || {});
+    if (cwAccount && cwAccount !== 'owner') p.set('account', cwAccount);
+    const pin = cwPins[cwAccount];
+    if (pin) p.set('pin', pin);
+    const s = p.toString();
+    return s ? `?${s}` : '';
+  };
+  // If a request 409s asking for a PIN, prompt for it, remember it, and let the caller retry.
+  const cwHandlePin = (r) => {
+    if (r && r.code === 'PIN_REQUIRED') {
+      const pin = prompt(`This Plex Home profile is PIN-protected.\nEnter its 4-digit PIN to act as this user:`);
+      if (pin) { setCwPins(prev => ({ ...prev, [cwAccount]: pin })); return pin; }
+    }
+    return null;
+  };
+  const loadCwUsers = async () => {
+    const r = await fetch('/api/cw/users').then(x=>x.json()).catch(e=>({error:e.message}));
+    if (r.accounts) setCwAccounts(r.accounts);
+  };
+  const loadCwState = async (retried = false) => {
     setCwLoading(true);
-    const r = await fetch('/api/cw/state').then(x=>x.json()).catch(e=>({error:e.message}));
+    const res = await fetch(`/api/cw/state${cwAcctQs()}`);
+    const r = await res.json().catch(e=>({error:e.message}));
+    if (res.status === 409 && !retried && cwHandlePin(r)) { return loadCwState(true); }
     setCwState(r); setCwLoading(false);
   };
-  const cwSnapshotNow = async (deep = false) => {
+  const cwSnapshotNow = async (deep = false, retried = false) => {
     setCwLoading(true);
-    const url = deep ? '/api/cw/snapshot?deep=1' : '/api/cw/snapshot';
-    const r = await fetch(url, { method: 'POST' }).then(x=>x.json()).catch(e=>({error:e.message}));
-    if (r.success) showToast(`${deep?'Deep-scan':'Snapshot'}: ${r.saved} item${r.saved!==1?'s':''}`);
+    const res = await fetch(`/api/cw/snapshot${cwAcctQs(deep ? { deep: '1' } : {})}`, { method: 'POST' });
+    const r = await res.json().catch(e=>({error:e.message}));
+    if (res.status === 409 && !retried && cwHandlePin(r)) { return cwSnapshotNow(deep, true); }
+    if (r.success) showToast(`${deep?'Deep-scan':'Snapshot'}: ${r.saved} item${r.saved!==1?'s':''}${r.account && r.account.id!=='owner' ? ` for ${r.account.title}` : ''}`);
     else showToast('Snapshot failed: ' + (r.error||'Unknown'), 'error');
     await loadCwState();
   };
@@ -941,9 +972,11 @@ function App() {
     if (r.success) { showToast('CW settings updated'); loadCwState(); }
     else showToast('Update failed: ' + (r.error||'Unknown'), 'error');
   };
-  const cwRestoreOne = async (rk) => {
+  const cwRestoreOne = async (rk, retried = false) => {
     setCwBusyKey(rk);
-    const r = await fetch(`/api/cw/restore/${rk}`, { method: 'POST' }).then(x=>x.json()).catch(e=>({error:e.message}));
+    const res = await fetch(`/api/cw/restore/${rk}${cwAcctQs()}`, { method: 'POST' });
+    const r = await res.json().catch(e=>({error:e.message}));
+    if (res.status === 409 && !retried && cwHandlePin(r)) { return cwRestoreOne(rk, true); }
     setCwBusyKey(null);
     if (r.success) { showToast('Restored — may take a minute to reappear in Plex'); loadCwState(); }
     else showToast('Restore failed: ' + (r.error||'Unknown'), 'error');
@@ -952,19 +985,23 @@ function App() {
     if (!cwState?.snapshots) return;
     const missing = cwState.snapshots.filter(s => s.isLive === false).map(s => s.rating_key);
     if (missing.length === 0) return showToast('Nothing to restore', 'info');
-    if (!confirm(`Restore ${missing.length} missing item${missing.length!==1?'s':''}?`)) return;
+    const who = cwAccount !== 'owner' ? ` for ${(cwAccounts.find(a=>a.id===cwAccount)||{}).title||'this user'}` : '';
+    if (!confirm(`Restore ${missing.length} missing item${missing.length!==1?'s':''}${who}?`)) return;
     setCwLoading(true);
-    const r = await fetch('/api/cw/restore-bulk', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ rating_keys: missing })
-    }).then(x=>x.json()).catch(e=>({error:e.message}));
+    const body = { rating_keys: missing };
+    if (cwAccount !== 'owner') { body.account = cwAccount; if (cwPins[cwAccount]) body.pin = cwPins[cwAccount]; }
+    const res = await fetch('/api/cw/restore-bulk', {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+    const r = await res.json().catch(e=>({error:e.message}));
+    if (res.status === 409 && cwHandlePin(r)) { setCwLoading(false); return cwRestoreAll(); }
     if (r.success) showToast(`Restored ${r.restored}${r.failed?`, ${r.failed} failed`:''}`);
     else showToast('Bulk restore failed: ' + (r.error||'Unknown'), 'error');
     await loadCwState();
   };
   const cwForget = async (rk) => {
     if (!confirm('Forget this snapshot? (cannot be restored after this)')) return;
-    await fetch(`/api/cw/snapshot/${rk}`, { method: 'DELETE' });
+    await fetch(`/api/cw/snapshot/${rk}${cwAcctQs()}`, { method: 'DELETE' });
     loadCwState();
   };
 
@@ -1624,7 +1661,7 @@ function App() {
                   const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`plex-snapshot-${Date.now()}.json`;a.click();
                   showToast('Snapshot downloaded!');
                 }},
-                {icon:'🧹',title:'Continue Watching Restore',desc:'Find items Plex aged out of Continue Watching and put them back',action:()=>{setCwModal(true);loadCwState();},adminOnly:true},
+                {icon:'🧹',title:'Continue Watching Restore',desc:'Find items Plex aged out of Continue Watching and put them back — for yourself or any Plex Home user',action:()=>{setCwModal(true);},adminOnly:true},
                 {icon:'💬',title:'Missing Subtitles',desc:'List shows/movies missing subs via Bazarr and queue searches',action:()=>{setSubsModal(true);loadSubsState();},adminOnly:true},
                 {icon:'📅',title:'Date Added Editor',desc:'Coming soon: Change date added for items',action:()=>showToast('Feature coming soon','warn')},
                 {icon:'👥',title:'Copy Watch History',desc:'Coming soon: Copy watched status between users',action:()=>showToast('Feature coming soon','warn')},
@@ -1696,7 +1733,27 @@ function App() {
                 </div>
 
                 <div style={{fontSize:'.75rem',color:'#94a3b8',marginBottom:'.75rem'}}>
-                  Snapshots items currently in your Plex <em>Continue Watching</em> hub so that anything Plex ages out can be re-pushed via a stopped-timeline event. Restore re-applies the snapshotted <code>viewOffset</code> and updates <code>lastViewedAt</code> — Plex's hub may take a minute to refresh.
+                  Snapshots items in a user's Plex <em>Continue Watching</em> hub so that anything Plex ages out can be re-pushed via a stopped-timeline event. Restore re-applies the snapshotted <code>viewOffset</code> and updates <code>lastViewedAt</code> — Plex's hub may take a minute to refresh.
+                </div>
+
+                {/* Account selector — owner + Plex Home users. Watch state is per-account, so the
+                    whole modal operates on the chosen user. */}
+                <div style={{display:'flex',alignItems:'center',gap:'.5rem',marginBottom:'.75rem',flexWrap:'wrap'}}>
+                  <span style={{fontSize:'.8rem',color:'#cbd5e1',fontWeight:600}}>User:</span>
+                  <select className="form-input" style={{width:'auto',padding:'.25rem .5rem',fontSize:'.8rem'}}
+                    value={cwAccount} onChange={e=>{ setCwShowLive(false); setCwAccount(e.target.value); }}>
+                    {cwAccounts.map(a => (
+                      <option key={a.id} value={a.id}>
+                        {a.kind==='owner' ? `${a.title} (you)` : a.title}{a.protected ? ' 🔒' : ''}
+                      </option>
+                    ))}
+                  </select>
+                  {cwAccount !== 'owner' && (
+                    <span style={{fontSize:'.7rem',color:'#94a3b8'}}>
+                      Acting as this Plex Home user{cwPins[cwAccount] ? ' · PIN set' : ''}.
+                    </span>
+                  )}
+                  <span style={{fontSize:'.7rem',color:'#64748b',marginLeft:'auto'}}>Only Plex Home users can be restored — external shared friends aren't listed.</span>
                 </div>
 
                 {/* Controls + status */}
@@ -1714,9 +1771,13 @@ function App() {
                         onChange={e=>cwUpdateSettings({interval_minutes:parseInt(e.target.value)||15})}/>
                       <span style={{fontSize:'.7rem',color:'#94a3b8'}}>minutes</span>
                     </label>
-                    <label style={{display:'flex',alignItems:'center',gap:'.4rem',fontSize:'.8rem'}}>
+                    <label style={{display:'flex',alignItems:'center',gap:'.4rem',fontSize:'.8rem',marginBottom:'.4rem'}}>
                       <input type="checkbox" checked={!!s.auto_restore} onChange={e=>cwUpdateSettings({auto_restore:e.target.checked})}/>
                       Auto-restore missing items each cycle
+                    </label>
+                    <label style={{display:'flex',alignItems:'center',gap:'.4rem',fontSize:'.8rem'}} title="When on, each cycle also snapshots (and auto-restores, if enabled above) every Plex Home user — not just you. PIN-protected profiles are skipped automatically.">
+                      <input type="checkbox" checked={!!s.snapshot_all_users} onChange={e=>cwUpdateSettings({snapshot_all_users:e.target.checked})}/>
+                      Include all Plex Home users
                     </label>
                   </div>
                   <div className="card" style={{padding:'.75rem'}}>
