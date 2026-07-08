@@ -1,10 +1,10 @@
 {
   "name": "plex-command-center",
-  "version": "4.0.1",
+  "version": "4.0.17",
   "description": "Advanced Plex monitoring and control dashboard",
-  "main": "backend-server-v2.5.2-final.js",
+  "main": "backend-server.js",
   "scripts": {
-    "start": "node backend-server-v2.5.2-final.js",
+    "start": "node backend-server.js",
     "service:install": "node windows/service-installer.js",
     "service:uninstall": "node windows/service-uninstaller.js"
   },

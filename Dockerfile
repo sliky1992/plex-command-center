@@ -10,14 +10,14 @@ RUN apk add --no-cache python3 py3-pip make g++ linux-headers ffmpeg fontconfig 
 RUN pip3 install --break-system-packages yt-dlp
 
 # Copy package file and install dependencies
-COPY package-v2.5.2.json ./package.json
+COPY package.json ./package.json
 RUN npm install --production
 
 # Create required directories
 RUN mkdir -p /app/data /app/logs /app/public /app/data/fillers
 
 # Copy application files
-COPY backend-server-v2.5.2-final.js ./backend-server.js
+COPY backend-server.js ./backend-server.js
 COPY plex-command-center-v2.5.2-final.html ./public/index.html
 COPY public/desktop-renderer.html ./public/desktop-renderer.html
 COPY manifest.json ./public/manifest.json

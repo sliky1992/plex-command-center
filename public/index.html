@@ -6,10 +6,11 @@
   <title>Plex Command Center v2.5.2</title>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
   <style>
-    *{margin:0;padding:0;box-sizing:border-box}
-    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#0a0e27 0%,#1a1f3a 100%);color:#e2e8f0;min-height:100vh}
+    *{margin:0;padding:0;box-sizing:border-box;user-select:none}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#0a0e27 0%,#1a1f3a 100%);color:#e2e8f0;min-height:100vh;cursor:default}
+    input,textarea,select,[contenteditable]{user-select:text}
     .header{background:rgba(10,14,39,.95);backdrop-filter:blur(20px);border-bottom:1px solid rgba(100,116,139,.2);position:sticky;top:0;z-index:100;box-shadow:0 4px 6px -1px rgba(0,0,0,.3)}
     .header-content{max-width:1800px;margin:0 auto;padding:.75rem 2rem;display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap}
     .logo{display:flex;align-items:center;gap:.75rem}
@@ -742,9 +743,18 @@ function App() {
     ]);
     setLtvNowPlaying(asArray(np)); setLtvChannels(asArray(ch)); setLtvGenres(asArray(genres)); setLtvFillers(asArray(fillers));
   };
+  const guideScrollRef = useRef(null);
   const loadLtvGuide = async () => {
-    const g = await fetch('/api/livetv/guide?hours=6').then(r=>r.json()).catch(()=>[]);
+    const g = await fetch('/api/livetv/guide?hours=12').then(r=>r.json()).catch(()=>[]);
     setLtvGuide(asArray(g));
+    // After data loads, scroll "now" into view (1h of past data sits to the left)
+    setTimeout(() => {
+      if (guideScrollRef.current) {
+        const PX_PER_HOUR = 150;
+        // 140px channel label + 1h of past content
+        guideScrollRef.current.scrollLeft = 140 + PX_PER_HOUR - 20;
+      }
+    }, 50);
   };
   useEffect(() => {
     if (tab === 'livetv') { loadLiveTv(); loadLtvGuide(); }
@@ -2561,71 +2571,79 @@ function App() {
 
             {/* --- TV GUIDE --- */}
             {ltvView==='guide' && (
-              <div style={{overflowX:'auto'}}>
+              <div ref={guideScrollRef} style={{overflowX:'auto'}}>
                 {ltvGuide.length===0 ? (
                   <div className="empty">No guide data available. Create channels first.</div>
                 ) : (
-                  <div style={{minWidth:'900px'}}>
-                    {(() => {
-                      const now = Date.now();
-                      const guideStart = now - 1800000;
-                      const guideEnd = now + 6*3600000;
-                      const totalMs = guideEnd - guideStart;
-                      const hourMarkers = [];
-                      const startHour = new Date(guideStart);
-                      startHour.setMinutes(0,0,0);
-                      for (let t = startHour.getTime(); t < guideEnd; t += 3600000) {
-                        if (t >= guideStart) hourMarkers.push(t);
-                      }
-                      return (
-                        <div>
-                          {/* Time header */}
-                          <div style={{display:'flex',marginLeft:'140px',position:'relative',height:'30px',borderBottom:'1px solid rgba(100,116,139,.2)',marginBottom:'2px'}}>
-                            {hourMarkers.map(t => (
-                              <div key={t} style={{position:'absolute',left:`${((t-guideStart)/totalMs)*100}%`,fontSize:'.7rem',color:'#94a3b8',borderLeft:'1px solid rgba(100,116,139,.2)',paddingLeft:'4px',height:'100%'}}>
-                                {new Date(t).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}
-                              </div>
-                            ))}
-                            {/* Current time marker */}
-                            <div style={{position:'absolute',left:`${((now-guideStart)/totalMs)*100}%`,width:'2px',height:'100%',background:'#ef4444',zIndex:10}}/>
-                          </div>
-                          {/* Channel rows */}
-                          {ltvGuide.map(g => (
-                            <div key={g.channel.id} style={{display:'flex',marginBottom:'2px',height:'60px'}}>
-                              <div style={{width:'140px',flexShrink:0,display:'flex',alignItems:'center',gap:'.5rem',padding:'.5rem',background:'rgba(15,23,42,.6)',borderRadius:'6px 0 0 6px',borderRight:'1px solid rgba(100,116,139,.2)'}}>
-                                <span style={{background:'linear-gradient(135deg,#3b82f6,#8b5cf6)',padding:'.1rem .4rem',borderRadius:'3px',fontSize:'.65rem',fontWeight:700}}>{g.channel.number}</span>
-                                <span style={{fontSize:'.75rem',fontWeight:500,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{g.channel.name}</span>
-                              </div>
-                              <div style={{flex:1,position:'relative',overflow:'hidden',background:'rgba(15,23,42,.3)',borderRadius:'0 6px 6px 0'}}>
-                                {g.programs.map((p, i) => {
-                                  const pStart = Math.max(p.startMs || new Date(p.start).getTime(), guideStart);
-                                  const pEnd = Math.min(p.stopMs || new Date(p.stop).getTime(), guideEnd);
-                                  if (pEnd <= guideStart || pStart >= guideEnd) return null;
-                                  const left = ((pStart - guideStart) / totalMs) * 100;
-                                  const width = ((pEnd - pStart) / totalMs) * 100;
-                                  const isNow = pStart <= now && pEnd > now;
-                                  return (
-                                    <div key={i} title={`${p.title}${p.showTitle?' - '+p.showTitle:''}\n${new Date(p.start).toLocaleTimeString()} - ${new Date(p.stop).toLocaleTimeString()}`}
-                                      style={{position:'absolute',left:`${left}%`,width:`${width}%`,height:'100%',
-                                        background:isNow?'rgba(59,130,246,.25)': p.type==='filler'?'rgba(139,92,246,.15)':'rgba(15,23,42,.5)',
-                                        border:`1px solid ${isNow?'rgba(59,130,246,.5)':'rgba(100,116,139,.15)'}`,
-                                        borderRadius:'3px',padding:'.25rem .4rem',overflow:'hidden',cursor:'default',
-                                        display:'flex',flexDirection:'column',justifyContent:'center'}}>
-                                      <div style={{fontSize:'.7rem',fontWeight:600,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{p.title}</div>
-                                      {p.showTitle && <div style={{fontSize:'.6rem',color:'#a78bfa',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{p.showTitle}</div>}
-                                      <div style={{fontSize:'.6rem',color:'#94a3b8'}}>{new Date(p.start).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</div>
-                                    </div>
-                                  );
-                                })}
-                                {/* Current time line */}
-                                <div style={{position:'absolute',left:`${((now-guideStart)/totalMs)*100}%`,width:'2px',height:'100%',background:'#ef4444',zIndex:5}}/>
-                              </div>
+                  (() => {
+                    const now = Date.now();
+                    const PX_PER_HOUR = 150;
+                    const guideStart = now - 3600000;          // 1h back
+                    const guideEnd = now + 12 * 3600000;       // 12h forward
+                    const totalMs = guideEnd - guideStart;
+                    const totalPx = (totalMs / 3600000) * PX_PER_HOUR; // 13h × 150 = 1950px
+                    const msToLeft = ms => ((ms - guideStart) / 3600000) * PX_PER_HOUR;
+                    const hourMarkers = [];
+                    const startHour = new Date(guideStart);
+                    startHour.setMinutes(0,0,0);
+                    for (let t = startHour.getTime(); t < guideEnd; t += 3600000) {
+                      if (t >= guideStart) hourMarkers.push(t);
+                    }
+                    return (
+                      <div style={{width: 140 + totalPx + 'px'}}>
+                        {/* Time header */}
+                        <div style={{display:'flex',marginLeft:'140px',position:'relative',height:'30px',borderBottom:'1px solid rgba(100,116,139,.2)',marginBottom:'2px',width:totalPx+'px'}}>
+                          {hourMarkers.map(t => (
+                            <div key={t} style={{position:'absolute',left:msToLeft(t)+'px',fontSize:'.7rem',color:'#94a3b8',borderLeft:'1px solid rgba(100,116,139,.2)',paddingLeft:'4px',height:'100%',whiteSpace:'nowrap'}}>
+                              {new Date(t).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}
                             </div>
                           ))}
+                          {/* Current time marker */}
+                          <div style={{position:'absolute',left:msToLeft(now)+'px',width:'2px',height:'100%',background:'#ef4444',zIndex:10}}/>
                         </div>
-                      );
-                    })()}
-                  </div>
+                        {/* Channel rows */}
+                        {ltvGuide.map(g => (
+                          <div key={g.channel.id} style={{display:'flex',marginBottom:'2px',height:'60px'}}>
+                            <div style={{width:'140px',flexShrink:0,display:'flex',alignItems:'center',gap:'.5rem',padding:'.5rem',background:'rgba(15,23,42,.6)',borderRadius:'6px 0 0 6px',borderRight:'1px solid rgba(100,116,139,.2)',position:'sticky',left:0,zIndex:2}}>
+                              <span style={{background:'linear-gradient(135deg,#3b82f6,#8b5cf6)',padding:'.1rem .4rem',borderRadius:'3px',fontSize:'.65rem',fontWeight:700}}>{g.channel.number}</span>
+                              <span style={{fontSize:'.75rem',fontWeight:500,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{g.channel.name}</span>
+                            </div>
+                            <div style={{position:'relative',width:totalPx+'px',flexShrink:0,background:'rgba(15,23,42,.3)',borderRadius:'0 6px 6px 0',height:'60px'}}>
+                              {g.programs.map((p, i) => {
+                                const pStartMs = p.startMs || new Date(p.start).getTime();
+                                const pEndMs = p.stopMs || new Date(p.stop).getTime();
+                                if (pEndMs <= guideStart || pStartMs >= guideEnd) return null;
+                                const left = Math.max(msToLeft(pStartMs), 0);
+                                const right = Math.min(msToLeft(pEndMs), totalPx);
+                                const width = right - left;
+                                if (width < 2) return null;
+                                const isNow = pStartMs <= now && pEndMs > now;
+                                const seLabel = (p.seasonNum || p.episodeNum)
+                                  ? `S${String(p.seasonNum||0).padStart(2,'0')}E${String(p.episodeNum||0).padStart(2,'0')}` : null;
+                                return (
+                                  <div key={i} title={`${p.title}${p.showTitle?' · '+p.showTitle:''}${seLabel?' · '+seLabel:''}\n${new Date(p.start).toLocaleTimeString()} – ${new Date(p.stop).toLocaleTimeString()}`}
+                                    style={{position:'absolute',left:left+'px',width:width+'px',height:'100%',
+                                      background:isNow?'rgba(59,130,246,.25)': p.type==='filler'?'rgba(139,92,246,.15)':'rgba(15,23,42,.5)',
+                                      border:`1px solid ${isNow?'rgba(59,130,246,.5)':'rgba(100,116,139,.15)'}`,
+                                      borderRadius:'3px',padding:'.25rem .4rem',overflow:'hidden',cursor:'default',
+                                      boxSizing:'border-box',display:'flex',flexDirection:'column',justifyContent:'center'}}>
+                                    <div style={{fontSize:'.7rem',fontWeight:600,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{p.title}</div>
+                                    {p.showTitle && <div style={{fontSize:'.6rem',color:'#a78bfa',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{p.showTitle}</div>}
+                                    <div style={{display:'flex',gap:'.4rem',alignItems:'center'}}>
+                                      <div style={{fontSize:'.6rem',color:'#94a3b8',whiteSpace:'nowrap'}}>{new Date(p.start).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</div>
+                                      {seLabel && <div style={{fontSize:'.6rem',color:'#64748b',whiteSpace:'nowrap'}}>{seLabel}</div>}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                              {/* Current time line */}
+                              <div style={{position:'absolute',left:msToLeft(now)+'px',width:'2px',height:'100%',background:'#ef4444',zIndex:5,pointerEvents:'none'}}/>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })()
                 )}
               </div>
             )}

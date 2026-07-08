@@ -12,11 +12,13 @@
   <title>Plex Command Center</title>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
   <script>if('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(()=>{});</script>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
+    *{-webkit-user-select:none;user-select:none;cursor:default}
     body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#0a0e27 0%,#1a1f3a 100%);color:#e2e8f0;min-height:100vh}
+    input,textarea,select,[contenteditable]{-webkit-user-select:text!important;user-select:text!important;cursor:text!important}
     .header{background:rgba(10,14,39,.95);backdrop-filter:blur(20px);border-bottom:1px solid rgba(100,116,139,.2);position:sticky;top:0;z-index:100;box-shadow:0 4px 6px -1px rgba(0,0,0,.3)}
     .header-content{max-width:1800px;margin:0 auto;padding:.75rem 2rem;display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;position:relative}
     .logo{display:flex;align-items:center;gap:.75rem}
@@ -222,9 +224,22 @@ function LtvVideoPlayer({ streamUrl, streamType, offsetSec, subtitleTrack, onEnd
     };
 
     const handleEnded = () => advance();
+    // On a stream ERROR, retry the SAME source with backoff instead of immediately advancing.
+    // advance() calls ltvWatch() which spawns a brand-new Plex transcode session, so a
+    // persistently-failing stream used to create a session storm that overwhelmed Plex. Retry the
+    // same stream up to 3× (3s apart) — only give up and advance after that.
+    let errCount = 0;
+    let retryTimer = null;
     const handleError = () => {
-      console.warn('LtvVideoPlayer: stream error, advancing to next program');
-      advance();
+      errCount++;
+      if (errCount <= 3) {
+        console.warn(`LtvVideoPlayer: stream error, retry ${errCount}/3 in 3s`);
+        if (retryTimer) clearTimeout(retryTimer);
+        retryTimer = setTimeout(() => { try { video.load(); video.play().catch(()=>{}); } catch(e){} }, 3000);
+      } else {
+        console.warn('LtvVideoPlayer: stream failed after 3 retries, advancing to next program');
+        advance();
+      }
     };
     // Stall detection: if the video hasn't progressed in 15s, advance
     let stallTimer = null;
@@ -236,6 +251,7 @@ function LtvVideoPlayer({ streamUrl, streamType, offsetSec, subtitleTrack, onEnd
       }, 15000);
     };
     const handlePlaying = () => {
+      errCount = 0; // successful playback resets the error/retry counter
       if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
     };
 
@@ -254,6 +270,7 @@ function LtvVideoPlayer({ streamUrl, streamType, offsetSec, subtitleTrack, onEnd
       video.removeEventListener('stalled', handleStalled);
       video.removeEventListener('playing', handlePlaying);
       if (stallTimer) clearTimeout(stallTimer);
+      if (retryTimer) clearTimeout(retryTimer);
       video.pause();
       video.src = '';
     };
@@ -373,6 +390,9 @@ function App() {
       loadLtvSubStatus();
     } catch(e) {}
   };
+  // `tab` lives here (above the subs-poll effect that reads it) to avoid a TDZ: the effect's
+  // dependency array is evaluated during render, before later useState declarations would run.
+  const [tab, setTab] = useState('dashboard');
   // Poll status while subs tab is open AND a scan is running, so user sees progress live.
   React.useEffect(() => {
     if (tab !== 'subs') return;
@@ -414,7 +434,6 @@ function App() {
   const [ytDiskSpace, setYtDiskSpace] = useState(null);
   const [ytManualUrl, setYtManualUrl] = useState('');
 
-  const [tab, setTab] = useState('dashboard');
   const [status, setStatus] = useState(null);
   const [plexRes, setPlexRes] = useState(null);
   const [dockerRes, setDockerRes] = useState(null);
@@ -561,6 +580,8 @@ function App() {
   const [autoColSettings, setAutoColSettings] = useState(null);
   const [autoColActive, setAutoColActive] = useState([]);
   const [autoColRunning, setAutoColRunning] = useState(false);
+  const [autoColPushUsers, setAutoColPushUsers] = useState([]);
+  const [autoColPushUsersLoading, setAutoColPushUsersLoading] = useState(false);
 
   // Settings tab state (admin-only — integrated tool tokens/URLs).
   // Ported from public/index.html so users can edit Plex/Tautulli/Jellyseerr/Zabbix/Bazarr/
@@ -1516,6 +1537,22 @@ function App() {
     if (r.success) { showToast(`Auto-retire set to ${n} airings (rebuilt ${r.programCount} items)`); loadLtvAirings(); }
     else showToast('Failed to save: ' + (r.error||'unknown'), 'error');
   };
+  // Anti-rerun window override. Pass '' (blank) to clear the override and inherit the global default.
+  const ltvSetRerunDays = async (val) => {
+    const r = await doAction(`/api/livetv/channels/${ltvEditModal}/airings/settings`, 'PUT', { rerun_days: val });
+    if (r.success) {
+      showToast(r.rerun_days===null ? `Anti-rerun: using global default (rebuilt ${r.programCount} items)` : `Anti-rerun set to ${r.rerun_days} days (rebuilt ${r.programCount} items)`);
+      loadLtvAirings(); loadLtvGuide && loadLtvGuide();
+    } else showToast('Failed to save: ' + (r.error||'unknown'), 'error');
+  };
+  // One-click renew/reset: wipe ALL airing history for the channel so every program (movies and
+  // episodes) returns to rotation. The only renew that works for movie channels.
+  const ltvRenewAll = async () => {
+    if (!confirm('Reset airing history for this whole channel? Every movie and episode returns to rotation as if never aired. This does not delete content.')) return;
+    const r = await doAction(`/api/livetv/channels/${ltvEditModal}/renew-all`, 'POST');
+    if (r.success) { showToast(`Channel renewed — cleared ${r.removed} airing record(s), rebuilt ${r.programCount} items`); loadLtvAirings(); loadLtvGuide && loadLtvGuide(); loadLiveTv && loadLiveTv(); }
+    else showToast('Renew failed: ' + (r.error||'unknown'), 'error');
+  };
   const ltvSaveIncluded = async (newIds) => {
     if (!ltvEditModal) return;
     const r = await doAction(`/api/livetv/channels/${ltvEditModal}/included-programs`, 'PUT', { included: newIds });
@@ -1678,6 +1715,15 @@ function App() {
       setAutoColSettings(r.settings);
       setAutoColActive(r.active || []);
     } catch(e) {}
+  };
+
+  const loadAutoColPushUsers = async () => {
+    setAutoColPushUsersLoading(true);
+    try {
+      const r = await fetch('/api/plex/collection-push-users').then(x=>x.json());
+      setAutoColPushUsers(r.users || []);
+    } catch(e) {}
+    setAutoColPushUsersLoading(false);
   };
 
   const saveAutoColSettings = async (updates) => {
@@ -2152,22 +2198,47 @@ function App() {
                     <div className="empty"><p>No collections found</p></div>
                   ) : (
                     <div className="col-grid">
-                      {collections.slice(0,8).map((col,i)=>(
-                        <div key={i} className="col-card">
-                          {col.thumb
-                            ? <img src={col.thumb} className="col-poster" alt={col.title} onError={e=>{e.target.parentNode.querySelector('.col-poster-ph')?.style&&(e.target.style.display='none');}}/>
-                            : <div className="col-poster-ph"><span>📚</span></div>
-                          }
-                          <div className="col-info">
-                            <div className="col-title">{col.title}</div>
-                            <div className="col-count">{col.itemCount} items • {col.library} {col.pinned ? '• 📌 Pinned' : ''}</div>
-                            <div className="col-actions" style={{gap:'.3rem'}}>
-                              <button className="btn-sm" style={{flex:1,background:col.pinned?'linear-gradient(135deg,#f59e0b,#d97706)':'linear-gradient(135deg,#3b82f6,#2563eb)',color:'#fff',border:'none',borderRadius:'6px',cursor:'pointer',fontSize:'.7rem',padding:'.3rem'}} onClick={()=>pinCollection(col.key,!col.pinned,col.libraryKey)} title={col.pinned?'Unpin from Plex Home':'Pin to Plex Home'}>{col.pinned ? '📌 Unpin' : '📌 Pin Home'}</button>
-                              <button className="btn-sm btn-delete" style={{flex:1}} onClick={()=>deleteCollection(col.key)}>🗑️ Delete</button>
+                      {(() => {
+                        // Build a lookup: plex ratingKey → auto-collection meta
+                        const autoByKey = {};
+                        for (const ac of autoColActive) autoByKey[ac.plex_key] = ac;
+                        return collections.slice(0,8).map((col,i) => {
+                          const ac = autoByKey[col.key];
+                          const isSeasonal = ac?.create_type === 'seasonal';
+                          const forUser = ac?.for_user_name || null;
+                          return (
+                            <div key={i} className="col-card" style={{position:'relative'}}>
+                              {/* User / seasonal overlay badge on poster */}
+                              {(forUser || isSeasonal) && (
+                                <div style={{position:'absolute',top:'6px',left:'6px',zIndex:2,display:'flex',flexDirection:'column',gap:'3px'}}>
+                                  {isSeasonal && (
+                                    <span style={{display:'inline-block',background:'rgba(245,158,11,.9)',color:'#fff',fontSize:'.55rem',fontWeight:800,padding:'2px 5px',borderRadius:'4px',backdropFilter:'blur(4px)',letterSpacing:'.04em'}}>
+                                      SEASONAL
+                                    </span>
+                                  )}
+                                  {forUser && !isSeasonal && (
+                                    <span style={{display:'inline-block',background:'rgba(109,40,217,.85)',color:'#fff',fontSize:'.55rem',fontWeight:700,padding:'2px 5px',borderRadius:'4px',backdropFilter:'blur(4px)',maxWidth:'120px',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={`For: ${forUser}`}>
+                                      👤 {forUser}
+                                    </span>
+                                  )}
+                                </div>
+                              )}
+                              {col.thumb
+                                ? <img src={col.thumb} className="col-poster" alt={col.title} onError={e=>{e.target.parentNode.querySelector('.col-poster-ph')?.style&&(e.target.style.display='none');}}/>
+                                : <div className="col-poster-ph"><span>📚</span></div>
+                              }
+                              <div className="col-info">
+                                <div className="col-title">{col.title}</div>
+                                <div className="col-count">{col.itemCount} items • {col.library} {col.pinned ? '• 📌 Pinned' : ''}</div>
+                                <div className="col-actions" style={{gap:'.3rem'}}>
+                                  <button className="btn-sm" style={{flex:1,background:col.pinned?'linear-gradient(135deg,#f59e0b,#d97706)':'linear-gradient(135deg,#3b82f6,#2563eb)',color:'#fff',border:'none',borderRadius:'6px',cursor:'pointer',fontSize:'.7rem',padding:'.3rem'}} onClick={()=>pinCollection(col.key,!col.pinned,col.libraryKey)} title={col.pinned?'Unpin from Plex Home':'Pin to Plex Home'}>{col.pinned ? '📌 Unpin' : '📌 Pin Home'}</button>
+                                  <button className="btn-sm btn-delete" style={{flex:1}} onClick={()=>deleteCollection(col.key)}>🗑️ Delete</button>
+                                </div>
+                              </div>
                             </div>
-                          </div>
-                        </div>
-                      ))}
+                          );
+                        });
+                      })()}
                     </div>
                   )}
                 </div>
@@ -3521,8 +3592,8 @@ function App() {
                                               {!isNarrow && p.showTitle && (
                                                 <div style={{fontSize:'.7rem',color:'#a78bfa',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis',lineHeight:1.2}}>{p.showTitle}</div>
                                               )}
-                                              {!isNarrow && p.seasonNum && (
-                                                <div style={{fontSize:'.6rem',color:'#64748b',lineHeight:1.2}}>S{String(p.seasonNum).padStart(2,'0')}E{String(p.episodeNum).padStart(2,'0')}</div>
+                                              {!isNarrow && (p.seasonNum || p.episodeNum) && (
+                                                <div style={{fontSize:'.6rem',color:'#64748b',lineHeight:1.2}}>S{String(p.seasonNum||0).padStart(2,'0')}E{String(p.episodeNum||0).padStart(2,'0')}</div>
                                               )}
                                             </>
                                           )}
@@ -4062,8 +4133,9 @@ function App() {
             </div>
             <div className="toggle" style={{marginBottom:'.75rem',width:'100%'}}>
               <button className={`toggle-opt ${colModalTab==='suggestions'?'active':''}`} style={{flex:1}} onClick={()=>{setColModalTab('suggestions');loadColSuggestions();}}>Smart Suggestions</button>
-              <button className={`toggle-opt ${colModalTab==='auto'?'active':''}`} style={{flex:1}} onClick={()=>{setColModalTab('auto');loadAutoColSettings();}}>Auto-Create</button>
+              <button className={`toggle-opt ${colModalTab==='auto'?'active':''}`} style={{flex:1}} onClick={()=>{setColModalTab('auto');loadAutoColSettings();loadAutoColPushUsers();}}>Auto-Create</button>
               <button className={`toggle-opt ${colModalTab==='manual'?'active':''}`} style={{flex:1}} onClick={()=>setColModalTab('manual')}>Manual</button>
+              <button className={`toggle-opt ${colModalTab==='users'?'active':''}`} style={{flex:1}} onClick={()=>{setColModalTab('users');loadAutoColSettings();loadAutoColPushUsers();}}>Per User</button>
             </div>
 
             {colModalTab==='suggestions' && (
@@ -4156,16 +4228,44 @@ function App() {
                       </div>
                     </div>
 
+                    {/* Push to specific users */}
+                    <div style={{padding:'.75rem',background:'rgba(15,23,42,.4)',borderRadius:'8px',marginBottom:'1rem'}}>
+                      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:'.5rem'}}>
+                        <label style={{fontSize:'.7rem',color:'#94a3b8'}}>Push Collections to Users</label>
+                        {autoColPushUsersLoading && <span style={{fontSize:'.65rem',color:'#64748b'}}>Loading...</span>}
+                      </div>
+                      {!autoColPushUsersLoading && autoColPushUsers.length === 0 ? (
+                        <div style={{fontSize:'.75rem',color:'#64748b'}}>No managed home users or shared library users found</div>
+                      ) : (
+                        <div style={{display:'flex',flexWrap:'wrap',gap:'.4rem'}}>
+                          {autoColPushUsers.map(u => {
+                            const selected = (autoColSettings.push_user_ids || []).includes(u.id);
+                            return (
+                              <button key={u.id} onClick={()=>{
+                                const current = autoColSettings.push_user_ids || [];
+                                const next = selected ? current.filter(id=>id!==u.id) : [...current, u.id];
+                                saveAutoColSettings({push_user_ids: next});
+                              }} style={{padding:'.3rem .65rem',borderRadius:'20px',border:`1px solid ${selected?'#3b82f6':'rgba(100,116,139,.3)'}`,cursor:'pointer',fontSize:'.75rem',fontWeight:selected?600:400,background:selected?'rgba(59,130,246,.2)':'rgba(15,23,42,.6)',color:selected?'#93c5fd':'#94a3b8'}}>
+                                <span style={{fontSize:'.65rem',color:'#64748b',marginRight:'.25rem'}}>{u.kind==='home'?'[Home]':'[Shared]'}</span>{u.title}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+
                     {/* Run Now button */}
                     <button className="btn btn-primary" onClick={runAutoColNow} disabled={autoColRunning} style={{width:'100%',padding:'.65rem',marginBottom:'1.25rem'}}>
                       {autoColRunning ? 'Running...' : '▶ Run Now'}
                     </button>
 
                     {/* Status bar */}
-                    <div style={{display:'flex',gap:'.75rem',marginBottom:'1rem',fontSize:'.7rem',color:'#64748b'}}>
+                    <div style={{display:'flex',gap:'.75rem',marginBottom:'1rem',fontSize:'.7rem',color:'#64748b',flexWrap:'wrap'}}>
                       {autoColSettings.last_run && <span>Last run: {new Date(autoColSettings.last_run+'Z').toLocaleString()}</span>}
-                      <span>Active: {autoColActive.length}/{autoColSettings.max_collections||3}</span>
-                      {autoColSettings.seasonal_enabled ? <span style={{color:'#f59e0b'}}>Seasonal: up to {autoColSettings.max_seasonal||1} slot{(autoColSettings.max_seasonal||1)>1?'s':''}</span> : <span>Seasonal: off</span>}
+                      {(autoColSettings.push_user_ids||[]).length > 0
+                        ? <span style={{color:'#a78bfa'}}>👤 Per-user mode — {(autoColSettings.push_user_ids||[]).length} user{(autoColSettings.push_user_ids||[]).length>1?'s':''} · {autoColSettings.max_collections||3} personal slots each</span>
+                        : <span>Active: {autoColActive.length}/{autoColSettings.max_collections||3}</span>}
+                      {autoColSettings.seasonal_enabled ? <span style={{color:'#f59e0b'}}>Seasonal: up to {autoColSettings.max_seasonal||1} shared slot{(autoColSettings.max_seasonal||1)>1?'s':''}</span> : <span>Seasonal: off</span>}
                     </div>
 
                     {/* Active auto-collections */}
@@ -4179,11 +4279,16 @@ function App() {
                           const daysLeft = Math.floor(hoursLeft / 24);
                           const timeStr = daysLeft > 0 ? `${daysLeft}d ${hoursLeft%24}h left` : `${hoursLeft}h left`;
                           const expired = hoursLeft <= 0;
+                          const isSeasonal = ac.create_type === 'seasonal';
                           return (
-                            <div key={i} style={{display:'flex',alignItems:'center',gap:'.75rem',padding:'.6rem .75rem',background:'rgba(15,23,42,.4)',borderRadius:'8px',marginBottom:'.5rem',border:'1px solid rgba(100,116,139,.15)'}}>
+                            <div key={i} style={{display:'flex',alignItems:'center',gap:'.75rem',padding:'.6rem .75rem',background:'rgba(15,23,42,.4)',borderRadius:'8px',marginBottom:'.5rem',border:`1px solid ${isSeasonal?'rgba(245,158,11,.25)':ac.for_tautulli_user?'rgba(139,92,246,.25)':'rgba(100,116,139,.15)'}`}}>
                               <div style={{flex:1}}>
-                                <div style={{fontWeight:600,fontSize:'.85rem'}}>{ac.title}</div>
-                                <div style={{fontSize:'.7rem',color:'#94a3b8'}}>
+                                <div style={{display:'flex',alignItems:'center',gap:'.4rem',flexWrap:'wrap'}}>
+                                  {isSeasonal && <span style={{fontSize:'.6rem',background:'rgba(245,158,11,.2)',color:'#f59e0b',borderRadius:'4px',padding:'1px 5px',fontWeight:700}}>SEASONAL</span>}
+                                  {!isSeasonal && <span style={{fontSize:'.6rem',background:ac.for_user_name?'rgba(139,92,246,.2)':'rgba(100,116,139,.15)',color:ac.for_user_name?'#a78bfa':'#64748b',borderRadius:'4px',padding:'1px 5px',fontWeight:700}}>{ac.for_user_name?'👤 '+ac.for_user_name:'All Users'}</span>}
+                                  <span style={{fontWeight:600,fontSize:'.85rem'}}>{ac.title}</span>
+                                </div>
+                                <div style={{fontSize:'.7rem',color:'#94a3b8',marginTop:'.2rem'}}>
                                   {ac.source_title && <span>From: {ac.source_title} • </span>}
                                   {ac.pinned ? '📌 Pinned' : 'Not pinned'} • {expired ? <span style={{color:'#ef4444'}}>Expired</span> : <span style={{color:'#10b981'}}>{timeStr}</span>}
                                 </div>
@@ -4253,6 +4358,93 @@ function App() {
                 <button className="btn btn-primary" onClick={createCollection} disabled={colCreating} style={{width:'100%',padding:'.75rem'}}>
                   {colCreating ? 'Creating...' : 'Create Collection'}
                 </button>
+              </div>
+            )}
+
+            {colModalTab==='users' && (
+              <div>
+                {autoColPushUsersLoading ? (
+                  <div style={{textAlign:'center',padding:'2rem'}}><div className="spinner"/></div>
+                ) : (() => {
+                  // Group active auto-collections by user
+                  const byUser = {};
+                  for (const ac of autoColActive) {
+                    const key = ac.for_tautulli_user || '__all__';
+                    if (!byUser[key]) byUser[key] = { name: ac.for_user_name || null, cols: [] };
+                    byUser[key].cols.push(ac);
+                  }
+                  // Build user list: targeted users first, then "All Users" bucket
+                  const targetedIds = autoColSettings.push_user_ids || [];
+                  const allUsers = autoColPushUsers.filter(u => targetedIds.includes(u.id));
+                  // If no targeted users configured, show a hint
+                  const hasUserMode = targetedIds.length > 0;
+
+                  const renderCollectionCard = (ac) => {
+                    const expiresAt = new Date(ac.expires_at+'Z');
+                    const hoursLeft = Math.max(0, Math.round((expiresAt - new Date()) / 3600000));
+                    const daysLeft = Math.floor(hoursLeft / 24);
+                    const timeStr = daysLeft > 0 ? `${daysLeft}d ${hoursLeft%24}h left` : `${hoursLeft}h left`;
+                    const isSeasonal = ac.create_type === 'seasonal';
+                    return (
+                      <div key={ac.id} style={{display:'flex',alignItems:'center',gap:'.6rem',padding:'.55rem .7rem',background:'rgba(15,23,42,.4)',borderRadius:'7px',marginBottom:'.4rem',border:`1px solid ${isSeasonal?'rgba(245,158,11,.25)':'rgba(100,116,139,.15)'}`}}>
+                        <div style={{flex:1}}>
+                          <div style={{display:'flex',alignItems:'center',gap:'.35rem',flexWrap:'wrap'}}>
+                            {isSeasonal && <span style={{fontSize:'.6rem',background:'rgba(245,158,11,.2)',color:'#f59e0b',borderRadius:'4px',padding:'1px 5px',fontWeight:700}}>SEASONAL</span>}
+                            <span style={{fontWeight:600,fontSize:'.83rem'}}>{ac.title}</span>
+                          </div>
+                          <div style={{fontSize:'.68rem',color:'#94a3b8',marginTop:'.15rem'}}>
+                            {ac.source_title && <span>From: {ac.source_title} · </span>}
+                            {ac.pinned ? '📌 Pinned · ' : ''}{hoursLeft <= 0 ? <span style={{color:'#ef4444'}}>Expired</span> : <span style={{color:'#10b981'}}>{timeStr}</span>}
+                          </div>
+                        </div>
+                        <button className="btn-sm btn-delete" onClick={()=>deleteAutoCol(ac.id)} style={{fontSize:'.68rem'}}>Remove</button>
+                      </div>
+                    );
+                  };
+
+                  return (
+                    <div>
+                      {!hasUserMode && (
+                        <div style={{padding:'.75rem',background:'rgba(139,92,246,.08)',border:'1px solid rgba(139,92,246,.2)',borderRadius:'8px',marginBottom:'1rem',fontSize:'.78rem',color:'#a78bfa'}}>
+                          Per-user targeting is off. Go to the <strong>Auto-Create</strong> tab → "Push Collections to Users" to enable per-user collections.
+                        </div>
+                      )}
+
+                      {/* Per-user sections */}
+                      {hasUserMode && allUsers.map(u => {
+                        const userCols = (byUser[u.id] || {}).cols || [];
+                        return (
+                          <div key={u.id} style={{marginBottom:'1rem',padding:'.75rem',background:'rgba(15,23,42,.35)',borderRadius:'10px',border:'1px solid rgba(139,92,246,.2)'}}>
+                            <div style={{display:'flex',alignItems:'center',gap:'.5rem',marginBottom:'.6rem'}}>
+                              <span style={{fontSize:'1rem'}}>👤</span>
+                              <span style={{fontWeight:700,fontSize:'.9rem',color:'#c4b5fd'}}>{u.title}</span>
+                              <span style={{fontSize:'.65rem',background:'rgba(139,92,246,.15)',color:'#a78bfa',borderRadius:'4px',padding:'1px 6px',marginLeft:'auto'}}>{userCols.length} collection{userCols.length!==1?'s':''}</span>
+                            </div>
+                            {userCols.length === 0 ? (
+                              <div style={{fontSize:'.77rem',color:'#64748b',padding:'.4rem 0'}}>No collections active — will be created on next auto-create run.</div>
+                            ) : userCols.map(ac => renderCollectionCard(ac))}
+                          </div>
+                        );
+                      })}
+
+                      {/* All-Users bucket */}
+                      <div style={{marginBottom:'1rem',padding:'.75rem',background:'rgba(15,23,42,.35)',borderRadius:'10px',border:'1px solid rgba(100,116,139,.2)'}}>
+                        <div style={{display:'flex',alignItems:'center',gap:'.5rem',marginBottom:'.6rem'}}>
+                          <span style={{fontSize:'1rem'}}>🌐</span>
+                          <span style={{fontWeight:700,fontSize:'.9rem',color:'#94a3b8'}}>All Users (Shared)</span>
+                          <span style={{fontSize:'.65rem',background:'rgba(100,116,139,.15)',color:'#64748b',borderRadius:'4px',padding:'1px 6px',marginLeft:'auto'}}>{(byUser['__all__']?.cols||[]).length} collection{(byUser['__all__']?.cols||[]).length!==1?'s':''}</span>
+                        </div>
+                        {(byUser['__all__']?.cols||[]).length === 0 ? (
+                          <div style={{fontSize:'.77rem',color:'#64748b',padding:'.4rem 0'}}>No shared collections active.</div>
+                        ) : (byUser['__all__']?.cols||[]).map(ac => renderCollectionCard(ac))}
+                      </div>
+
+                      {autoColActive.length === 0 && (
+                        <div style={{textAlign:'center',padding:'1.5rem',color:'#64748b',fontSize:'.85rem'}}>No auto-collections active yet. Go to <strong>Auto-Create</strong> and click "Run Now".</div>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
             )}
           </div>
@@ -5476,6 +5668,22 @@ function App() {
                       key={'ret'+(a.channel?.retire_after_airings||0)}
                       onBlur={e=>{const n=Math.max(0,parseInt(e.target.value)||0); if(n!==(a.channel?.retire_after_airings||0)) ltvSetRetireAfter(n);}}/>
                     <span style={{fontSize:'.75rem',color:'#94a3b8'}}>airings (0 = never; channel-wide, rebuilds on change)</span>
+                  </div>
+                  <div className="card" style={{padding:'.6rem .75rem',marginBottom:'1rem',display:'flex',alignItems:'center',gap:'.6rem',flexWrap:'wrap'}}>
+                    <label style={{fontSize:'.8rem',fontWeight:500}}>Anti-rerun window</label>
+                    <input type="number" min="0" max="60" className="form-input" style={{width:'80px',padding:'.25rem .4rem'}}
+                      placeholder={`${a.channel?.rerun_days_default ?? 7} (global)`}
+                      defaultValue={a.channel?.rerun_days==null ? '' : a.channel.rerun_days}
+                      key={'rer'+(a.channel?.rerun_days==null?'g':a.channel.rerun_days)}
+                      onBlur={e=>{const raw=e.target.value.trim(); const cur=a.channel?.rerun_days==null?'':String(a.channel.rerun_days);
+                        if(raw!==cur){ ltvSetRerunDays(raw===''?'':Math.max(0,Math.min(60,parseInt(raw)||0))); }}}/>
+                    <span style={{fontSize:'.75rem',color:'#94a3b8'}}>days a program rests before it can rerun (0 = allow immediate reruns; blank = use global default {a.channel?.rerun_days_default ?? 7})</span>
+                  </div>
+                  <div className="card" style={{padding:'.6rem .75rem',marginBottom:'1rem',display:'flex',alignItems:'center',gap:'.6rem',flexWrap:'wrap',justifyContent:'space-between'}}>
+                    <div style={{fontSize:'.75rem',color:'#94a3b8',flex:'1 1 240px'}}>
+                      <strong style={{color:'#e2e8f0'}}>Renew / reset content.</strong> Clears this channel's airing history so every program — movies included — returns to rotation as if never aired. Use when the channel has cycled through everything.
+                    </div>
+                    <button className="btn-sm btn-approve" onClick={ltvRenewAll}>↻ Renew channel</button>
                   </div>
                   <div style={{display:'flex',justifyContent:'flex-end',marginBottom:'.5rem'}}>
                     <button className="btn-sm btn-outline" onClick={loadLtvAirings} disabled={ltvAirLoading}>{ltvAirLoading?'…':'Refresh'}</button>

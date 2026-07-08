@@ -4,7 +4,7 @@ services:
   plex-command-center:
     build:
       context: .
-      dockerfile: Dockerfile-v2.5.2
+      dockerfile: Dockerfile
     container_name: plex-command-center
     restart: unless-stopped
     ports:

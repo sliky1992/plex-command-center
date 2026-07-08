@@ -5,48 +5,12 @@ const cors = require('cors');
 const axios = require('axios');
 const si = require('systeminformation');
 const path = require('path');
-const fs = require('fs');
 const { spawn, spawnSync } = require('child_process');
 const Database = require('better-sqlite3');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const http = require('http');
 const net = require('net');
-
-// --- Cross-platform path layout ---
-// Data lives separately from the app code so a service install can keep its DB / fillers /
-// uploads / sub cache stable across upgrades. PCC_DATA_DIR wins; otherwise default by OS.
-const DATA_DIR = process.env.PCC_DATA_DIR
-  || (process.platform === 'win32'
-      ? path.join(process.env.PROGRAMDATA || 'C:\\ProgramData', 'PlexCommandCenter')
-      : path.join(__dirname, 'data'));
-const paths = {
-  appDir: __dirname,
-  dataDir: DATA_DIR,
-  logsDir: process.env.PCC_LOGS_DIR || path.join(DATA_DIR, 'logs'),
-  pccDb: path.join(DATA_DIR, 'pcc.db'),
-  livetvDb: path.join(DATA_DIR, 'livetv.db'),
-  fillerDir: path.join(DATA_DIR, 'fillers'),
-  fillerUploadDir: path.join(DATA_DIR, 'fillers', 'uploads'),
-  subsCacheDir: path.join(DATA_DIR, 'subs'),
-  publicDir: path.join(__dirname, 'public')
-};
-for (const d of [paths.dataDir, paths.logsDir, paths.fillerDir, paths.fillerUploadDir, paths.subsCacheDir]) {
-  try { fs.mkdirSync(d, { recursive: true }); } catch (e) { console.warn('[paths] mkdir failed for', d, e.message); }
-}
-
-// --- Cross-platform binary resolution ---
-// On Windows we prefer a bundled bin dir (set by the installer) so ffmpeg/yt-dlp don't need to
-// be on PATH. On Linux this is a no-op — names resolve via PATH the same as before.
-function binPath(name) {
-  if (process.platform !== 'win32') return name;
-  const exe = name.endsWith('.exe') ? name : `${name}.exe`;
-  if (process.env.PCC_BIN_DIR) {
-    const full = path.join(process.env.PCC_BIN_DIR, exe);
-    if (fs.existsSync(full)) return full;
-  }
-  return exe;
-}
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -111,18 +75,7 @@ app.use((req, res, next) => {
   console.log(`[REQ] ${req.method} ${req.path} from ${req.ip}`);
   next();
 });
-// Static handler. We deliberately mark index.html and sw.js as no-store: the inline React
-// app in index.html ships every new feature/bug-fix, and sw.js controls cache invalidation
-// for everything else. If either gets HTTP-cached by the browser, a deploy looks like it
-// never happened (user sees the old UI; SW happily serves the old cached HTML). Other
-// assets keep default Express caching.
-app.use(express.static(paths.publicDir, {
-  setHeaders: (res, filePath) => {
-    if (filePath.endsWith('index.html') || filePath.endsWith('sw.js')) {
-      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
-    }
-  }
-}));
+app.use(express.static(path.join(__dirname, 'public')));
 
 // Auth middleware MUST be mounted before any /api/* route is registered. Express applies
 // middleware in registration order, so anything declared above this line is public.
@@ -130,15 +83,12 @@ app.use(express.static(paths.publicDir, {
 // and friends only at request time, by which point those const tables are initialized.
 app.use(requireAuth);
 
-// Live service config. Values are seeded from env here so the rest of the file can be loaded
-// before pccDb exists; reapplyServiceConfigs() (defined below the DB init) overlays any DB
-// overrides on top of these env defaults, in place, so existing call sites need no changes.
 const config = {
-  plex: { url: process.env.PLEX_URL || 'http://localhost:32400', token: process.env.PLEX_TOKEN || '' },
-  tautulli: { url: process.env.TAUTULLI_URL || 'http://localhost:8181', apiKey: process.env.TAUTULLI_API_KEY || '' },
-  jellyseerr: { url: process.env.JELLYSEERR_URL || 'http://localhost:5055', apiKey: process.env.JELLYSEERR_API_KEY || '' },
-  zabbix: { url: process.env.ZABBIX_URL || '', user: process.env.ZABBIX_USER || 'Admin', password: process.env.ZABBIX_PASSWORD || '', hostId: process.env.ZABBIX_HOST_ID || '' },
-  bazarr: { url: process.env.BAZARR_URL || '', apiKey: process.env.BAZARR_API_KEY || '' },
+  plex:          { url: process.env.PLEX_URL || 'http://localhost:32400', token: process.env.PLEX_TOKEN || '' },
+  tautulli:      { url: process.env.TAUTULLI_URL || 'http://localhost:8181', apiKey: process.env.TAUTULLI_API_KEY || '' },
+  jellyseerr:    { url: process.env.JELLYSEERR_URL || 'http://localhost:5055', apiKey: process.env.JELLYSEERR_API_KEY || '' },
+  zabbix:        { url: process.env.ZABBIX_URL || '', user: process.env.ZABBIX_USER || 'Admin', password: process.env.ZABBIX_PASSWORD || '', hostId: process.env.ZABBIX_HOST_ID || '' },
+  bazarr:        { url: process.env.BAZARR_URL || '', apiKey: process.env.BAZARR_API_KEY || '' },
   opensubtitles: { apiKey: process.env.OPENSUBTITLES_API_KEY || '', username: process.env.OPENSUBTITLES_USERNAME || '', password: process.env.OPENSUBTITLES_PASSWORD || '' }
 };
 
@@ -373,60 +323,43 @@ app.get('/api/docker/resources', async (req, res) => {
     const [cpu, mem, disks, net] = await Promise.all([si.currentLoad(), si.mem(), si.fsSize(), si.networkStats()]);
     
     // Get actual directory sizes using du command (async, parallel)
-    const directories = [
-      { label: 'app',  path: paths.appDir },
-      { label: 'data', path: paths.dataDir },
-      { label: 'logs', path: paths.logsDir },
-      { label: 'fillers', path: paths.fillerDir }
-    ];
+    const { exec } = require('child_process');
+    const { promisify } = require('util');
+    const execPromise = promisify(exec);
+    const directories = ['/app', '/app/logs', '/app/data', '/app/public', '/tmp'];
     const dirSizes = [];
 
-    const sumDir = (dir) => {
-      let total = 0;
+    const duResults = await Promise.all(directories.map(async (dir) => {
       try {
-        const stack = [dir];
-        while (stack.length) {
-          const cur = stack.pop();
-          let entries; try { entries = fs.readdirSync(cur, { withFileTypes: true }); } catch (e) { continue; }
-          for (const ent of entries) {
-            const p = path.join(cur, ent.name);
-            try {
-              if (ent.isDirectory()) stack.push(p);
-              else total += fs.statSync(p).size;
-            } catch (e) {}
-          }
+        const { stdout } = await execPromise(`du -sb ${dir} 2>/dev/null | cut -f1`);
+        const bytes = parseInt(stdout.toString().trim());
+        if (bytes > 0) {
+          return {
+            name: dir,
+            mount: dir,
+            label: dir.replace('/app/', ''),
+            total: Math.round(bytes / 1048576), // MB
+            used: Math.round(bytes / 1048576),
+            percentage: 0, // Will calculate based on parent
+            sizeFormatted: bytes > 1073741824
+              ? `${(bytes / 1073741824).toFixed(2)} GB`
+              : `${(bytes / 1048576).toFixed(1)} MB`
+          };
         }
-      } catch (e) {}
-      return total;
-    };
-
-    const duResults = await Promise.all(directories.map(async (entry) => {
-      try {
-        if (!fs.existsSync(entry.path)) return null;
-        const bytes = sumDir(entry.path);
-        if (!bytes) return null;
-        return {
-          name: entry.path,
-          mount: entry.path,
-          label: entry.label,
-          total: Math.round(bytes / 1048576),
-          used: Math.round(bytes / 1048576),
-          percentage: 0,
-          sizeFormatted: bytes > 1073741824
-            ? `${(bytes / 1073741824).toFixed(2)} GB`
-            : `${(bytes / 1048576).toFixed(1)} MB`
-        };
-      } catch (e) { return null; }
+        return null;
+      } catch (e) {
+        return null; // Directory doesn't exist or can't read
+      }
     }));
     dirSizes.push(...duResults.filter(Boolean));
-
-    // Add main disk info — first disk on Linux (/), system drive on Windows
-    const mainDisk = disks.find(d => d.mount === '/' || d.mount === 'C:') || disks[0];
+    
+    // Add main disk info
+    const mainDisk = disks.find(d => d.mount === '/');
     if (mainDisk) {
       dirSizes.unshift({
-        name: mainDisk.mount,
-        mount: mainDisk.mount,
-        label: process.platform === 'win32' ? `${mainDisk.mount} Drive` : 'Container Root',
+        name: 'overlay',
+        mount: '/',
+        label: 'Container Root',
         total: Math.round(mainDisk.size / 1073741824),
         used: Math.round(mainDisk.used / 1073741824),
         percentage: Math.round(mainDisk.use * 10) / 10,
@@ -890,16 +823,20 @@ app.post('/api/plex/collections/suggestions', async (req, res) => {
     const showLibs = libraries.filter(l => l.type === 'show');
 
     // --- a) Title-based suggestions from watch history ---
+    // tautulliUserId filters history to a single Plex user; null = global history
+    const tautulliUserId = req.body?.tautulliUserId || null;
     if (config.tautulli.apiKey) {
       try {
         // Get recent watch history - movies and episodes
+        const histBase = { apikey: config.tautulli.apiKey, length: 50 };
+        if (tautulliUserId) histBase.user_id = tautulliUserId;
         const [movieHistRes, episodeHistRes] = await Promise.all([
           axios.get(`${config.tautulli.url}/api/v2`, {
-            params: { apikey: config.tautulli.apiKey, cmd: 'get_history', length: 30, media_type: 'movie' },
+            params: { ...histBase, cmd: 'get_history', media_type: 'movie' },
             timeout: 10000
           }),
           axios.get(`${config.tautulli.url}/api/v2`, {
-            params: { apikey: config.tautulli.apiKey, cmd: 'get_history', length: 30, media_type: 'episode' },
+            params: { ...histBase, cmd: 'get_history', media_type: 'episode' },
             timeout: 10000
           })
         ]);
@@ -1469,7 +1406,10 @@ app.post('/api/plex/collections/:key/pin', async (req, res) => {
 // AUTO-COLLECTION ENGINE (SQLite-backed)
 // ============================================
 
-const pccDb = new Database(paths.pccDb);
+const fs = require('fs');
+const pccDbDir = path.join(__dirname, 'data');
+if (!fs.existsSync(pccDbDir)) fs.mkdirSync(pccDbDir, { recursive: true });
+const pccDb = new Database(path.join(pccDbDir, 'pcc.db'));
 pccDb.pragma('journal_mode = WAL');
 pccDb.exec(`
   CREATE TABLE IF NOT EXISTS auto_collections (
@@ -1656,28 +1596,25 @@ pccDb.exec(`INSERT OR IGNORE INTO regional_settings (key, value) VALUES ('gatewa
 pccDb.exec(`INSERT OR IGNORE INTO regional_settings (key, value) VALUES ('gateway_target', '${(process.env.PCC_GATEWAY_TARGET || '').replace(/'/g, "''")}')`);
 
 // ============================================
-// SERVICE SETTINGS - UI-editable token/URL overrides
+// SETTINGS / SERVICES (DB-backed config overrides with encrypted secrets)
 // ============================================
-// Layered config: env (boot) -> conf/.env file -> service_settings (DB, wins).
-// Secrets are encrypted at rest with AES-256-GCM. Key source priority:
-//   1. PCC_SECRETS_KEY env var (preferred — survives DB rebuilds)
-//   2. Persisted random salt stored in service_settings under (_meta, enc_salt)
+
 pccDb.exec(`
   CREATE TABLE IF NOT EXISTS service_settings (
-    service TEXT NOT NULL,
-    field TEXT NOT NULL,
-    value TEXT,
-    is_secret INTEGER NOT NULL DEFAULT 0,
+    service    TEXT NOT NULL,
+    field      TEXT NOT NULL,
+    value      TEXT NOT NULL DEFAULT '',
+    is_secret  INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (service, field)
   );
   CREATE TABLE IF NOT EXISTS settings_audit (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    service TEXT NOT NULL,
-    field TEXT NOT NULL,
-    actor TEXT,
-    action TEXT NOT NULL,
-    detail TEXT,
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    service    TEXT NOT NULL,
+    field      TEXT NOT NULL,
+    actor      TEXT NOT NULL DEFAULT 'system',
+    action     TEXT NOT NULL,
+    detail     TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
   CREATE INDEX IF NOT EXISTS idx_settings_audit_created ON settings_audit(created_at);
@@ -1724,15 +1661,12 @@ function decryptSecret(stored) {
   }
 }
 
-// Public schema of editable services — drives both backend resolver and the Settings UI.
-// envKey: the legacy env var (used as fallback when no DB override exists).
-// configPath: dot path into the live `config` object (so reapply can overwrite in place).
 const SERVICE_DEFS = {
   plex: {
     label: 'Plex Media Server',
     description: 'Source server for sessions, library, and playback.',
     fields: [
-      { name: 'url',   type: 'url',    label: 'Server URL',   envKey: 'PLEX_URL', configPath: 'plex.url' },
+      { name: 'url',   type: 'url',    label: 'Server URL',   envKey: 'PLEX_URL',   configPath: 'plex.url'   },
       { name: 'token', type: 'secret', label: 'X-Plex-Token', envKey: 'PLEX_TOKEN', configPath: 'plex.token' }
     ]
   },
@@ -1740,7 +1674,7 @@ const SERVICE_DEFS = {
     label: 'Tautulli',
     description: 'History, watch stats, and per-user analytics.',
     fields: [
-      { name: 'url',    type: 'url',    label: 'URL',     envKey: 'TAUTULLI_URL', configPath: 'tautulli.url' },
+      { name: 'url',    type: 'url',    label: 'URL',     envKey: 'TAUTULLI_URL',     configPath: 'tautulli.url'    },
       { name: 'apiKey', type: 'secret', label: 'API Key', envKey: 'TAUTULLI_API_KEY', configPath: 'tautulli.apiKey' }
     ]
   },
@@ -1748,7 +1682,7 @@ const SERVICE_DEFS = {
     label: 'Jellyseerr',
     description: 'Media request management.',
     fields: [
-      { name: 'url',    type: 'url',    label: 'URL',     envKey: 'JELLYSEERR_URL', configPath: 'jellyseerr.url' },
+      { name: 'url',    type: 'url',    label: 'URL',     envKey: 'JELLYSEERR_URL',     configPath: 'jellyseerr.url'    },
       { name: 'apiKey', type: 'secret', label: 'API Key', envKey: 'JELLYSEERR_API_KEY', configPath: 'jellyseerr.apiKey' }
     ]
   },
@@ -1756,17 +1690,17 @@ const SERVICE_DEFS = {
     label: 'Zabbix',
     description: 'Server health metrics (Windows Plex host).',
     fields: [
-      { name: 'url',      type: 'url',    label: 'URL',      envKey: 'ZABBIX_URL', configPath: 'zabbix.url' },
-      { name: 'user',     type: 'text',   label: 'Username', envKey: 'ZABBIX_USER', configPath: 'zabbix.user' },
+      { name: 'url',      type: 'url',    label: 'URL',      envKey: 'ZABBIX_URL',      configPath: 'zabbix.url'      },
+      { name: 'user',     type: 'text',   label: 'Username', envKey: 'ZABBIX_USER',     configPath: 'zabbix.user'     },
       { name: 'password', type: 'secret', label: 'Password', envKey: 'ZABBIX_PASSWORD', configPath: 'zabbix.password' },
-      { name: 'hostId',   type: 'text',   label: 'Host ID',  envKey: 'ZABBIX_HOST_ID', configPath: 'zabbix.hostId' }
+      { name: 'hostId',   type: 'text',   label: 'Host ID',  envKey: 'ZABBIX_HOST_ID',  configPath: 'zabbix.hostId'   }
     ]
   },
   bazarr: {
     label: 'Bazarr',
     description: 'Subtitle management for missing subs.',
     fields: [
-      { name: 'url',    type: 'url',    label: 'URL',     envKey: 'BAZARR_URL', configPath: 'bazarr.url' },
+      { name: 'url',    type: 'url',    label: 'URL',     envKey: 'BAZARR_URL',     configPath: 'bazarr.url'    },
       { name: 'apiKey', type: 'secret', label: 'API Key', envKey: 'BAZARR_API_KEY', configPath: 'bazarr.apiKey' }
     ]
   },
@@ -1774,7 +1708,7 @@ const SERVICE_DEFS = {
     label: 'OpenSubtitles',
     description: 'External subtitle fallback for LiveTV playback.',
     fields: [
-      { name: 'apiKey',   type: 'secret', label: 'API Key',  envKey: 'OPENSUBTITLES_API_KEY', configPath: 'opensubtitles.apiKey' },
+      { name: 'apiKey',   type: 'secret', label: 'API Key',  envKey: 'OPENSUBTITLES_API_KEY',  configPath: 'opensubtitles.apiKey'   },
       { name: 'username', type: 'text',   label: 'Username', envKey: 'OPENSUBTITLES_USERNAME', configPath: 'opensubtitles.username' },
       { name: 'password', type: 'secret', label: 'Password', envKey: 'OPENSUBTITLES_PASSWORD', configPath: 'opensubtitles.password' }
     ]
@@ -1801,7 +1735,6 @@ function reapplyServiceConfigs() {
     for (const f of def.fields) {
       const dbVal = dbBySvc[svc]?.[f.name];
       const envVal = process.env[f.envKey];
-      // DB beats env; if both blank, keep whatever's already in config (preserves seeded defaults).
       const finalVal = (dbVal !== undefined && dbVal !== '') ? dbVal
                      : (envVal !== undefined && envVal !== '') ? envVal
                      : undefined;
@@ -1810,7 +1743,6 @@ function reapplyServiceConfigs() {
   }
 }
 
-// Apply any DB overrides now that pccDb is initialized.
 reapplyServiceConfigs();
 
 function settingsAudit(actor, service, field, action, detail) {
@@ -1819,62 +1751,6 @@ function settingsAudit(actor, service, field, action, detail) {
       .run(service, field, actor || 'system', action, (detail || '').slice(0, 500));
   } catch (e) { console.warn('[SETTINGS] audit insert failed:', e.message); }
 }
-
-// ============================================
-// CONTINUE WATCHING SNAPSHOTS - recover items aged out of Plex's Continue Watching hub
-// ============================================
-// Plex's "Continue Watching" hub ages items out after a server-side computed window. Once an
-// item is gone, its viewOffset is lost — so to "restore" we need a snapshot taken BEFORE the
-// item disappeared. Cron polls /library/onDeck (admin token) at a configurable interval and
-// upserts each item with viewOffset > 0. When auto_restore is on, items in the snapshot that
-// disappear from the live hub get re-pushed via /:/timeline to revive both viewOffset and
-// lastViewedAt (the two values Plex uses to decide hub membership).
-pccDb.exec(`
-  CREATE TABLE IF NOT EXISTS cw_snapshots (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    account_id TEXT NOT NULL DEFAULT 'owner',
-    rating_key TEXT NOT NULL,
-    title TEXT,
-    show_title TEXT,
-    season_num INTEGER,
-    episode_num INTEGER,
-    year INTEGER,
-    item_type TEXT,
-    thumb TEXT,
-    view_offset INTEGER NOT NULL DEFAULT 0,
-    duration INTEGER NOT NULL DEFAULT 0,
-    last_viewed_at INTEGER,
-    first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
-    last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
-    last_in_hub_at TEXT NOT NULL DEFAULT (datetime('now')),
-    restored_at TEXT,
-    restored_by TEXT,
-    UNIQUE(account_id, rating_key)
-  );
-  CREATE INDEX IF NOT EXISTS idx_cw_lastinhub ON cw_snapshots(last_in_hub_at);
-  CREATE TABLE IF NOT EXISTS cw_settings (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    enabled INTEGER NOT NULL DEFAULT 1,
-    interval_minutes INTEGER NOT NULL DEFAULT 15,
-    auto_restore INTEGER NOT NULL DEFAULT 0,
-    stale_after_hours INTEGER NOT NULL DEFAULT 6,
-    last_run TEXT,
-    last_snapshot_count INTEGER NOT NULL DEFAULT 0,
-    last_restore_count INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT
-  );
-  INSERT OR IGNORE INTO cw_settings (id) VALUES (1);
-`);
-// Episodes' own `thumb` is a still-frame grab that's often unrecognizable in a list; store the
-// show poster (grandparentThumb) too so the UI can show a poster the user actually recognizes.
-try { pccDb.exec("ALTER TABLE cw_snapshots ADD COLUMN grandparent_thumb TEXT"); } catch(e) {}
-// Plex numeric ratingKeys are NOT stable — a library rescan/rebuild reassigns them, leaving the
-// snapshot pointing at a different item (a season, a behind-the-scenes clip, etc). Store the
-// stable `guid` so we can detect a reassigned key and re-resolve the current ratingKey by guid.
-try { pccDb.exec("ALTER TABLE cw_snapshots ADD COLUMN guid TEXT"); } catch(e) {}
-// When on, the snapshotter cron also snapshots (and, if auto_restore is on, restores) every Plex
-// Home user — not just the owner. Default off to avoid extra plex.tv token-mint calls until opted in.
-try { pccDb.exec("ALTER TABLE cw_settings ADD COLUMN snapshot_all_users INTEGER NOT NULL DEFAULT 0"); } catch(e) {}
 
 // Seed default admin if no users exist — flagged so the first login is forced to rotate password.
 const userCount = pccDb.prepare('SELECT COUNT(*) as cnt FROM users').get().cnt;
@@ -1960,13 +1836,6 @@ const AUTH_EXEMPT = new Set([
 const AUTH_EXEMPT_PREFIXES = [
   '/api/livetv/stream/', '/api/livetv/m3u', '/api/livetv/xmltv', '/api/livetv/logos/'
 ];
-// Fully-public matchers (no tuner key, no session). Only the cached VTT file URLs —
-// the <track> element can't attach session headers from file://→http:// in Electron and
-// the sub text is just dialog, not secret. KEEP NARROW: must not eclipse sibling routes
-// like /api/livetv/subs/status that need admin gating.
-const AUTH_PUBLIC_MATCHERS = [
-  (p) => /^\/api\/livetv\/subs\/\d+\/[a-z]+\.vtt$/i.test(p)
-];
 const TUNER_PATHS = new Set([
   '/discover.json', '/lineup.json', '/lineup_status.json', '/lineup.post', '/device.xml'
 ]);
@@ -1975,11 +1844,6 @@ const TUNER_PATHS = new Set([
 const PWCHANGE_OK_ROUTES = new Set([
   '/api/auth/me', '/api/auth/logout', '/api/auth/change-password'
 ]);
-
-// Per-process secret for internal-to-self HTTP calls (e.g. the auto-collection cron POSTs to
-// /api/plex/collections/suggestions). Regenerated on every restart so it can't be replayed
-// from logs. Only code in this process can present it because it never leaves memory.
-const INTERNAL_API_TOKEN = crypto.randomBytes(32).toString('hex');
 
 // Optional shared key for tuner endpoints. When TUNER_KEY env is set, /lineup.json,
 // /api/livetv/stream/*, /api/livetv/m3u, /api/livetv/xmltv, /api/livetv/logos/* require
@@ -2000,7 +1864,6 @@ function checkTunerKey(req) {
 function requireAuth(req, res, next) {
   // Skip auth for exempt routes
   if (AUTH_EXEMPT.has(req.path)) return next();
-  if (AUTH_PUBLIC_MATCHERS.some(m => m(req.path))) return next();
   if (TUNER_PATHS.has(req.path)) {
     if (!checkTunerKey(req)) return res.status(401).json({ error: 'Tuner key required' });
     return next();
@@ -2009,18 +1872,12 @@ function requireAuth(req, res, next) {
     if (!checkTunerKey(req)) return res.status(401).json({ error: 'Tuner key required' });
     return next();
   }
-  // Internal-call bypass — the auto-collection cron calls /api/plex/collections/suggestions
-  // over HTTP against its own process and presents the per-process INTERNAL_API_TOKEN. Only a
-  // process on this host with read access to its own memory can know that token, so any client
-  // that can present it is by definition us. A blanket "loopback bypass" looks similar but is
-  // wrong: when this app runs as a Windows service on localhost:3001 every browser request
-  // also originates from 127.0.0.1, so an unconditional loopback bypass would skip setting
-  // req.user for the *real* user and then any requireAdmin route 403s.
-  if ((req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1')
-      && req.headers['x-internal-token']
-      && req.headers['x-internal-token'] === INTERNAL_API_TOKEN
-      && req.path.startsWith('/api/')) {
-    return next();
+  // Loopback bypass — the auto-collection cron calls /api/plex/collections/suggestions over
+  // HTTP against its own process. Loopback (127.0.0.1 / ::1) traffic can only come from inside
+  // the container's own network namespace, so it's safe to trust. Without this bypass the auth
+  // middleware introduced in 3.1.0 broke the internal cron.
+  if (req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1') {
+    if (req.path.startsWith('/api/')) return next();
   }
   // Skip auth for static files / non-API
   if (!req.path.startsWith('/api/')) return next();
@@ -2204,489 +2061,6 @@ app.delete('/api/admin/users/:id', requireAdmin, (req, res) => {
   pccDb.prepare('DELETE FROM sessions WHERE user_id = ?').run(req.params.id);
   pccDb.prepare('DELETE FROM users WHERE id = ?').run(req.params.id);
   res.json({ success: true });
-});
-
-// ============================================
-// SERVICE SETTINGS API - UI-editable integration tokens/URLs
-// ============================================
-
-// Returns the schema + current effective values. Secrets are returned as a masked sentinel
-// (presence indicator only) — actual cleartext never leaves the server through this endpoint.
-app.get('/api/settings/services', requireAdmin, (req, res) => {
-  const out = [];
-  // Stable per-row lookup so we can label source as 'db' / 'env' / 'default'.
-  const dbRows = pccDb.prepare("SELECT service, field, value FROM service_settings WHERE service != '_meta'").all();
-  const hasDb = new Set(dbRows.filter(r => r.value && r.value !== '').map(r => `${r.service}|${r.field}`));
-  for (const [svc, def] of Object.entries(SERVICE_DEFS)) {
-    const fields = def.fields.map(f => {
-      const parts = f.configPath.split('.');
-      let v = config; for (const p of parts) v = v ? v[p] : undefined;
-      const has = v !== undefined && v !== '';
-      const dbOverride = hasDb.has(`${svc}|${f.name}`);
-      const envValue = process.env[f.envKey];
-      const source = dbOverride ? 'db' : (envValue ? 'env' : (has ? 'default' : 'unset'));
-      return {
-        name: f.name, label: f.label, type: f.type, envKey: f.envKey,
-        value: f.type === 'secret' ? (has ? '••••••••' : '') : (v || ''),
-        hasValue: has,
-        source
-      };
-    });
-    out.push({ service: svc, label: def.label, description: def.description, fields });
-  }
-  res.json(out);
-});
-
-// Body: { field: value, ... }. Pass an empty string to clear the DB override (revert to env).
-// Masked sentinel '••••' is ignored (user didn't actually edit the secret).
-app.put('/api/settings/services/:service', requireAdmin, (req, res) => {
-  const svc = req.params.service;
-  const def = SERVICE_DEFS[svc];
-  if (!def) return res.status(404).json({ error: 'Unknown service' });
-  const actor = req.user?.username || 'unknown';
-  const patch = req.body || {};
-  const fieldsByName = Object.fromEntries(def.fields.map(f => [f.name, f]));
-
-  const apply = pccDb.transaction(() => {
-    for (const [name, rawVal] of Object.entries(patch)) {
-      const f = fieldsByName[name];
-      if (!f) continue;
-      // Ignore unchanged masked secret
-      if (f.type === 'secret' && typeof rawVal === 'string' && /^[•*]+$/.test(rawVal)) continue;
-      const newVal = rawVal == null ? '' : String(rawVal);
-      const existing = pccDb.prepare("SELECT value FROM service_settings WHERE service=? AND field=?").get(svc, name);
-
-      if (newVal === '') {
-        if (existing) {
-          pccDb.prepare("DELETE FROM service_settings WHERE service=? AND field=?").run(svc, name);
-          settingsAudit(actor, svc, name, 'clear', 'reverted to env/default');
-        }
-        continue;
-      }
-      const isSecret = f.type === 'secret' ? 1 : 0;
-      const stored = isSecret ? encryptSecret(newVal) : newVal;
-      pccDb.prepare(`
-        INSERT INTO service_settings (service, field, value, is_secret, updated_at)
-        VALUES (?,?,?,?, datetime('now'))
-        ON CONFLICT(service, field) DO UPDATE SET value=excluded.value, is_secret=excluded.is_secret, updated_at=datetime('now')
-      `).run(svc, name, stored, isSecret);
-      settingsAudit(actor, svc, name, existing ? 'update' : 'create', isSecret ? 'secret changed' : `value="${newVal.slice(0, 100)}"`);
-    }
-  });
-  try { apply(); } catch (e) { return res.status(500).json({ error: e.message }); }
-
-  reapplyServiceConfigs();
-  // Service-specific reinit hooks after config change
-  if (svc === 'zabbix') {
-    zabbixAuthToken = null; zabbixAuthExpiry = 0; zabbixDisabled = false; zabbixDisabledReason = null;
-    console.log('[SETTINGS] Zabbix config updated — token cleared, polling re-enabled');
-  }
-  if (svc === 'opensubtitles') {
-    _osTokenCache = { token: null, expiresAt: 0 };
-  }
-  res.json({ success: true });
-});
-
-// Test a service using its currently-saved config. Logs the result to audit so admins can
-// see when something stopped working without diffing token rotations.
-app.post('/api/settings/services/:service/test', requireAdmin, async (req, res) => {
-  const svc = req.params.service;
-  if (!SERVICE_DEFS[svc]) return res.status(404).json({ error: 'Unknown service' });
-  const actor = req.user?.username || 'unknown';
-  let result;
-  try { result = await runServiceTest(svc); }
-  catch (e) { result = { ok: false, error: e.response?.data?.error || e.message }; }
-  settingsAudit(actor, svc, '*', 'test', result.ok ? (result.detail || 'ok') : `fail: ${(result.error || '').slice(0, 200)}`);
-  res.json(result);
-});
-
-async function runServiceTest(svc) {
-  const c = config;
-  switch (svc) {
-    case 'plex': {
-      if (!c.plex.url || !c.plex.token) return { ok: false, error: 'URL and token required' };
-      const r = await axios.get(`${c.plex.url}/identity`, { params: { 'X-Plex-Token': c.plex.token }, headers: { Accept: 'application/json' }, timeout: 5000 });
-      const mid = r.data?.MediaContainer?.machineIdentifier;
-      return { ok: !!mid, detail: mid ? `machineId ${String(mid).slice(0, 12)}…` : 'no machineIdentifier in response' };
-    }
-    case 'tautulli': {
-      if (!c.tautulli.url || !c.tautulli.apiKey) return { ok: false, error: 'URL and API key required' };
-      const r = await axios.get(`${c.tautulli.url}/api/v2`, { params: { apikey: c.tautulli.apiKey, cmd: 'get_server_info' }, timeout: 5000 });
-      const ok = r.data?.response?.result === 'success';
-      return ok ? { ok: true, detail: `server: ${r.data?.response?.data?.pms_name || 'connected'}` }
-                : { ok: false, error: r.data?.response?.message || 'auth failed' };
-    }
-    case 'jellyseerr': {
-      if (!c.jellyseerr.url || !c.jellyseerr.apiKey) return { ok: false, error: 'URL and API key required' };
-      const r = await axios.get(`${c.jellyseerr.url}/api/v1/status`, { headers: { 'X-Api-Key': c.jellyseerr.apiKey, Accept: 'application/json' }, timeout: 5000 });
-      return { ok: !!r.data?.version, detail: `version ${r.data?.version}` };
-    }
-    case 'zabbix': {
-      zabbixAuthToken = null; zabbixDisabled = false; zabbixAuthExpiry = 0; zabbixDisabledReason = null;
-      if (!c.zabbix.url || !c.zabbix.user || !c.zabbix.password) return { ok: false, error: 'URL, user and password required' };
-      const t = await getZabbixToken();
-      if (!t) return { ok: false, error: zabbixDisabledReason || 'login failed' };
-      return { ok: true, detail: 'authenticated' };
-    }
-    case 'bazarr': {
-      if (!c.bazarr.url || !c.bazarr.apiKey) return { ok: false, error: 'URL and API key required' };
-      const r = await bazarrGet('/api/system/status');
-      const v = r?.data?.bazarr_version || r?.bazarr_version;
-      return { ok: !!v, detail: v ? `version ${v}` : 'unexpected response shape' };
-    }
-    case 'opensubtitles': {
-      if (!c.opensubtitles.apiKey) return { ok: false, error: 'API key required' };
-      const r = await axios.get('https://api.opensubtitles.com/api/v1/infos/formats', { headers: { 'Api-Key': c.opensubtitles.apiKey, 'User-Agent': OS_USER_AGENT }, timeout: 5000 });
-      return { ok: r.status === 200, detail: 'API reachable' };
-    }
-    default:
-      return { ok: false, error: 'No test handler for this service' };
-  }
-}
-
-app.get('/api/settings/audit', requireAdmin, (req, res) => {
-  const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
-  const rows = pccDb.prepare('SELECT id, service, field, actor, action, detail, created_at FROM settings_audit ORDER BY id DESC LIMIT ?').all(limit);
-  res.json(rows);
-});
-
-// ============================================
-// CONTINUE WATCHING API
-// ============================================
-
-// Combined state: settings + last run + current snapshots annotated with live/missing.
-// Also runs a prune-completed pass so the "missing" list doesn't show finished items.
-app.get('/api/cw/state', requireAdmin, async (req, res) => {
-  const settings = pccDb.prepare('SELECT * FROM cw_settings WHERE id=1').get();
-
-  // Which account's Continue Watching are we viewing? Defaults to the owner.
-  let account, accountError = null;
-  try { account = await _cwResolveAccount(req.query.account, req.query.pin); }
-  catch (e) {
-    if (e.code === 'PIN_REQUIRED') return res.status(409).json({ error: e.message, code: 'PIN_REQUIRED' });
-    account = _cwOwnerAccount(); accountError = e.message;
-  }
-
-  let liveKeys = null, plexError = accountError;
-  try {
-    const live = await _cwFetchOnDeck(account.token);
-    liveKeys = new Set(live.filter(i => (Number(i.viewOffset)||0) > 0).map(i => String(i.ratingKey)));
-    // Prune watched/deleted items inline so the user sees a clean list immediately. Best-
-    // effort: an error here just leaves the rows in place until the next snapshot tick.
-    try { await _cwPruneCompleted(liveKeys, account); } catch (e) { /* swallow — non-fatal */ }
-  } catch (e) { plexError = e.message; }
-
-  const snaps = pccDb.prepare(`
-    SELECT rating_key, title, show_title, season_num, episode_num, year, item_type, thumb,
-           grandparent_thumb, view_offset, duration, last_viewed_at, first_seen_at, last_seen_at,
-           last_in_hub_at, restored_at, restored_by
-    FROM cw_snapshots WHERE account_id = ? ORDER BY last_in_hub_at DESC
-  `).all(account.id);
-
-  const mkThumb = (path) => path && config.plex.url && config.plex.token
-    ? `${config.plex.url}${path}?X-Plex-Token=${config.plex.token}`
-    : null;
-  const annotated = snaps.map(s => ({
-    ...s,
-    // Existing convention across the app: backend returns fully-qualified thumb URLs because
-    // Plex doesn't accept anonymous access. The browser hits Plex directly. Works on LAN /
-    // tailscale; for stricter setups a future server-side proxy could be substituted.
-    // For episodes prefer the show poster (grandparent_thumb) — the episode's own thumb is a
-    // still-frame that reads as a "wrong"/unrecognizable cover in a list.
-    thumb: mkThumb((s.item_type === 'episode' && s.grandparent_thumb) ? s.grandparent_thumb : s.thumb),
-    isLive: liveKeys ? liveKeys.has(s.rating_key) : null,
-    progress_pct: s.duration > 0 ? Math.min(99, Math.round((s.view_offset / s.duration) * 100)) : 0
-  }));
-
-  res.json({
-    settings,
-    plexError,
-    account: { id: account.id, title: account.title, kind: account.kind },
-    snapshots: annotated,
-    liveCount: liveKeys ? liveKeys.size : null,
-    snapshotCount: snaps.length,
-    missingCount: liveKeys ? snaps.filter(s => !liveKeys.has(s.rating_key)).length : null
-  });
-});
-
-// List the accounts whose Continue Watching can be viewed/restored: the owner plus every Plex
-// Home (managed) user. External shared friends are not Home members and have no obtainable token,
-// so they are intentionally excluded. `protected` flags PIN-gated profiles so the UI can prompt.
-app.get('/api/cw/users', requireAdmin, async (req, res) => {
-  const accounts = [{ id: 'owner', title: 'Owner', kind: 'owner', protected: false }];
-  try {
-    const users = await cwFetchHomeUsers(req.query.refresh === '1');
-    for (const u of users) {
-      if (u.admin) continue; // the owner is already represented by the 'owner' entry
-      accounts.push({
-        id: String(u.uuid),
-        title: u.title || u.username || u.friendlyName || 'User',
-        kind: 'home',
-        restricted: !!u.restricted,
-        protected: !!u.protected,
-        thumb: u.thumb || null
-      });
-    }
-    res.json({ accounts });
-  } catch (e) {
-    // Couldn't reach plex.tv — still let the UI work with the owner account.
-    res.json({ accounts, error: e.message });
-  }
-});
-
-app.put('/api/cw/settings', requireAdmin, (req, res) => {
-  const cur = pccDb.prepare('SELECT * FROM cw_settings WHERE id=1').get();
-  const { enabled, interval_minutes, auto_restore, stale_after_hours, snapshot_all_users } = req.body || {};
-  const newEnabled = enabled === undefined ? cur.enabled : (enabled ? 1 : 0);
-  const newInterval = interval_minutes === undefined ? cur.interval_minutes : Math.max(1, Math.min(1440, parseInt(interval_minutes) || cur.interval_minutes));
-  const newAuto = auto_restore === undefined ? cur.auto_restore : (auto_restore ? 1 : 0);
-  const newStale = stale_after_hours === undefined ? cur.stale_after_hours : Math.max(1, parseInt(stale_after_hours) || cur.stale_after_hours);
-  const newAllUsers = snapshot_all_users === undefined ? cur.snapshot_all_users : (snapshot_all_users ? 1 : 0);
-  pccDb.prepare('UPDATE cw_settings SET enabled=?, interval_minutes=?, auto_restore=?, stale_after_hours=?, snapshot_all_users=? WHERE id=1')
-    .run(newEnabled, newInterval, newAuto, newStale, newAllUsers);
-  scheduleCwSnapshotter();
-  settingsAudit(req.user?.username, 'cw', '*', 'update', `enabled=${newEnabled} interval=${newInterval}m auto=${newAuto} allUsers=${newAllUsers}`);
-  res.json({ success: true });
-});
-
-app.post('/api/cw/snapshot', requireAdmin, async (req, res) => {
-  try {
-    // `?deep=1` walks every library for items with viewOffset>0 instead of just polling
-    // Plex's /library/onDeck endpoint. Slower but catches items Plex has aged out of the
-    // CW hub — those are exactly the items the user wants to be able to restore.
-    const deep = req.query.deep === '1' || req.body?.deep === true;
-    let account;
-    try { account = await _cwResolveAccount(req.query.account || req.body?.account, req.query.pin || req.body?.pin); }
-    catch (e) {
-      if (e.code === 'PIN_REQUIRED') return res.status(409).json({ error: e.message, code: 'PIN_REQUIRED' });
-      return res.status(400).json({ error: e.message });
-    }
-    const r = await cwSnapshot(deep, account);
-    if (account.id === 'owner') pccDb.prepare("UPDATE cw_settings SET last_run = datetime('now'), last_snapshot_count = ?, last_error = NULL WHERE id = 1").run(r.saved);
-    res.json({ success: true, deep, account: { id: account.id, title: account.title }, ...r });
-  } catch (e) {
-    pccDb.prepare("UPDATE cw_settings SET last_run = datetime('now'), last_error = ? WHERE id = 1").run((e.message||'').slice(0, 500));
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post('/api/cw/restore/:rating_key', requireAdmin, async (req, res) => {
-  let account;
-  try { account = await _cwResolveAccount(req.query.account || req.body?.account, req.query.pin || req.body?.pin); }
-  catch (e) {
-    if (e.code === 'PIN_REQUIRED') return res.status(409).json({ error: e.message, code: 'PIN_REQUIRED' });
-    return res.status(400).json({ error: e.message });
-  }
-  const r = await cwRestoreItem(req.params.rating_key, req.user?.username || 'admin', account);
-  if (r.ok) res.json({ success: true, applied: r.applied, note: r.note, plexOffset: r.plexOffset });
-  else res.status(400).json({ error: r.error });
-});
-
-app.post('/api/cw/restore-bulk', requireAdmin, async (req, res) => {
-  const keys = Array.isArray(req.body?.rating_keys) ? req.body.rating_keys : [];
-  if (!keys.length) return res.status(400).json({ error: 'rating_keys array required' });
-  let account;
-  try { account = await _cwResolveAccount(req.body?.account, req.body?.pin); }
-  catch (e) {
-    if (e.code === 'PIN_REQUIRED') return res.status(409).json({ error: e.message, code: 'PIN_REQUIRED' });
-    return res.status(400).json({ error: e.message });
-  }
-  const actor = req.user?.username || 'admin';
-  const results = { restored: 0, failed: 0, errors: [] };
-  for (const k of keys) {
-    const r = await cwRestoreItem(k, actor, account);
-    if (r.ok) results.restored++;
-    else { results.failed++; results.errors.push({ rating_key: k, error: r.error }); }
-  }
-  res.json({ success: true, ...results });
-});
-
-app.delete('/api/cw/snapshot/:rating_key', requireAdmin, (req, res) => {
-  // account here is just the snapshot owner key (no token needed); 'owner' uuid maps to 'owner'.
-  const acctId = (!req.query.account || req.query.account === 'owner') ? 'owner' : String(req.query.account);
-  pccDb.prepare("DELETE FROM cw_snapshots WHERE account_id = ? AND rating_key = ?").run(acctId, req.params.rating_key);
-  res.json({ success: true });
-});
-
-// --- Bazarr client ---
-function _bazarrBase() {
-  if (!config.bazarr.url) throw new Error('Bazarr URL not configured');
-  if (!config.bazarr.apiKey) throw new Error('Bazarr API key not configured');
-  return config.bazarr.url.replace(/\/+$/, '');
-}
-async function bazarrGet(path, params) {
-  const r = await axios.get(`${_bazarrBase()}${path}`, {
-    params,
-    headers: { 'X-API-KEY': config.bazarr.apiKey, Accept: 'application/json' },
-    timeout: 15000
-  });
-  return r.data;
-}
-async function bazarrPatch(path, body, params) {
-  const r = await axios.patch(`${_bazarrBase()}${path}`, body, {
-    params,
-    headers: { 'X-API-KEY': config.bazarr.apiKey, 'Content-Type': 'application/json', Accept: 'application/json' },
-    timeout: 15000
-  });
-  return r.data;
-}
-
-// Aggregated wanted-subs view. Bazarr's wanted endpoints already encode "missing" status from
-// the language profile, so we don't re-scan Plex — we just surface what Bazarr already knows.
-// Episodes and movies are returned in two separate arrays with a normalized shape, so the UI
-// can render and trigger searches with one button each.
-app.get('/api/bazarr/missing', requireAdmin, async (req, res) => {
-  if (!config.bazarr.url || !config.bazarr.apiKey) {
-    return res.status(400).json({ error: 'Bazarr is not configured. Add the URL + API key in Settings.' });
-  }
-  try {
-    // Bazarr paginates wanted with start/length. Default to a large page so admins see everything.
-    const limit = Math.min(5000, parseInt(req.query.limit) || 1000);
-    const [epRes, mvRes] = await Promise.all([
-      bazarrGet('/api/episodes/wanted', { start: 0, length: limit }).catch(e => ({ error: e.message })),
-      bazarrGet('/api/movies/wanted', { start: 0, length: limit }).catch(e => ({ error: e.message }))
-    ]);
-    const epData = Array.isArray(epRes?.data) ? epRes.data : [];
-    const mvData = Array.isArray(mvRes?.data) ? mvRes.data : [];
-
-    const episodes = epData.map(e => ({
-      kind: 'episode',
-      bazarr_id: e.sonarrEpisodeId,
-      series_id: e.sonarrSeriesId,
-      title: e.seriesTitle,
-      episode_label: e.episode_number,
-      episode_title: e.episodeTitle,
-      missing_languages: (e.missing_subtitles || []).map(s => ({
-        code: s.code2 || s.code3, name: s.name, hi: !!s.hi, forced: !!s.forced
-      })),
-      failed_attempts: e.failedAttempts || null,
-      monitored: !!e.monitored,
-      scene_name: e.scene_name || null
-    }));
-    const movies = mvData.map(m => ({
-      kind: 'movie',
-      bazarr_id: m.radarrId,
-      title: m.title,
-      year: m.year,
-      missing_languages: (m.missing_subtitles || []).map(s => ({
-        code: s.code2 || s.code3, name: s.name, hi: !!s.hi, forced: !!s.forced
-      })),
-      failed_attempts: m.failedAttempts || null,
-      monitored: !!m.monitored,
-      scene_name: m.scene_name || null
-    }));
-
-    res.json({
-      episodes, movies,
-      total: episodes.length + movies.length,
-      episodesTotal: epRes?.total ?? episodes.length,
-      moviesTotal: mvRes?.total ?? movies.length,
-      epError: epRes?.error || null,
-      mvError: mvRes?.error || null
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.response?.data?.error || e.message });
-  }
-});
-
-// Tells Bazarr to rescan its libraries from disk. The "wanted/missing" list often goes stale
-// after users add subs manually or after the file layout changes — running this clears the
-// false-positive items (the user's "Bazarr says X is missing but I have subs" complaint).
-app.post('/api/bazarr/refresh', requireAdmin, async (req, res) => {
-  if (!config.bazarr.url || !config.bazarr.apiKey) return res.status(400).json({ error: 'Bazarr not configured' });
-  // Bazarr uses separate sync tasks per source (sonarr/radarr) plus disk-scan jobs. No single
-  // combined task exists, so we trigger several and report which succeeded.
-  const taskIds = ['update_series', 'update_movies', 'sync_episodes'];
-  const results = await Promise.all(taskIds.map(async (taskid) => {
-    try {
-      await axios.post(`${_bazarrBase()}/api/system/tasks`, null, {
-        params: { taskid },
-        headers: { 'X-API-KEY': config.bazarr.apiKey, Accept: 'application/json' },
-        timeout: 10000
-      });
-      return { taskid, ok: true };
-    } catch (e) {
-      return { taskid, ok: false, error: _bazarrErr(e) };
-    }
-  }));
-  const anyOk = results.some(r => r.ok);
-  if (!anyOk) return res.status(502).json({ error: results.map(r => `${r.taskid}: ${r.error}`).join('; ') });
-  settingsAudit(req.user?.username, 'bazarr', '*', 'refresh', `triggered ${results.filter(r=>r.ok).map(r=>r.taskid).join(',')}`);
-  res.json({ success: true, results });
-});
-
-// Pulls a human-readable error out of a Bazarr axios failure so the UI doesn't just see
-// "Internal Server Error". Bazarr surfaces validation errors as JSON, as plain text, or as
-// HTML depending on the route — handle all three.
-function _bazarrErr(e) {
-  const r = e.response;
-  if (!r) return e.message || 'Bazarr unreachable';
-  const body = r.data;
-  if (typeof body === 'string') return `Bazarr ${r.status}: ${body.slice(0, 200)}`;
-  if (body && typeof body === 'object') {
-    return `Bazarr ${r.status}: ${body.error || body.message || JSON.stringify(body).slice(0, 200)}`;
-  }
-  return `Bazarr ${r.status} ${r.statusText || ''}`.trim();
-}
-
-// Trigger Bazarr's "search missing subtitles" for a specific item. Bazarr does the rest
-// (searches enabled providers, downloads if a match is found). Bazarr's own PATCH route
-// reads the IDs from the *query string* (request.args) and the action name is the literal
-// string "search-missing" (NOT "search-missing-subtitles" — that's what the prior version
-// sent, which is why every call 500'd). Confirmed against bazarr/api/episodes + movies.
-app.post('/api/bazarr/search/:type/:id', requireAdmin, async (req, res) => {
-  const { type, id } = req.params;
-  if (!['episode','movie'].includes(type)) return res.status(400).json({ error: 'type must be episode or movie' });
-  if (!config.bazarr.url || !config.bazarr.apiKey) return res.status(400).json({ error: 'Bazarr not configured' });
-  const numericId = parseInt(id);
-  if (!Number.isFinite(numericId)) return res.status(400).json({ error: 'id must be numeric' });
-
-  const path = type === 'episode' ? '/api/episodes' : '/api/movies';
-  const idField = type === 'episode' ? 'episodeid' : 'radarrid';
-
-  // Bazarr's query parser is forgiving about list vs. scalar — it'll accept either a bare
-  // numeric ID or a JSON-encoded list. Try a JSON list first (the format Bazarr's own web UI
-  // sends, and what newer Sonarr/Radarr forks expect), then fall back to the bare integer.
-  const attempts = [
-    { [idField]: `[${numericId}]`, action: 'search-missing' },
-    { [idField]: String(numericId), action: 'search-missing' }
-  ];
-  let lastError = null;
-  for (const params of attempts) {
-    try {
-      await bazarrPatch(path, null, params);
-      settingsAudit(req.user?.username, 'bazarr', `${type}:${id}`, 'search', `triggered search-missing (params=${JSON.stringify(params)})`);
-      return res.json({ success: true });
-    } catch (e) { lastError = e; }
-  }
-  console.warn(`[BAZARR] search ${type}:${id} failed:`, _bazarrErr(lastError));
-  res.status(502).json({ error: _bazarrErr(lastError) });
-});
-
-app.post('/api/bazarr/search-all', requireAdmin, async (req, res) => {
-  if (!config.bazarr.url || !config.bazarr.apiKey) return res.status(400).json({ error: 'Bazarr not configured' });
-  // Bazarr schedules wanted-search as TWO separate jobs (one for movies, one for series).
-  // There's no combined "wanted_search_missing_subtitles" task id — sending that name 404'd
-  // the previous build. We trigger both and report on whichever fail.
-  const taskIds = ['wanted_search_missing_subtitles_movies', 'wanted_search_missing_subtitles_series'];
-  const results = await Promise.all(taskIds.map(async (taskid) => {
-    try {
-      await axios.post(`${_bazarrBase()}/api/system/tasks`, null, {
-        params: { taskid },
-        headers: { 'X-API-KEY': config.bazarr.apiKey, Accept: 'application/json' },
-        timeout: 10000
-      });
-      return { taskid, ok: true };
-    } catch (e) {
-      return { taskid, ok: false, error: _bazarrErr(e) };
-    }
-  }));
-  const fails = results.filter(r => !r.ok);
-  if (fails.length === results.length) {
-    return res.status(502).json({ error: fails.map(f => `${f.taskid}: ${f.error}`).join('; ') });
-  }
-  settingsAudit(req.user?.username, 'bazarr', '*', 'search-all', `triggered ${results.filter(r=>r.ok).map(r=>r.taskid).join(',')}`);
-  res.json({ success: true, results });
 });
 
 // ============================================
@@ -2963,22 +2337,6 @@ async function sendTelegramAlert(settings, alert) {
   }
 }
 
-// Generic one-way Telegram push (no buttons). Reuses the regional_settings bot token/chat that
-// the security alerts already use. Returns true on success. Used by the channel-exhaustion alert.
-async function sendTelegramMessage(text) {
-  const s = readRegionalSettings();
-  if (!s.telegram_bot_token || !s.telegram_chat_id) return false;
-  try {
-    await axios.post(`https://api.telegram.org/bot${s.telegram_bot_token}/sendMessage`, {
-      chat_id: s.telegram_chat_id, text, parse_mode: 'Markdown'
-    }, { timeout: 8000 });
-    return true;
-  } catch (e) {
-    console.warn('[LiveTV] Telegram exhaustion alert failed:', e.message);
-    return false;
-  }
-}
-
 async function editTelegramAlertResolution(settings, messageId, decisionText) {
   if (!settings.telegram_bot_token || !settings.telegram_chat_id || !messageId) return;
   try {
@@ -3212,22 +2570,100 @@ app.post('/api/security/telegram-webhook', async (req, res) => {
 // Migration: add new columns if missing
 try { pccDb.exec("ALTER TABLE auto_collection_settings ADD COLUMN seasonal_enabled INTEGER NOT NULL DEFAULT 1"); } catch(e) {}
 try { pccDb.exec("ALTER TABLE auto_collection_settings ADD COLUMN max_seasonal INTEGER NOT NULL DEFAULT 1"); } catch(e) {}
+try { pccDb.exec("ALTER TABLE auto_collection_settings ADD COLUMN push_user_ids TEXT DEFAULT NULL"); } catch(e) {}
+try { pccDb.exec("ALTER TABLE auto_collections ADD COLUMN for_tautulli_user TEXT DEFAULT NULL"); } catch(e) {}
+try { pccDb.exec("ALTER TABLE auto_collections ADD COLUMN for_user_name TEXT DEFAULT NULL"); } catch(e) {}
+
+// ── Continue Watching DB tables ───────────────────────────────────────────────
+pccDb.exec(`
+  CREATE TABLE IF NOT EXISTS cw_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id TEXT NOT NULL DEFAULT 'owner',
+    rating_key TEXT NOT NULL,
+    title TEXT,
+    show_title TEXT,
+    season_num INTEGER,
+    episode_num INTEGER,
+    year INTEGER,
+    item_type TEXT,
+    thumb TEXT,
+    view_offset INTEGER NOT NULL DEFAULT 0,
+    duration INTEGER NOT NULL DEFAULT 0,
+    last_viewed_at INTEGER,
+    first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_in_hub_at TEXT NOT NULL DEFAULT (datetime('now')),
+    restored_at TEXT,
+    restored_by TEXT,
+    UNIQUE(account_id, rating_key)
+  );
+  CREATE INDEX IF NOT EXISTS idx_cw_lastinhub ON cw_snapshots(last_in_hub_at);
+  CREATE TABLE IF NOT EXISTS cw_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled INTEGER NOT NULL DEFAULT 1,
+    interval_minutes INTEGER NOT NULL DEFAULT 15,
+    auto_restore INTEGER NOT NULL DEFAULT 0,
+    stale_after_hours INTEGER NOT NULL DEFAULT 6,
+    last_run TEXT,
+    last_snapshot_count INTEGER NOT NULL DEFAULT 0,
+    last_restore_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
+  );
+  INSERT OR IGNORE INTO cw_settings (id) VALUES (1);
+`);
+try { pccDb.exec("ALTER TABLE cw_snapshots ADD COLUMN grandparent_thumb TEXT"); } catch(e) {}
+try { pccDb.exec("ALTER TABLE cw_snapshots ADD COLUMN guid TEXT"); } catch(e) {}
+try { pccDb.exec("ALTER TABLE cw_settings ADD COLUMN snapshot_all_users INTEGER NOT NULL DEFAULT 0"); } catch(e) {}
 // Fix old default: max_collections 5 -> 3
 const curSettings = pccDb.prepare('SELECT max_collections FROM auto_collection_settings WHERE id = 1').get();
 if (curSettings && curSettings.max_collections === 5) {
   pccDb.prepare('UPDATE auto_collection_settings SET max_collections = 3 WHERE id = 1').run();
 }
 
+// Helper: parse push_user_ids JSON from a settings row
+function parsePushUserIds(settings) {
+  if (!settings) return [];
+  try { return JSON.parse(settings.push_user_ids || '[]'); } catch(e) { return []; }
+}
+
+// List users available for per-user collection targeting.
+// Sourced from Tautulli (the system that has per-user watch history we need for suggestions).
+app.get('/api/plex/collection-push-users', async (req, res) => {
+  try {
+    const users = [];
+    if (config.tautulli?.apiKey) {
+      const r = await axios.get(`${config.tautulli.url}/api/v2`, {
+        params: { apikey: config.tautulli.apiKey, cmd: 'get_users' },
+        timeout: 5000
+      });
+      const raw = r.data?.response?.data || [];
+      for (const u of raw) {
+        if (!u.user_id || u.user_id === 0) continue;
+        users.push({
+          id: String(u.user_id),
+          title: u.friendly_name || u.username || `User ${u.user_id}`,
+          kind: 'tautulli'
+        });
+      }
+    }
+    res.json({ users });
+  } catch(e) {
+    res.json({ users: [] });
+  }
+});
+
 // Get auto-collection settings
 app.get('/api/plex/collections/auto/settings', (req, res) => {
   const settings = pccDb.prepare('SELECT * FROM auto_collection_settings WHERE id = 1').get();
+  if (settings) settings.push_user_ids = parsePushUserIds(settings);
   const active = pccDb.prepare('SELECT * FROM auto_collections ORDER BY created_at DESC').all();
   res.json({ settings, active });
 });
 
 // Update auto-collection settings
 app.post('/api/plex/collections/auto/settings', (req, res) => {
-  const { enabled, interval_hours, duration_hours, max_collections, pin_to_home, seasonal_enabled, max_seasonal } = req.body;
+  const { enabled, interval_hours, duration_hours, max_collections, pin_to_home, seasonal_enabled, max_seasonal, push_user_ids } = req.body;
+  const pushUserIdsJson = push_user_ids !== undefined ? JSON.stringify(Array.isArray(push_user_ids) ? push_user_ids : []) : null;
   pccDb.prepare(`
     UPDATE auto_collection_settings SET
       enabled = COALESCE(?, enabled),
@@ -3236,11 +2672,13 @@ app.post('/api/plex/collections/auto/settings', (req, res) => {
       max_collections = COALESCE(?, max_collections),
       pin_to_home = COALESCE(?, pin_to_home),
       seasonal_enabled = COALESCE(?, seasonal_enabled),
-      max_seasonal = COALESCE(?, max_seasonal)
+      max_seasonal = COALESCE(?, max_seasonal),
+      push_user_ids = COALESCE(?, push_user_ids)
     WHERE id = 1
-  `).run(enabled ?? null, interval_hours ?? null, duration_hours ?? null, max_collections ?? null, pin_to_home ?? null, seasonal_enabled ?? null, max_seasonal ?? null);
+  `).run(enabled ?? null, interval_hours ?? null, duration_hours ?? null, max_collections ?? null, pin_to_home ?? null, seasonal_enabled ?? null, max_seasonal ?? null, pushUserIdsJson ?? null);
 
   const settings = pccDb.prepare('SELECT * FROM auto_collection_settings WHERE id = 1').get();
+  if (settings) settings.push_user_ids = parsePushUserIds(settings);
   // Restart timer if settings changed
   scheduleAutoCollections();
   res.json({ success: true, settings });
@@ -3285,23 +2723,121 @@ app.delete('/api/plex/collections/auto/:id', async (req, res) => {
   }
 });
 
+// Core: create one collection from a suggestion object.
+// forTautulliUser / forUserName are null for shared (seasonal) collections.
+async function createAutoCollection(sug, settings, machineId, globalDurationHours, forTautulliUser, forUserName, result) {
+  const libraryKey = sug.libraryKey;
+  const createType = sug.createType || 'genre';
+  const createValue = sug.createValue || '';
+  const durationHours = (sug.seasonal && sug.seasonalDurationHours) ? sug.seasonalDurationHours : globalDurationHours;
+
+  // Build the items query. Repeated genre= params let Plex AND-intersect server-side.
+  const andGenres = [
+    ...(Array.isArray(sug.extraGenres) ? sug.extraGenres : []),
+    ...(sug.intersectGenre ? [sug.intersectGenre] : [])
+  ].filter(Boolean);
+
+  const qs = new URLSearchParams();
+  qs.append('X-Plex-Token', config.plex.token);
+  if (createType === 'genre' || createType === 'seasonal') {
+    qs.append('genre', createValue);
+    for (const g of andGenres) qs.append('genre', g);
+  } else if (createType === 'actor') qs.append('actor', createValue);
+  else if (createType === 'director') qs.append('director', createValue);
+  else if (createType === 'studio') qs.append('studio', createValue);
+
+  const itemsRes = await axios.get(`${config.plex.url}/library/sections/${libraryKey}/all?${qs.toString()}`, {
+    headers: { 'Accept': 'application/json' }, timeout: 10000
+  });
+  let items = (itemsRes.data.MediaContainer.Metadata || []).slice(0, 150);
+  if (items.length === 0) {
+    if (andGenres.length) console.log(`[AutoCollections] "${sug.title}" — no items match [${[createValue, ...andGenres].join(', ')}], skipping`);
+    return false;
+  }
+
+  const plexType = await getLibraryType(libraryKey);
+  const firstUri = `server://${machineId}/com.plexapp.plugins.library/library/metadata/${items[0].ratingKey}`;
+
+  const cParams = new URLSearchParams();
+  cParams.append('X-Plex-Token', config.plex.token);
+  cParams.append('type', String(plexType));
+  cParams.append('title', sug.title);
+  cParams.append('smart', '0');
+  cParams.append('sectionId', String(libraryKey));
+  const summaryTag = sug.seasonal ? '[PCC-Seasonal]' : '[PCC-Auto]';
+  const summaryUser = forUserName ? ` User: ${forUserName}.` : '';
+  cParams.append('summary', `${summaryTag} Auto-created.${summaryUser} Expires after ${durationHours}h. Source: ${sug.sourceTitle || 'watch history'}`);
+  cParams.append('uri', firstUri);
+
+  const createRes = await axios.post(
+    `${config.plex.url}/library/collections?${cParams.toString()}`,
+    null,
+    { headers: { 'Accept': 'application/json' }, timeout: 15000 }
+  );
+
+  let plexKey = createRes.data?.MediaContainer?.Metadata?.[0]?.ratingKey;
+  if (!plexKey) {
+    try {
+      const colsRes = await axios.get(`${config.plex.url}/library/sections/${libraryKey}/collections`, {
+        params: { 'X-Plex-Token': config.plex.token },
+        headers: { 'Accept': 'application/json' }, timeout: 5000
+      });
+      const match = (colsRes.data.MediaContainer.Metadata || []).find(c => c.title === sug.title);
+      if (match) plexKey = match.ratingKey;
+    } catch(e) {}
+  }
+  if (!plexKey) {
+    result.errors.push({ title: sug.title, error: 'Created but could not find ratingKey' });
+    return false;
+  }
+
+  for (const item of items.slice(1)) {
+    try {
+      const addUri = `server://${machineId}/com.plexapp.plugins.library/library/metadata/${item.ratingKey}`;
+      await axios.put(
+        `${config.plex.url}/library/collections/${plexKey}/items?X-Plex-Token=${config.plex.token}&uri=${encodeURIComponent(addUri)}`,
+        null,
+        { headers: { 'Accept': 'application/json' }, timeout: 5000 }
+      );
+    } catch(e) {}
+  }
+
+  if (settings.pin_to_home) {
+    try {
+      await axios.post(`${config.plex.url}/hubs/sections/${libraryKey}/manage`, null, {
+        params: { 'X-Plex-Token': config.plex.token, metadataItemId: plexKey, promotedToOwnHome: 1, promotedToRecommended: 1, promotedToSharedHome: 1 },
+        headers: { 'Accept': 'application/json' }, timeout: 5000
+      });
+    } catch(e) {
+      result.errors.push({ title: sug.title, error: 'Pin failed: ' + e.message });
+    }
+  }
+
+  pccDb.prepare(`
+    INSERT INTO auto_collections (plex_key, library_key, title, create_type, create_value, source_title, pinned, duration_hours, expires_at, for_tautulli_user, for_user_name)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+' || ? || ' hours'), ?, ?)
+  `).run(String(plexKey), String(libraryKey), sug.title, createType, createValue, sug.sourceTitle || null, settings.pin_to_home ? 1 : 0, durationHours, durationHours, forTautulliUser || null, forUserName || null);
+
+  result.created.push({ title: sug.title, plexKey, expiresIn: `${durationHours}h`, seasonal: !!sug.seasonal, forUser: forUserName || null });
+  return true;
+}
+
 // Core: auto-create cycle
 async function runAutoCollectionCycle() {
   const settings = pccDb.prepare('SELECT * FROM auto_collection_settings WHERE id = 1').get();
+  const pushUserIds = parsePushUserIds(settings);
   const result = { created: [], expired: [], errors: [] };
 
   // Step 1: Clean up expired collections
   const expired = pccDb.prepare("SELECT * FROM auto_collections WHERE expires_at <= datetime('now')").all();
   for (const row of expired) {
     try {
-      // Unpin
       try {
         await axios.delete(`${config.plex.url}/hubs/sections/${row.library_key}/manage`, {
           params: { 'X-Plex-Token': config.plex.token, metadataItemId: row.plex_key },
           headers: { 'Accept': 'application/json' }, timeout: 5000
         });
       } catch(e) {}
-      // Delete from Plex
       await axios.delete(`${config.plex.url}/library/collections/${row.plex_key}`, {
         params: { 'X-Plex-Token': config.plex.token }, timeout: 5000
       });
@@ -3312,7 +2848,7 @@ async function runAutoCollectionCycle() {
     pccDb.prepare('DELETE FROM auto_collections WHERE id = ?').run(row.id);
   }
 
-  // Step 1b: Clean orphaned DB entries (Plex collection was deleted externally)
+  // Step 1b: Remove DB entries whose Plex collection was deleted externally
   const activeRows = pccDb.prepare("SELECT * FROM auto_collections WHERE expires_at > datetime('now')").all();
   for (const row of activeRows) {
     try {
@@ -3321,178 +2857,123 @@ async function runAutoCollectionCycle() {
         headers: { 'Accept': 'application/json' }, timeout: 3000
       });
     } catch(e) {
-      // Collection no longer exists in Plex — remove DB entry
       pccDb.prepare('DELETE FROM auto_collections WHERE id = ?').run(row.id);
       result.expired.push(`${row.title} (orphaned)`);
     }
   }
 
-  // Step 2: Count active (non-expired) auto-collections
-  const activeCount = pccDb.prepare("SELECT COUNT(*) as cnt FROM auto_collections WHERE expires_at > datetime('now')").get().cnt;
-  const slotsAvailable = (settings.max_collections || 5) - activeCount;
-
-  if (slotsAvailable <= 0) {
-    pccDb.prepare("UPDATE auto_collection_settings SET last_run = datetime('now') WHERE id = 1").run();
-    return { ...result, message: `Max collections reached (${activeCount}/${settings.max_collections})` };
-  }
-
-  // Step 3: Get fresh suggestions
-  let suggestions = [];
-  try {
-    // Call our own suggestions engine internally — uses the per-process internal token to
-    // satisfy requireAuth without going through a user session.
-    const sugResponse = await axios.post(`http://localhost:${PORT}/api/plex/collections/suggestions`, {}, {
-      timeout: 30000,
-      headers: { 'X-Internal-Token': INTERNAL_API_TOKEN }
-    });
-    suggestions = sugResponse.data || [];
-  } catch(e) {
-    result.errors.push({ error: 'Failed to get suggestions: ' + e.message });
-  }
-
-  // Filter out suggestions that already have active auto-collections or existing Plex collections
-  const activeTitles = new Set(
-    pccDb.prepare("SELECT title FROM auto_collections WHERE expires_at > datetime('now')").all().map(r => r.title)
-  );
-  // Also check existing Plex collections to avoid duplicates
-  let existingColTitles = new Set();
-  try {
-    const existingRes = await axios.get(`http://localhost:${PORT}/api/plex/collections`, {
-      timeout: 10000,
-      headers: { 'X-Internal-Token': INTERNAL_API_TOKEN }
-    });
-    existingColTitles = new Set((existingRes.data || []).map(c => c.title));
-  } catch(e) {}
-  suggestions = suggestions.filter(s => !activeTitles.has(s.title) && !existingColTitles.has(s.title));
-
-  // Step 4: Create new collections — respect seasonal toggle and slot limits
   const seasonalEnabled = settings.seasonal_enabled !== 0;
   const maxSeasonal = settings.max_seasonal || 1;
-  let seasonal = seasonalEnabled ? suggestions.filter(s => s.seasonal) : [];
-  const personal = suggestions.filter(s => !s.seasonal);
-  // Count how many active seasonal/personal we already have
-  const activeSeasonal = pccDb.prepare("SELECT COUNT(*) as cnt FROM auto_collections WHERE create_type = 'seasonal' AND expires_at > datetime('now')").get().cnt;
-  const seasonalSlots = Math.max(0, maxSeasonal - activeSeasonal);
-  seasonal.sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99));
-  seasonal = seasonal.slice(0, seasonalSlots);
-  const personalSlots = slotsAvailable - seasonal.length;
-  const toCreate = [...seasonal, ...personal.slice(0, Math.max(0, personalSlots))];
   const globalDurationHours = settings.duration_hours || 168;
   const machineId = await getPlexMachineId();
 
-  const createdTitles = new Set(); // Track titles created in this cycle to prevent dupes
-  for (const sug of toCreate) {
+  // Fetch existing Plex collection titles once to avoid creating duplicates
+  let existingColTitles = new Set();
+  try {
+    const existingRes = await axios.get(`http://localhost:${PORT}/api/plex/collections`, { timeout: 10000 });
+    existingColTitles = new Set((existingRes.data || []).map(c => c.title));
+  } catch(e) {}
+
+  if (pushUserIds.length > 0) {
+    // ── PER-USER MODE ──────────────────────────────────────────────────────
+    // Seasonal collections are shared (created once, visible to everyone).
+    // Personal collections are generated per-user from their own watch history.
+
+    // A) Seasonal — shared, created once
+    if (seasonalEnabled) {
+      let allSugs = [];
+      try {
+        const r = await axios.post(`http://localhost:${PORT}/api/plex/collections/suggestions`, {}, { timeout: 30000 });
+        allSugs = r.data || [];
+      } catch(e) { result.errors.push({ error: 'Seasonal suggestions failed: ' + e.message }); }
+
+      const activeSeasonal = pccDb.prepare("SELECT COUNT(*) as cnt FROM auto_collections WHERE create_type = 'seasonal' AND for_tautulli_user IS NULL AND expires_at > datetime('now')").get().cnt;
+      const seasonalSlots = Math.max(0, maxSeasonal - activeSeasonal);
+      const activeSeasonalTitles = new Set(pccDb.prepare("SELECT title FROM auto_collections WHERE create_type = 'seasonal' AND expires_at > datetime('now')").all().map(r => r.title));
+
+      let seasonalSugs = allSugs.filter(s => s.seasonal && !activeSeasonalTitles.has(s.title) && !existingColTitles.has(s.title));
+      seasonalSugs.sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99));
+      seasonalSugs = seasonalSugs.slice(0, seasonalSlots);
+
+      for (const sug of seasonalSugs) {
+        try { await createAutoCollection(sug, settings, machineId, globalDurationHours, null, null, result); } catch(e) { result.errors.push({ title: sug.title, error: e.message }); }
+      }
+    }
+
+    // B) Personal — one cycle per configured user
+    for (const tautulliUserId of pushUserIds) {
+      let userName = String(tautulliUserId);
+      try {
+        const uRes = await axios.get(`${config.tautulli.url}/api/v2`, {
+          params: { apikey: config.tautulli.apiKey, cmd: 'get_user', user_id: tautulliUserId },
+          timeout: 5000
+        });
+        userName = uRes.data?.response?.data?.friendly_name || uRes.data?.response?.data?.username || userName;
+      } catch(e) {}
+
+      const userActiveCount = pccDb.prepare("SELECT COUNT(*) as cnt FROM auto_collections WHERE for_tautulli_user = ? AND create_type != 'seasonal' AND expires_at > datetime('now')").get(String(tautulliUserId)).cnt;
+      const userSlots = (settings.max_collections || 3) - userActiveCount;
+      if (userSlots <= 0) { console.log(`[AutoCollections] ${userName}: personal slots full`); continue; }
+
+      let userSugs = [];
+      try {
+        const r = await axios.post(`http://localhost:${PORT}/api/plex/collections/suggestions`, { tautulliUserId }, { timeout: 30000 });
+        userSugs = (r.data || []).filter(s => !s.seasonal);
+      } catch(e) { result.errors.push({ error: `Suggestions for ${userName} failed: ` + e.message }); continue; }
+
+      const userActiveTitles = new Set(pccDb.prepare("SELECT title FROM auto_collections WHERE for_tautulli_user = ? AND expires_at > datetime('now')").all(String(tautulliUserId)).map(r => r.title));
+
+      // Title format: "Username: Collection Name" so collections are self-labelling in Plex
+      const toCreate = userSugs
+        .map(s => ({ ...s, title: `${userName}: ${s.title}` }))
+        .filter(s => !userActiveTitles.has(s.title) && !existingColTitles.has(s.title))
+        .slice(0, userSlots);
+
+      for (const sug of toCreate) {
+        try { await createAutoCollection(sug, settings, machineId, globalDurationHours, String(tautulliUserId), userName, result); } catch(e) { result.errors.push({ title: sug.title, error: e.message }); }
+      }
+    }
+
+  } else {
+    // ── GLOBAL MODE (original behaviour — no user targeting configured) ────
+    let suggestions = [];
     try {
-      // Skip if we already created a collection with this title in this cycle
-      if (createdTitles.has(sug.title)) continue;
-
-      const libraryKey = sug.libraryKey;
-      const createType = sug.createType || 'genre';
-      const createValue = sug.createValue || '';
-      // Seasonal collections use their own duration; personal uses global setting
-      const durationHours = (sug.seasonal && sug.seasonalDurationHours) ? sug.seasonalDurationHours : globalDurationHours;
-
-      // Build the items query. For multi-genre seasonal (e.g. "Movies for Mom" = Drama+Family)
-      // and "X & Y Mix" suggestions, we pass repeated `genre=` params so Plex AND-intersects
-      // server-side. Plex's section listing truncates the Genre array, so we cannot reliably
-      // post-filter from it — but the server-side query handles the intersection correctly.
-      const andGenres = [
-        ...(Array.isArray(sug.extraGenres) ? sug.extraGenres : []),
-        ...(sug.intersectGenre ? [sug.intersectGenre] : [])
-      ].filter(Boolean);
-
-      const qs = new URLSearchParams();
-      qs.append('X-Plex-Token', config.plex.token);
-      if (createType === 'genre' || createType === 'seasonal') {
-        qs.append('genre', createValue);
-        for (const g of andGenres) qs.append('genre', g);
-      } else if (createType === 'actor') qs.append('actor', createValue);
-      else if (createType === 'director') qs.append('director', createValue);
-      else if (createType === 'studio') qs.append('studio', createValue);
-
-      const itemsRes = await axios.get(`${config.plex.url}/library/sections/${libraryKey}/all?${qs.toString()}`, {
-        headers: { 'Accept': 'application/json' }, timeout: 10000
-      });
-      let items = (itemsRes.data.MediaContainer.Metadata || []).slice(0, 150);
-      if (items.length === 0) {
-        if (andGenres.length) console.log(`[AutoCollections] "${sug.title}" — no items match all of [${[createValue, ...andGenres].join(', ')}], skipping`);
-        continue;
-      }
-
-      const plexType = await getLibraryType(libraryKey);
-
-      // Create collection with first item, then add rest one by one
-      const firstUri = `server://${machineId}/com.plexapp.plugins.library/library/metadata/${items[0].ratingKey}`;
-      const cParams = new URLSearchParams();
-      cParams.append('X-Plex-Token', config.plex.token);
-      cParams.append('type', String(plexType));
-      cParams.append('title', sug.title);
-      cParams.append('smart', '0');
-      cParams.append('sectionId', String(libraryKey));
-      cParams.append('summary', `[PCC-Auto] Auto-created collection. Expires after ${durationHours}h. Source: ${sug.sourceTitle || 'watch history'}`);
-      cParams.append('uri', firstUri);
-
-      const createRes = await axios.post(
-        `${config.plex.url}/library/collections?${cParams.toString()}`,
-        null,
-        { headers: { 'Accept': 'application/json' }, timeout: 15000 }
-      );
-
-      // Find the new collection's ratingKey
-      const newColMeta = createRes.data?.MediaContainer?.Metadata?.[0];
-      let plexKey = newColMeta?.ratingKey;
-
-      // Fallback: search collections for matching title
-      if (!plexKey) {
-        try {
-          const colsRes = await axios.get(`${config.plex.url}/library/sections/${libraryKey}/collections`, {
-            params: { 'X-Plex-Token': config.plex.token },
-            headers: { 'Accept': 'application/json' }, timeout: 5000
-          });
-          const match = (colsRes.data.MediaContainer.Metadata || []).find(c => c.title === sug.title);
-          if (match) plexKey = match.ratingKey;
-        } catch(e) {}
-      }
-
-      if (!plexKey) {
-        result.errors.push({ title: sug.title, error: 'Created but could not find ratingKey' });
-        continue;
-      }
-
-      // Add remaining items one by one
-      for (const item of items.slice(1)) {
-        try {
-          const addUri = `server://${machineId}/com.plexapp.plugins.library/library/metadata/${item.ratingKey}`;
-          await axios.put(
-            `${config.plex.url}/library/collections/${plexKey}/items?X-Plex-Token=${config.plex.token}&uri=${encodeURIComponent(addUri)}`,
-            null,
-            { headers: { 'Accept': 'application/json' }, timeout: 5000 }
-          );
-        } catch(e) {}
-      }
-
-      // Pin to home if enabled
-      if (settings.pin_to_home) {
-        try {
-          await axios.post(`${config.plex.url}/hubs/sections/${libraryKey}/manage`, null, {
-            params: { 'X-Plex-Token': config.plex.token, metadataItemId: plexKey, promotedToOwnHome: 1, promotedToRecommended: 1, promotedToSharedHome: 1 },
-            headers: { 'Accept': 'application/json' }, timeout: 5000
-          });
-        } catch(e) {
-          result.errors.push({ title: sug.title, error: 'Pin failed: ' + e.message });
-        }
-      }
-
-      // Track in DB
-      pccDb.prepare(`
-        INSERT INTO auto_collections (plex_key, library_key, title, create_type, create_value, source_title, pinned, duration_hours, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+' || ? || ' hours'))
-      `).run(String(plexKey), String(libraryKey), sug.title, createType, createValue, sug.sourceTitle || null, settings.pin_to_home ? 1 : 0, durationHours, durationHours);
-
-      createdTitles.add(sug.title);
-      result.created.push({ title: sug.title, plexKey, expiresIn: `${durationHours}h`, seasonal: !!sug.seasonal });
+      const sugResponse = await axios.post(`http://localhost:${PORT}/api/plex/collections/suggestions`, {}, { timeout: 30000 });
+      suggestions = sugResponse.data || [];
     } catch(e) {
-      result.errors.push({ title: sug.title, error: e.message });
+      result.errors.push({ error: 'Failed to get suggestions: ' + e.message });
+    }
+
+    const activeTitles = new Set(
+      pccDb.prepare("SELECT title FROM auto_collections WHERE expires_at > datetime('now')").all().map(r => r.title)
+    );
+    suggestions = suggestions.filter(s => !activeTitles.has(s.title) && !existingColTitles.has(s.title));
+
+    const activeCount = pccDb.prepare("SELECT COUNT(*) as cnt FROM auto_collections WHERE expires_at > datetime('now')").get().cnt;
+    const slotsAvailable = (settings.max_collections || 3) - activeCount;
+
+    if (slotsAvailable <= 0) {
+      pccDb.prepare("UPDATE auto_collection_settings SET last_run = datetime('now') WHERE id = 1").run();
+      return { ...result, message: `Max collections reached (${activeCount}/${settings.max_collections})` };
+    }
+
+    let seasonal = seasonalEnabled ? suggestions.filter(s => s.seasonal) : [];
+    const personal = suggestions.filter(s => !s.seasonal);
+    const activeSeasonal = pccDb.prepare("SELECT COUNT(*) as cnt FROM auto_collections WHERE create_type = 'seasonal' AND expires_at > datetime('now')").get().cnt;
+    seasonal.sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99));
+    seasonal = seasonal.slice(0, Math.max(0, maxSeasonal - activeSeasonal));
+    const personalSlots = slotsAvailable - seasonal.length;
+    const toCreate = [...seasonal, ...personal.slice(0, Math.max(0, personalSlots))];
+
+    const createdTitles = new Set();
+    for (const sug of toCreate) {
+      if (createdTitles.has(sug.title)) continue;
+      try {
+        const ok = await createAutoCollection(sug, settings, machineId, globalDurationHours, null, null, result);
+        if (ok) createdTitles.add(sug.title);
+      } catch(e) {
+        result.errors.push({ title: sug.title, error: e.message });
+      }
     }
   }
 
@@ -3527,139 +3008,75 @@ function scheduleAutoCollections() {
 setTimeout(() => scheduleAutoCollections(), 5000);
 
 // ============================================
-// CONTINUE WATCHING SNAPSHOTTER + RESTORER
+// CONTINUE WATCHING RESTORE SYSTEM
 // ============================================
 
-// ============================================
-// Multi-user support for Continue Watching
-// ============================================
-// Plex stores onDeck / viewOffset state PER ACCOUNT, so snapshotting or restoring another user's
-// Continue Watching requires talking to Plex AS that user (with their token). For Plex Home /
-// managed users the owner can mint a per-user token via the Home "switch" API. External shared
-// friends are NOT Home members and have no obtainable token, so they are intentionally out of
-// scope — only Home users appear. Per the design decision, user tokens are minted FRESH on demand
-// and never persisted.
 const PCC_CW_CLIENT_ID = 'pcc-continue-watching-restore';
 
-// The owner/admin account context. account_id stays 'owner' to keep the original single-user rows.
 function _cwOwnerAccount() {
   return { id: 'owner', token: config.plex.token, title: 'Owner', kind: 'owner' };
 }
 
-// List the Plex Home users (owner + managed profiles) via plex.tv. Short in-memory cache so the
-// snapshotter and the UI don't hammer plex.tv. Returns the raw v2 user objects.
 let _cwHomeUsersCache = { at: 0, data: null };
 async function cwFetchHomeUsers(force = false) {
   if (!config.plex.token) throw new Error('Plex not configured');
-  if (!force && _cwHomeUsersCache.data && (Date.now() - _cwHomeUsersCache.at) < 60000) {
-    return _cwHomeUsersCache.data;
-  }
+  if (!force && _cwHomeUsersCache.data && (Date.now() - _cwHomeUsersCache.at) < 60000) return _cwHomeUsersCache.data;
   const r = await axios.get('https://plex.tv/api/v2/home/users', {
     params: { 'X-Plex-Token': config.plex.token },
-    headers: {
-      Accept: 'application/json',
-      'X-Plex-Client-Identifier': PCC_CW_CLIENT_ID,
-      'X-Plex-Product': 'Plex Command Center'
-    },
+    headers: { Accept: 'application/json', 'X-Plex-Client-Identifier': PCC_CW_CLIENT_ID, 'X-Plex-Product': 'Plex Command Center' },
     timeout: 12000
   });
-  // v2 shape: { id, name, ..., users: [ {id, uuid, title, username, admin, restricted, protected, ...} ] }
   const users = Array.isArray(r.data?.users) ? r.data.users : [];
   _cwHomeUsersCache = { at: Date.now(), data: users };
   return users;
 }
 
-// Mint a fresh plex.tv token for a Home user via the switch API. Tries the v2 JSON endpoint
-// (keyed by uuid) first, falls back to the legacy v1 XML endpoint (keyed by numeric id). Note:
-// this returns a plex.tv ACCOUNT token, which the local PMS rejects on its own — it must then be
-// exchanged for a per-server access token via _cwServerAccessToken (see _cwResolveAccount).
-// PIN-protected profiles (`user.protected`) require a valid `pin`; without one Plex returns 401,
-// which we surface as PIN_REQUIRED so the UI can prompt. A 401 for a NON-protected user is a real
-// error (never masked as a PIN prompt).
 async function cwSwitchUserToken(user, pin) {
   const params = { 'X-Plex-Token': config.plex.token };
   if (pin) params.pin = pin;
-  const headers = {
-    Accept: 'application/json',
-    'X-Plex-Client-Identifier': PCC_CW_CLIENT_ID,
-    'X-Plex-Product': 'Plex Command Center'
-  };
+  const headers = { Accept: 'application/json', 'X-Plex-Client-Identifier': PCC_CW_CLIENT_ID, 'X-Plex-Product': 'Plex Command Center' };
   const classifyErr = (e) => {
-    if ((e.response?.status === 401 || e.response?.status === 403) && user.protected) {
+    if ((e.response?.status === 401 || e.response?.status === 403) && user.protected)
       return Object.assign(new Error('This profile is PIN-protected — enter its Plex Home PIN to act as this user.'), { code: 'PIN_REQUIRED' });
-    }
     return e;
   };
   let v2Err = null;
   try {
-    const r = await axios.post(`https://plex.tv/api/v2/home/users/${user.uuid}/switch`, null, {
-      params, headers, timeout: 12000
-    });
+    const r = await axios.post(`https://plex.tv/api/v2/home/users/${user.uuid}/switch`, null, { params, headers, timeout: 12000 });
     const tok = r.data?.authToken || r.data?.authenticationToken;
     if (tok) return tok;
-    // Some plex.tv builds return the switched user object without the token on v2 — fall through.
-  } catch (e) {
-    v2Err = classifyErr(e);
-    if (v2Err.code === 'PIN_REQUIRED') throw v2Err;
-    // otherwise fall through to the v1 fallback
-  }
-  // Legacy v1 XML endpoint keyed by numeric id; returns authenticationToken="..." attribute.
+  } catch (e) { v2Err = classifyErr(e); if (v2Err.code === 'PIN_REQUIRED') throw v2Err; }
   try {
-    const r2 = await axios.post(`https://plex.tv/api/home/users/${user.id}/switch`, null, {
-      params, headers: { ...headers, Accept: 'application/xml' }, timeout: 12000
-    });
+    const r2 = await axios.post(`https://plex.tv/api/home/users/${user.id}/switch`, null, { params, headers: { ...headers, Accept: 'application/xml' }, timeout: 12000 });
     const xml = typeof r2.data === 'string' ? r2.data : '';
     const m = xml.match(/authenticationToken="([^"]+)"/);
     if (m && m[1]) return m[1];
-  } catch (e) {
-    const err = classifyErr(e);
-    throw err;
-  }
+  } catch (e) { throw classifyErr(e); }
   throw v2Err || new Error('Plex did not return a token for this Home user');
 }
 
-// The local PMS's machineIdentifier (clientIdentifier in plex.tv resources). Cached for the
-// process — it never changes for a given server. Used to pick the right server's access token
-// out of a user's resource list.
 let _cwServerMachineId = null;
 async function _cwGetServerMachineId() {
   if (_cwServerMachineId) return _cwServerMachineId;
-  const r = await axios.get(`${config.plex.url}/identity`, {
-    params: { 'X-Plex-Token': config.plex.token },
-    headers: { Accept: 'application/json' },
-    timeout: 8000
-  });
+  const r = await axios.get(`${config.plex.url}/identity`, { params: { 'X-Plex-Token': config.plex.token }, headers: { Accept: 'application/json' }, timeout: 8000 });
   _cwServerMachineId = r.data?.MediaContainer?.machineIdentifier || null;
   if (!_cwServerMachineId) throw new Error('Could not determine Plex server machineIdentifier');
   return _cwServerMachineId;
 }
 
-// Exchange a user's plex.tv token for THIS server's per-user access token. A plex.tv account token
-// (e.g. from the Home switch) is not accepted by the PMS directly — the server returns 401. The
-// server-scoped accessToken lives in the user's plex.tv resource list, keyed by clientIdentifier.
 async function _cwServerAccessToken(userPlexToken) {
   const machineId = await _cwGetServerMachineId();
   const r = await axios.get('https://plex.tv/api/v2/resources', {
     params: { 'X-Plex-Token': userPlexToken, includeHttps: 1 },
-    headers: {
-      Accept: 'application/json',
-      'X-Plex-Client-Identifier': PCC_CW_CLIENT_ID,
-      'X-Plex-Product': 'Plex Command Center'
-    },
+    headers: { Accept: 'application/json', 'X-Plex-Client-Identifier': PCC_CW_CLIENT_ID, 'X-Plex-Product': 'Plex Command Center' },
     timeout: 12000
   });
   const resources = Array.isArray(r.data) ? r.data : [];
   const srv = resources.find(x => x.clientIdentifier === machineId);
-  if (!srv || !srv.accessToken) {
-    throw new Error('This Plex Home user does not have access to this server (no access token issued)');
-  }
+  if (!srv || !srv.accessToken) throw new Error('This Plex Home user does not have access to this server');
   return srv.accessToken;
 }
 
-// Resolve an account selector (from ?account= / body.account) to a usable context {id, token,
-// title, kind}. 'owner' / empty → owner token. Anything else is a Home user uuid|id: the admin
-// entry maps back to 'owner' (shared rows); other Home users get a freshly-minted token, then
-// exchanged for this server's per-user access token (the PMS rejects raw plex.tv tokens).
 async function _cwResolveAccount(accountId, pin) {
   if (!accountId || accountId === 'owner') return _cwOwnerAccount();
   const users = await cwFetchHomeUsers();
@@ -3675,109 +3092,59 @@ async function _cwFetchOnDeck(token = config.plex.token) {
   if (!config.plex.url || !token) throw new Error('Plex not configured');
   const r = await axios.get(`${config.plex.url}/library/onDeck`, {
     params: { 'X-Plex-Token': token },
-    // Plex's onDeck defaults to a small page (~20). Ask for up to 200 explicitly so users with
-    // a lot of in-progress content don't silently miss items.
-    headers: {
-      Accept: 'application/json',
-      'X-Plex-Container-Start': '0',
-      'X-Plex-Container-Size': '200'
-    },
+    headers: { Accept: 'application/json', 'X-Plex-Container-Start': '0', 'X-Plex-Container-Size': '200' },
     timeout: 15000
   });
   return r.data?.MediaContainer?.Metadata || [];
 }
 
-// Fetch a single item's current Plex metadata. Used to detect items that have been watched
-// (viewCount > 0) or deleted (404), so we can prune them from the snapshots.
 async function _cwFetchMetadata(ratingKey, token = config.plex.token) {
   try {
-    const r = await axios.get(`${config.plex.url}/library/metadata/${ratingKey}`, {
-      params: { 'X-Plex-Token': token },
-      headers: { Accept: 'application/json' },
-      timeout: 10000
-    });
+    const r = await axios.get(`${config.plex.url}/library/metadata/${ratingKey}`, { params: { 'X-Plex-Token': token }, headers: { Accept: 'application/json' }, timeout: 10000 });
     const md = r.data?.MediaContainer?.Metadata?.[0];
     if (!md) return { gone: true };
-    return {
-      viewCount: Number(md.viewCount) || 0,
-      viewOffset: Number(md.viewOffset) || 0,
-      duration: Number(md.duration) || 0,
-      lastViewedAt: Number(md.lastViewedAt) || 0,
-      type: md.type || null,
-      title: md.title || null,
-      guid: md.guid || null
-    };
-  } catch (e) {
-    if (e.response?.status === 404) return { gone: true };
-    return { error: e.message };
-  }
+    return { viewCount: Number(md.viewCount) || 0, viewOffset: Number(md.viewOffset) || 0, duration: Number(md.duration) || 0, lastViewedAt: Number(md.lastViewedAt) || 0, type: md.type || null, title: md.title || null, guid: md.guid || null };
+  } catch (e) { return e.response?.status === 404 ? { gone: true } : { error: e.message }; }
 }
 
-// Look up the CURRENT ratingKey for a stable Plex guid (e.g. plex://episode/abc123). Used to
-// recover snapshots whose numeric ratingKey was reassigned by a library rescan. Returns the live
-// item ({ ratingKey, thumb, grandparentThumb, type }) or null if not found / not searchable.
 async function _cwResolveByGuid(guid, token = config.plex.token) {
   if (!guid || !config.plex.url || !token) return null;
   try {
-    const r = await axios.get(`${config.plex.url}/library/all`, {
-      params: { 'X-Plex-Token': token, guid },
-      headers: { Accept: 'application/json' },
-      timeout: 10000
-    });
+    const r = await axios.get(`${config.plex.url}/library/all`, { params: { 'X-Plex-Token': token, guid }, headers: { Accept: 'application/json' }, timeout: 10000 });
     const m = r.data?.MediaContainer?.Metadata?.[0];
     if (!m) return null;
     return { ratingKey: String(m.ratingKey), thumb: m.thumb || null, grandparentThumb: m.grandparentThumb || null, type: m.type || null };
-  } catch (e) {
-    return null;
-  }
+  } catch (e) { return null; }
 }
 
-// A snapshot row is "stale" when its stored ratingKey no longer resolves to the same content —
-// either the item is gone, its type is no longer a playable movie/episode (key reassigned to a
-// season/clip/show), or its guid changed. Used to prune the list and to gate restores.
 function _cwMetaIsStale(snap, md) {
-  if (!md || md.error) return false;          // transient error — don't treat as stale
+  if (!md || md.error) return false;
   if (md.gone) return true;
   if (md.type && md.type !== 'movie' && md.type !== 'episode') return true;
   if (snap.guid && md.guid && md.guid !== snap.guid) return true;
   return false;
 }
 
-// For every snapshot row that is NOT currently in Plex's onDeck, check its real metadata. If
-// it's been fully watched (viewCount>0 AND viewOffset cleared) OR the item was deleted from
-// the library, drop it from the snapshots — otherwise it pollutes the "missing" list with
-// items the user has actually finished. Returns counts for logging.
 async function _cwPruneCompleted(liveKeys, account = _cwOwnerAccount()) {
   const acctId = account.id, token = account.token;
-  const missing = pccDb.prepare(`
-    SELECT rating_key, guid FROM cw_snapshots WHERE account_id = ?
-  `).all(acctId).filter(r => !liveKeys.has(r.rating_key));
+  const missing = pccDb.prepare('SELECT rating_key, guid FROM cw_snapshots WHERE account_id = ?').all(acctId).filter(r => !liveKeys.has(r.rating_key));
   if (!missing.length) return { checked: 0, pruned: 0, healed: 0 };
-
   let pruned = 0, healed = 0;
-  const del = pccDb.prepare("DELETE FROM cw_snapshots WHERE account_id = ? AND rating_key = ?");
-  const heal = pccDb.prepare("UPDATE cw_snapshots SET rating_key = ?, thumb = ?, grandparent_thumb = ? WHERE account_id = ? AND rating_key = ?");
-  // Lightly throttled: 5 concurrent metadata fetches at a time.
+  const del = pccDb.prepare('DELETE FROM cw_snapshots WHERE account_id = ? AND rating_key = ?');
+  const heal = pccDb.prepare('UPDATE cw_snapshots SET rating_key = ?, thumb = ?, grandparent_thumb = ? WHERE account_id = ? AND rating_key = ?');
   for (let i = 0; i < missing.length; i += 5) {
     const batch = missing.slice(i, i + 5);
-    const results = await Promise.all(batch.map(async (snap) => ({ snap, md: await _cwFetchMetadata(snap.rating_key, token) })));
+    const results = await Promise.all(batch.map(async snap => ({ snap, md: await _cwFetchMetadata(snap.rating_key, token) })));
     for (const { snap, md } of results) {
-      if (!md || md.error) continue; // transient Plex error — try again next cycle
+      if (!md || md.error) continue;
       const rk = snap.rating_key;
-      // Treat as completed when: explicitly viewed and no significant remaining progress, OR
-      // the item is gone from Plex entirely. Some Plex versions clear viewOffset to 0 after
-      // a finish; others leave it unset. A viewCount>0 with viewOffset under 30s is a safe
-      // "watched it" signal.
       const watched = md.gone || (md.viewCount > 0 && md.viewOffset < 30000);
       if (watched) { del.run(acctId, rk); pruned++; continue; }
-      // Stale: the numeric ratingKey was reassigned (now a season/clip, or guid changed). If we
-      // know the guid, re-resolve the current key and heal the row; otherwise drop it so it stops
-      // showing a wrong cover and failing to restore.
       if (_cwMetaIsStale(snap, md)) {
         const resolved = snap.guid ? await _cwResolveByGuid(snap.guid, token) : null;
         if (resolved && resolved.ratingKey && resolved.ratingKey !== rk && !liveKeys.has(resolved.ratingKey)) {
           try { heal.run(resolved.ratingKey, resolved.thumb, resolved.grandparentThumb, acctId, rk); healed++; }
-          catch (e) { del.run(acctId, rk); pruned++; } // UNIQUE collision etc — safe to drop
+          catch (e) { del.run(acctId, rk); pruned++; }
         } else { del.run(acctId, rk); pruned++; }
       }
     }
@@ -3785,97 +3152,51 @@ async function _cwPruneCompleted(liveKeys, account = _cwOwnerAccount()) {
   return { checked: missing.length, pruned, healed };
 }
 
-// Walks every TV-show and Movie library and returns items with viewOffset > 0. Used by the
-// deep-scan path because Plex's /library/onDeck endpoint silently caps its response and ages
-// items out — that's exactly the failure mode the user reports as "Fallout/Sleepy Hollow/etc.
-// not showing up". Shape mirrors what _cwFetchOnDeck returns so downstream code is the same.
 async function _cwFetchAllInProgress(token = config.plex.token) {
   if (!config.plex.url || !token) throw new Error('Plex not configured');
-  const sec = await axios.get(`${config.plex.url}/library/sections`, {
-    params: { 'X-Plex-Token': token },
-    headers: { Accept: 'application/json' },
-    timeout: 15000
-  });
+  const sec = await axios.get(`${config.plex.url}/library/sections`, { params: { 'X-Plex-Token': token }, headers: { Accept: 'application/json' }, timeout: 15000 });
   const sections = sec.data?.MediaContainer?.Directory || [];
   const out = [];
   for (const s of sections) {
-    // movie=1, show=2 → walk episodes (type=4) for shows so we get per-episode viewOffset.
-    const isMovie = s.type === 'movie';
-    const isShow  = s.type === 'show';
+    const isMovie = s.type === 'movie', isShow = s.type === 'show';
     if (!isMovie && !isShow) continue;
     try {
       const r = await axios.get(`${config.plex.url}/library/sections/${s.key}/all`, {
-        params: {
-          'X-Plex-Token': token,
-          ...(isShow ? { type: 4 } : {}) // episodes for show libs
-        },
-        headers: {
-          Accept: 'application/json',
-          'X-Plex-Container-Start': '0',
-          'X-Plex-Container-Size': '5000'
-        },
+        params: { 'X-Plex-Token': token, ...(isShow ? { type: 4 } : {}) },
+        headers: { Accept: 'application/json', 'X-Plex-Container-Start': '0', 'X-Plex-Container-Size': '5000' },
         timeout: 30000
       });
-      const items = r.data?.MediaContainer?.Metadata || [];
-      for (const it of items) {
-        if ((Number(it.viewOffset) || 0) > 0) out.push(it);
-      }
-    } catch (e) {
-      console.warn(`[CW] Deep-scan library ${s.key} (${s.title}) failed:`, e.message);
-    }
+      for (const it of r.data?.MediaContainer?.Metadata || []) { if ((Number(it.viewOffset) || 0) > 0) out.push(it); }
+    } catch (e) { console.warn(`[CW] Deep-scan library ${s.key} failed:`, e.message); }
   }
   return out;
 }
 
-// Snapshot: upsert all live onDeck items with viewOffset>0. Items whose ratingKey is no
-// longer in the live response stay in the table — that's how we detect "missing" items.
 async function cwSnapshot(deep = false, account = _cwOwnerAccount()) {
   const items = deep ? await _cwFetchAllInProgress(account.token) : await _cwFetchOnDeck(account.token);
-  const now = new Date().toISOString();
   let saved = 0;
   const upsert = pccDb.prepare(`
-    INSERT INTO cw_snapshots
-      (account_id, rating_key, title, show_title, season_num, episode_num, year, item_type, thumb, grandparent_thumb, guid, view_offset, duration, last_viewed_at, last_seen_at, last_in_hub_at)
+    INSERT INTO cw_snapshots (account_id, rating_key, title, show_title, season_num, episode_num, year, item_type, thumb, grandparent_thumb, guid, view_offset, duration, last_viewed_at, last_seen_at, last_in_hub_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
     ON CONFLICT(account_id, rating_key) DO UPDATE SET
-      title = excluded.title,
-      show_title = excluded.show_title,
-      season_num = excluded.season_num,
-      episode_num = excluded.episode_num,
-      year = excluded.year,
-      item_type = excluded.item_type,
-      thumb = excluded.thumb,
-      grandparent_thumb = excluded.grandparent_thumb,
-      guid = excluded.guid,
-      view_offset = excluded.view_offset,
-      duration = excluded.duration,
-      last_viewed_at = excluded.last_viewed_at,
-      last_seen_at = datetime('now'),
-      last_in_hub_at = datetime('now')
+      title=excluded.title, show_title=excluded.show_title, season_num=excluded.season_num,
+      episode_num=excluded.episode_num, year=excluded.year, item_type=excluded.item_type,
+      thumb=excluded.thumb, grandparent_thumb=excluded.grandparent_thumb, guid=excluded.guid,
+      view_offset=excluded.view_offset, duration=excluded.duration, last_viewed_at=excluded.last_viewed_at,
+      last_seen_at=datetime('now'), last_in_hub_at=datetime('now')
   `);
   const tx = pccDb.transaction((rows) => {
     for (const it of rows) {
-      // Skip items with no progress — next-up episodes naturally re-appear once the prior
-      // episode is watched, no restore needed.
       const offset = Number(it.viewOffset) || 0;
       if (offset <= 0) continue;
       const isEp = it.type === 'episode';
-      upsert.run(
-        account.id,
-        String(it.ratingKey),
-        it.title || null,
+      upsert.run(account.id, String(it.ratingKey), it.title || null,
         isEp ? (it.grandparentTitle || it.parentTitle || null) : null,
         isEp ? (Number.isFinite(it.parentIndex) ? it.parentIndex : null) : null,
         isEp ? (Number.isFinite(it.index) ? it.index : null) : null,
-        Number.isFinite(it.year) ? it.year : null,
-        it.type || null,
-        it.thumb || null,
-        isEp ? (it.grandparentThumb || null) : null,
-        it.guid || null,
-        offset,
-        Number(it.duration) || 0,
-        Number(it.lastViewedAt) || null
-      );
+        Number.isFinite(it.year) ? it.year : null, it.type || null,
+        it.thumb || null, isEp ? (it.grandparentThumb || null) : null, it.guid || null,
+        offset, Number(it.duration) || 0, Number(it.lastViewedAt) || null);
       saved++;
     }
   });
@@ -3883,128 +3204,63 @@ async function cwSnapshot(deep = false, account = _cwOwnerAccount()) {
   return { fetched: items.length, saved };
 }
 
-// Push a single stopped /:/timeline event. This is what a mobile client sends when it stops
-// playback; it carries an X-Plex-Client-Identifier (Plex 400s without one) so the event is
-// attributed to a "client" in Plex's session list / Tautulli history. Used as a secondary
-// nudge to refresh lastViewedAt after /:/progress sets the offset.
 async function _cwPushTimeline(snap, token = config.plex.token) {
   await axios.get(`${config.plex.url}/:/timeline`, {
-    params: {
-      ratingKey: snap.rating_key,
-      key: `/library/metadata/${snap.rating_key}`,
-      identifier: 'com.plexapp.plugins.library',
-      state: 'stopped',
-      time: snap.view_offset,
-      duration: snap.duration || (snap.view_offset + 1),
-      'X-Plex-Token': token,
-      'X-Plex-Client-Identifier': 'pcc-cw-restore',
-      'X-Plex-Product': 'Plex Command Center',
-      'X-Plex-Version': '4.0.5',
-      'X-Plex-Device-Name': 'PCC Continue-Watching Restore',
-      'X-Plex-Platform': 'PCC'
-    },
-    headers: { Accept: 'application/json' },
-    timeout: 10000
+    params: { ratingKey: snap.rating_key, key: `/library/metadata/${snap.rating_key}`, identifier: 'com.plexapp.plugins.library', state: 'stopped', time: snap.view_offset, duration: snap.duration || (snap.view_offset + 1), 'X-Plex-Token': token, 'X-Plex-Client-Identifier': 'pcc-cw-restore', 'X-Plex-Product': 'Plex Command Center', 'X-Plex-Version': '4.0.5', 'X-Plex-Device-Name': 'PCC Continue-Watching Restore', 'X-Plex-Platform': 'PCC' },
+    headers: { Accept: 'application/json' }, timeout: 10000
   });
 }
 
-// Restore one item so it reappears in Plex's Continue Watching hub. The previous build used a
-// lone /:/timeline `stopped` event, which Plex silently drops when there's no live play session
-// behind the client id — the call returned 200 but viewOffset never changed (the "restore does
-// nothing" symptom). /:/progress writes the view offset directly (same shape as the working
-// /:/scrobble call) and does not depend on a session. We push that, then VERIFY by re-reading the
-// item's metadata so the result reflects what Plex actually stored rather than just "request sent".
 async function cwRestoreItem(ratingKey, actor, account = _cwOwnerAccount()) {
   const acctId = account.id, token = account.token;
-  const snap = pccDb.prepare("SELECT * FROM cw_snapshots WHERE account_id = ? AND rating_key = ?").get(acctId, String(ratingKey));
+  const snap = pccDb.prepare('SELECT * FROM cw_snapshots WHERE account_id = ? AND rating_key = ?').get(acctId, String(ratingKey));
   if (!snap) return { ok: false, error: 'No snapshot for this item' };
   if (!snap.view_offset || snap.view_offset <= 0) return { ok: false, error: 'Snapshot has no progress to restore' };
   if (!config.plex.url || !token) return { ok: false, error: 'Plex not configured' };
 
-  // Guard against stale/reassigned ratingKeys. Plex reassigns numeric keys on a library rescan,
-  // leaving the snapshot pointing at an unrelated item (a season, a behind-the-scenes clip…).
-  // Verify the stored key still resolves to our content; if stale, re-resolve the CURRENT key by
-  // guid and heal the row — never push progress to whatever item now occupies the old key.
-  // (Metadata is read with the owner token; it's library-global and the user token may lack scope.)
   let targetKey = String(snap.rating_key);
   const pre = await _cwFetchMetadata(targetKey);
   if (_cwMetaIsStale(snap, pre)) {
     const resolved = snap.guid ? await _cwResolveByGuid(snap.guid) : null;
     if (resolved && resolved.ratingKey) {
-      try {
-        pccDb.prepare("UPDATE cw_snapshots SET rating_key = ?, thumb = ?, grandparent_thumb = ? WHERE account_id = ? AND rating_key = ?")
-          .run(resolved.ratingKey, resolved.thumb, resolved.grandparentThumb, acctId, targetKey);
-      } catch (e) { /* UNIQUE collision with an existing row — fall through and push on resolved key */ }
+      try { pccDb.prepare('UPDATE cw_snapshots SET rating_key = ?, thumb = ?, grandparent_thumb = ? WHERE account_id = ? AND rating_key = ?').run(resolved.ratingKey, resolved.thumb, resolved.grandparentThumb, acctId, targetKey); } catch (e) {}
       targetKey = resolved.ratingKey;
     } else {
-      pccDb.prepare("DELETE FROM cw_snapshots WHERE account_id = ? AND rating_key = ?").run(acctId, targetKey);
-      return { ok: false, error: "This item's Plex ID was reassigned by a library rescan and couldn't be re-matched — removed from the list. Re-snapshot to track it under its new ID." };
+      pccDb.prepare('DELETE FROM cw_snapshots WHERE account_id = ? AND rating_key = ?').run(acctId, targetKey);
+      return { ok: false, error: "This item's Plex ID was reassigned and couldn't be re-matched — removed. Re-snapshot to track it under its new ID." };
     }
   }
 
-  // Push targets the (possibly re-resolved) live key. _cwPushTimeline reads rating_key/view_offset/duration.
   const pushSnap = { rating_key: targetKey, view_offset: snap.view_offset, duration: snap.duration };
-
-  // Both pushes are best-effort and independent — verification below is the source of truth, so
-  // a failure of either (e.g. an older Plex without /:/progress) doesn't abort the restore.
   let pushErr = null, pushedAny = false;
   try {
-    // Primary: /:/progress sets the partial view offset directly and reliably. Pushed with the
-    // TARGET user's token so the offset lands on their account, not the owner's.
-    await axios.get(`${config.plex.url}/:/progress`, {
-      params: {
-        key: targetKey,
-        identifier: 'com.plexapp.plugins.library',
-        time: snap.view_offset,
-        state: 'stopped',
-        'X-Plex-Token': token
-      },
-      headers: { Accept: 'application/json' },
-      timeout: 10000
-    });
+    await axios.get(`${config.plex.url}/:/progress`, { params: { key: targetKey, identifier: 'com.plexapp.plugins.library', time: snap.view_offset, state: 'stopped', 'X-Plex-Token': token }, headers: { Accept: 'application/json' }, timeout: 10000 });
     pushedAny = true;
   } catch (e) { pushErr = e; }
-  // Secondary: a stopped-timeline event (also bumps lastViewedAt for hub ordering).
   try { await _cwPushTimeline(pushSnap, token); pushedAny = true; } catch (e) { if (!pushErr) pushErr = e; }
 
   try {
-    // Verify against Plex's actual stored state for THIS user (viewOffset is per-account, so the
-    // read must use the user's token). Plex may clamp/round the offset slightly, so accept
-    // anything within 5s of the target (or a non-zero offset where we expected one).
     const after = await _cwFetchMetadata(targetKey, token);
     const plexOffset = after && !after.gone && !after.error ? Number(after.viewOffset) || 0 : 0;
     const applied = !after?.error && !after?.gone && (Math.abs(plexOffset - snap.view_offset) <= 5000 || plexOffset > 0);
-
     if (applied) {
-      pccDb.prepare("UPDATE cw_snapshots SET restored_at = datetime('now'), restored_by = ? WHERE account_id = ? AND rating_key = ?")
-        .run(actor || 'system', acctId, targetKey);
+      pccDb.prepare("UPDATE cw_snapshots SET restored_at = datetime('now'), restored_by = ? WHERE account_id = ? AND rating_key = ?").run(actor || 'system', acctId, targetKey);
       return { ok: true, applied: true, plexOffset, expected: snap.view_offset };
     }
     if (after?.gone) return { ok: false, error: 'Item no longer exists in Plex' };
     if (after?.error) {
-      // Couldn't read it back. If at least one push went through, treat as best-effort success.
       if (pushedAny) {
-        pccDb.prepare("UPDATE cw_snapshots SET restored_at = datetime('now'), restored_by = ? WHERE account_id = ? AND rating_key = ?")
-          .run(actor || 'system', acctId, targetKey);
+        pccDb.prepare("UPDATE cw_snapshots SET restored_at = datetime('now'), restored_by = ? WHERE account_id = ? AND rating_key = ?").run(actor || 'system', acctId, targetKey);
         return { ok: true, applied: null, note: `pushed, but could not verify (${after.error})` };
       }
       return { ok: false, error: pushErr ? (pushErr.response?.status ? `Plex ${pushErr.response.status}: ${pushErr.response.statusText}` : pushErr.message) : after.error };
     }
     return { ok: false, error: `Plex did not store the offset (viewOffset is ${Math.round(plexOffset/1000)}s after push). The item may be marked fully watched.`, plexOffset };
-  } catch (e) {
-    return { ok: false, error: e.response?.status ? `Plex ${e.response.status}: ${e.response.statusText}` : e.message };
-  }
+  } catch (e) { return { ok: false, error: e.response?.status ? `Plex ${e.response.status}: ${e.response.statusText}` : e.message }; }
 }
 
-// Auto-restore tick: for every snapshot item NOT in the current live hub AND not restored
-// recently, push the timeline event. Runs as part of each snapshot cycle when enabled.
 async function cwAutoRestoreCycle(liveKeys, account = _cwOwnerAccount()) {
-  // Only consider items snapshotted at least once before this cycle (i.e., last_in_hub_at < a moment ago).
-  const candidates = pccDb.prepare(`
-    SELECT rating_key, view_offset, title FROM cw_snapshots
-    WHERE account_id = ? AND view_offset > 0
-      AND (restored_at IS NULL OR restored_at < datetime('now','-1 day'))
-  `).all(account.id);
+  const candidates = pccDb.prepare(`SELECT rating_key, view_offset, title FROM cw_snapshots WHERE account_id = ? AND view_offset > 0 AND (restored_at IS NULL OR restored_at < datetime('now','-1 day'))`).all(account.id);
   let restored = 0, failed = 0;
   for (const c of candidates) {
     if (liveKeys.has(c.rating_key)) continue;
@@ -4022,7 +3278,6 @@ function scheduleCwSnapshotter() {
   const minutes = Math.max(1, Number(s.interval_minutes) || 15);
   console.log(`[CW] Snapshotter scheduled every ${minutes}m (auto_restore=${s.auto_restore ? 'on' : 'off'})`);
 
-  // Snapshot + prune (+ optional auto-restore) for one account. Returns per-account counts.
   const runForAccount = async (account, autoRestore) => {
     const result = await cwSnapshot(false, account);
     const live = await _cwFetchOnDeck(account.token);
@@ -4037,47 +3292,145 @@ function scheduleCwSnapshotter() {
     try {
       const cur = pccDb.prepare('SELECT * FROM cw_settings WHERE id=1').get();
       if (!cur.enabled) return;
-
-      // Always snapshot the owner. When snapshot_all_users is on, also iterate every Plex Home
-      // user (minting a fresh per-user token each time). PIN-protected profiles can't be minted
-      // without a PIN, so the cron skips them — they remain restorable manually from the UI.
       const accounts = [_cwOwnerAccount()];
       if (cur.snapshot_all_users) {
         try {
           const homeUsers = await cwFetchHomeUsers();
           for (const u of homeUsers) {
-            if (u.admin) continue;           // the owner is already covered above
-            if (u.protected) continue;       // needs a PIN — skip in the unattended cron
+            if (u.admin || u.protected) continue;
             try { accounts.push({ id: String(u.uuid), token: await cwSwitchUserToken(u), title: u.title || u.username || 'User', kind: 'home' }); }
             catch (e) { console.warn(`[CW] Skipping Home user ${u.title||u.uuid}: ${e.message}`); }
           }
         } catch (e) { console.warn('[CW] Could not list Home users:', e.message); }
       }
-
       let totalSaved = 0, totalRestored = 0, totalFailed = 0, totalPruned = 0;
       for (const account of accounts) {
         try {
           const r = await runForAccount(account, !!cur.auto_restore);
           totalSaved += r.saved; totalRestored += r.restored; totalFailed += r.failed; totalPruned += r.pruned;
-        } catch (e) {
-          console.warn(`[CW] Tick error for account ${account.title || account.id}:`, e.message);
-        }
+        } catch (e) { console.warn(`[CW] Tick error for ${account.title || account.id}:`, e.message); }
       }
-      pccDb.prepare(`
-        UPDATE cw_settings SET last_run = datetime('now'), last_snapshot_count = ?, last_restore_count = ?, last_error = NULL WHERE id = 1
-      `).run(totalSaved, totalRestored);
-      if (totalRestored || totalFailed || totalPruned) {
-        console.log(`[CW] Tick (${accounts.length} account${accounts.length!==1?'s':''}): snapshotted ${totalSaved}, pruned-watched ${totalPruned}, restored ${totalRestored}, failed ${totalFailed}`);
-      }
+      pccDb.prepare("UPDATE cw_settings SET last_run = datetime('now'), last_snapshot_count = ?, last_restore_count = ?, last_error = NULL WHERE id = 1").run(totalSaved, totalRestored);
+      if (totalRestored || totalFailed || totalPruned) console.log(`[CW] Tick (${accounts.length} acct): snapshotted ${totalSaved}, pruned ${totalPruned}, restored ${totalRestored}, failed ${totalFailed}`);
     } catch (e) {
       pccDb.prepare("UPDATE cw_settings SET last_run = datetime('now'), last_error = ? WHERE id = 1").run((e.message || String(e)).slice(0, 500));
       console.warn('[CW] Tick error:', e.message);
     }
   };
-  tick().catch(()=>{});
+  tick().catch(() => {});
   cwTimer = setInterval(tick, minutes * 60 * 1000);
 }
 setTimeout(() => scheduleCwSnapshotter(), 7000);
+
+// ── CW API routes ─────────────────────────────────────────────────────────────
+
+app.get('/api/cw/state', requireAdmin, async (req, res) => {
+  const settings = pccDb.prepare('SELECT * FROM cw_settings WHERE id=1').get();
+  let account, accountError = null;
+  try { account = await _cwResolveAccount(req.query.account, req.query.pin); }
+  catch (e) {
+    if (e.code === 'PIN_REQUIRED') return res.status(409).json({ error: e.message, code: 'PIN_REQUIRED' });
+    account = _cwOwnerAccount(); accountError = e.message;
+  }
+  let liveKeys = null, plexError = accountError;
+  try {
+    const live = await _cwFetchOnDeck(account.token);
+    liveKeys = new Set(live.filter(i => (Number(i.viewOffset)||0) > 0).map(i => String(i.ratingKey)));
+    try { await _cwPruneCompleted(liveKeys, account); } catch (e) {}
+  } catch (e) { plexError = e.message; }
+  const snaps = pccDb.prepare(`SELECT rating_key, title, show_title, season_num, episode_num, year, item_type, thumb, grandparent_thumb, view_offset, duration, last_viewed_at, first_seen_at, last_seen_at, last_in_hub_at, restored_at, restored_by FROM cw_snapshots WHERE account_id = ? ORDER BY last_in_hub_at DESC`).all(account.id);
+  const mkThumb = (path) => path && config.plex.url && config.plex.token ? `${config.plex.url}${path}?X-Plex-Token=${config.plex.token}` : null;
+  const annotated = snaps.map(s => ({
+    ...s,
+    thumb: mkThumb((s.item_type === 'episode' && s.grandparent_thumb) ? s.grandparent_thumb : s.thumb),
+    isLive: liveKeys ? liveKeys.has(s.rating_key) : null,
+    progress_pct: s.duration > 0 ? Math.min(99, Math.round((s.view_offset / s.duration) * 100)) : 0
+  }));
+  res.json({ settings, plexError, account: { id: account.id, title: account.title, kind: account.kind }, snapshots: annotated, liveCount: liveKeys ? liveKeys.size : null, snapshotCount: snaps.length, missingCount: liveKeys ? snaps.filter(s => !liveKeys.has(s.rating_key)).length : null });
+});
+
+app.get('/api/cw/users', requireAdmin, async (req, res) => {
+  const accounts = [{ id: 'owner', title: 'Owner', kind: 'owner', protected: false }];
+  try {
+    const users = await cwFetchHomeUsers(req.query.refresh === '1');
+    for (const u of users) {
+      if (u.admin) continue;
+      accounts.push({ id: String(u.uuid), title: u.title || u.username || u.friendlyName || 'User', kind: 'home', restricted: !!u.restricted, protected: !!u.protected, thumb: u.thumb || null });
+    }
+    res.json({ accounts });
+  } catch (e) { res.json({ accounts, error: e.message }); }
+});
+
+app.get('/api/cw/settings', requireAdmin, (req, res) => {
+  res.json(pccDb.prepare('SELECT * FROM cw_settings WHERE id=1').get());
+});
+
+app.put('/api/cw/settings', requireAdmin, (req, res) => {
+  const cur = pccDb.prepare('SELECT * FROM cw_settings WHERE id=1').get();
+  const { enabled, interval_minutes, auto_restore, stale_after_hours, snapshot_all_users } = req.body || {};
+  const newEnabled = enabled === undefined ? cur.enabled : (enabled ? 1 : 0);
+  const newInterval = interval_minutes === undefined ? cur.interval_minutes : Math.max(1, Math.min(1440, parseInt(interval_minutes) || cur.interval_minutes));
+  const newAuto = auto_restore === undefined ? cur.auto_restore : (auto_restore ? 1 : 0);
+  const newStale = stale_after_hours === undefined ? cur.stale_after_hours : Math.max(1, parseInt(stale_after_hours) || cur.stale_after_hours);
+  const newAllUsers = snapshot_all_users === undefined ? cur.snapshot_all_users : (snapshot_all_users ? 1 : 0);
+  pccDb.prepare('UPDATE cw_settings SET enabled=?, interval_minutes=?, auto_restore=?, stale_after_hours=?, snapshot_all_users=? WHERE id=1').run(newEnabled, newInterval, newAuto, newStale, newAllUsers);
+  scheduleCwSnapshotter();
+  res.json({ success: true });
+});
+
+app.post('/api/cw/snapshot', requireAdmin, async (req, res) => {
+  try {
+    const deep = req.query.deep === '1' || req.body?.deep === true;
+    let account;
+    try { account = await _cwResolveAccount(req.query.account || req.body?.account, req.query.pin || req.body?.pin); }
+    catch (e) {
+      if (e.code === 'PIN_REQUIRED') return res.status(409).json({ error: e.message, code: 'PIN_REQUIRED' });
+      return res.status(400).json({ error: e.message });
+    }
+    const r = await cwSnapshot(deep, account);
+    if (account.id === 'owner') pccDb.prepare("UPDATE cw_settings SET last_run = datetime('now'), last_snapshot_count = ?, last_error = NULL WHERE id = 1").run(r.saved);
+    res.json({ success: true, deep, account: { id: account.id, title: account.title }, ...r });
+  } catch (e) {
+    pccDb.prepare("UPDATE cw_settings SET last_run = datetime('now'), last_error = ? WHERE id = 1").run((e.message||'').slice(0, 500));
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/cw/restore/:rating_key', requireAdmin, async (req, res) => {
+  let account;
+  try { account = await _cwResolveAccount(req.query.account || req.body?.account, req.query.pin || req.body?.pin); }
+  catch (e) {
+    if (e.code === 'PIN_REQUIRED') return res.status(409).json({ error: e.message, code: 'PIN_REQUIRED' });
+    return res.status(400).json({ error: e.message });
+  }
+  const r = await cwRestoreItem(req.params.rating_key, req.user?.username || 'admin', account);
+  if (r.ok) res.json({ success: true, applied: r.applied, note: r.note, plexOffset: r.plexOffset });
+  else res.status(400).json({ error: r.error });
+});
+
+app.post('/api/cw/restore-bulk', requireAdmin, async (req, res) => {
+  const keys = Array.isArray(req.body?.rating_keys) ? req.body.rating_keys : [];
+  if (!keys.length) return res.status(400).json({ error: 'rating_keys array required' });
+  let account;
+  try { account = await _cwResolveAccount(req.body?.account, req.body?.pin); }
+  catch (e) {
+    if (e.code === 'PIN_REQUIRED') return res.status(409).json({ error: e.message, code: 'PIN_REQUIRED' });
+    return res.status(400).json({ error: e.message });
+  }
+  const actor = req.user?.username || 'admin';
+  const results = { restored: 0, failed: 0, errors: [] };
+  for (const k of keys) {
+    const r = await cwRestoreItem(k, actor, account);
+    if (r.ok) results.restored++; else { results.failed++; results.errors.push({ rating_key: k, error: r.error }); }
+  }
+  res.json({ success: true, ...results });
+});
+
+app.delete('/api/cw/snapshot/:rating_key', requireAdmin, (req, res) => {
+  const acctId = (!req.query.account || req.query.account === 'owner') ? 'owner' : String(req.query.account);
+  pccDb.prepare('DELETE FROM cw_snapshots WHERE account_id = ? AND rating_key = ?').run(acctId, req.params.rating_key);
+  res.json({ success: true });
+});
 
 // Unwatched report
 app.get('/api/plex/library/:key/unwatched', async (req, res) => {
@@ -4443,7 +3796,10 @@ const LIVETV_EPOCH = new Date('2025-01-01T00:00:00Z').getTime();
 // --- Database Init ---
 let db;
 if (LIVETV_ENABLED) {
-  db = new Database(paths.livetvDb);
+  const fs = require('fs');
+  const dbDir = path.join(__dirname, 'data');
+  if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
+  db = new Database(path.join(dbDir, 'livetv.db'));
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
 
@@ -4610,6 +3966,16 @@ if (LIVETV_ENABLED) {
     );
     CREATE INDEX IF NOT EXISTS idx_playlog_channel_date ON channel_playlog(channel_id, aired_on);
     CREATE INDEX IF NOT EXISTS idx_playlog_prog ON channel_playlog(program_id);
+    -- Per-show sequential-playback cursor: last episode that actually aired for a show set to
+    -- "order" mode on a given channel. Lets buildChannelPlaylist resume right after it instead
+    -- of resorting the whole catalog from S01E01 every rebuild (see _rotateEpisodesFromCursor).
+    CREATE TABLE IF NOT EXISTS channel_show_cursor (
+      channel_id INTEGER NOT NULL,
+      show_title TEXT NOT NULL,
+      last_program_id INTEGER,
+      updated_at TEXT,
+      PRIMARY KEY (channel_id, show_title)
+    );
   `);
   // channels.last_rebuilt_at tracks when each channel was last (re)built — drives the periodic
   // rebuild loop without needing to keep state in memory across restarts.
@@ -4623,12 +3989,6 @@ if (LIVETV_ENABLED) {
     // for any show that just completed its full episode run, so the show keeps rotating without
     // requiring the user to hit Renew manually.
     if (!cols2.includes('auto_renew_shows')) db.exec("ALTER TABLE channels ADD COLUMN auto_renew_shows INTEGER DEFAULT 0");
-    // Air-count features (#7): JSON array of program_ids the user "boosted" (get ~2x airtime),
-    // and an auto-retire threshold — drop a program from the pool once it has aired this many
-    // times on the channel (0 = disabled). retire_alerted_at dedupes the Telegram exhaustion ping.
-    if (!cols2.includes('boosted_programs')) db.exec("ALTER TABLE channels ADD COLUMN boosted_programs TEXT DEFAULT '[]'");
-    if (!cols2.includes('retire_after_airings')) db.exec("ALTER TABLE channels ADD COLUMN retire_after_airings INTEGER DEFAULT 0");
-    if (!cols2.includes('exhaustion_alerted_on')) db.exec("ALTER TABLE channels ADD COLUMN exhaustion_alerted_on TEXT");
   } catch(e) {}
   // Plex summary (one-paragraph description) — used by the Add-Programs UI cards. Populated on
   // scan when present; older rows stay NULL and just render without a description.
@@ -4671,6 +4031,30 @@ if (LIVETV_ENABLED) {
       db.exec("ALTER TABLE programs ADD COLUMN added_at INTEGER");
     }
   } catch(e) { /* already exists */ }
+
+  // Migrate: add guid to programs. Plex's `guid` (e.g. plex://movie/<hash>) is stable across
+  // library rescans, unlike `plex_rating_key` which Plex silently reassigns to different content
+  // on a rebuild (see cw_snapshots.guid for the same fix applied to Continue Watching). We use
+  // this to detect when a cached/uploaded subtitle for a ratingKey no longer belongs to the
+  // content currently living at that ratingKey.
+  try {
+    const progCols3 = db.pragma('table_info(programs)').map(c => c.name);
+    if (!progCols3.includes('guid')) db.exec("ALTER TABLE programs ADD COLUMN guid TEXT");
+  } catch(e) { /* already exists */ }
+
+  // Tracks subtitles we've downloaded/uploaded per (rkey, lang), tagged with the program guid
+  // at the time of upload. On next lookup, if the ratingKey's live guid no longer matches, the
+  // cached file and the Plex-attached stream are stale leftovers from before a rescan reassigned
+  // that ratingKey to different content — see [[project_plex_api_quirks]] point 4.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS subtitle_uploads (
+      rkey TEXT NOT NULL,
+      lang TEXT NOT NULL,
+      guid TEXT,
+      uploaded_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (rkey, lang)
+    );
+  `);
 
   // Create channel_fillers junction table for per-channel filler assignment
   db.exec(`
@@ -4751,13 +4135,10 @@ if (LIVETV_ENABLED) {
   setInterval(() => {
     if (!LIVETV_ENABLED || !db) return;
     try {
-      const channels = db.prepare('SELECT id, name FROM channels WHERE enabled = 1').all();
+      const channels = db.prepare('SELECT id, name, shuffle, shuffle_shows FROM channels WHERE enabled = 1').all();
       for (const ch of channels) {
         try {
-          // Strict on-air only: never count air-time during off-hours or the post-boundary
-          // grace tail. The show-completion report and rerun filter consume this log, so
-          // logging off-hours airings would inflate counts and falsely "complete" content.
-          if (!isChannelOnAir(ch.id)) continue;
+          if (!isChannelEffectivelyOnAir(ch.id)) continue;
           const prog = getCurrentProgram(ch.id);
           const pid = prog?.item?.program_id;
           if (!pid) continue; // skip fillers and empty slots
@@ -4765,15 +4146,22 @@ if (LIVETV_ENABLED) {
           _airtimeLastSeen.set(ch.id, pid);
           db.prepare('INSERT INTO channel_playlog (channel_id, program_id, filler_id, aired_on) VALUES (?, ?, NULL, ?)')
             .run(ch.id, pid, _todayDateStr());
+
+          // Advance the per-show sequential cursor so the next rebuild resumes right after this
+          // episode instead of resorting the whole catalog from S01E01 (see buildChannelPlaylist).
+          const showTitle = prog.item.show_title;
+          if (showTitle && prog.item.prog_type === 'episode' && _effectiveShowMode(ch, showTitle) === 'order') {
+            db.prepare(`
+              INSERT INTO channel_show_cursor (channel_id, show_title, last_program_id, updated_at)
+              VALUES (?, ?, ?, datetime('now'))
+              ON CONFLICT(channel_id, show_title) DO UPDATE SET
+                last_program_id=excluded.last_program_id, updated_at=excluded.updated_at
+            `).run(ch.id, showTitle, pid);
+          }
         } catch(e) { /* channel-level failure — keep iterating */ }
       }
     } catch(e) { console.warn('[LiveTV] airtime logger error:', e.message); }
   }, 5 * 60 * 1000);
-
-  // Channel-exhaustion alert (#7): check every 6 hours whether any channel has cycled through
-  // most of its pool and push a one-time Telegram renewal nudge. First run shortly after boot.
-  setInterval(() => { checkChannelExhaustion(); }, 6 * 60 * 60 * 1000);
-  setTimeout(() => { checkChannelExhaustion(); }, 60 * 1000);
 }
 
 // --- Virtual Clock Engine ---
@@ -4819,19 +4207,30 @@ const channelOnAirStart = new Map(); // channelId -> timestamp when channel last
 const channelWasOnAir = new Map(); // channelId -> boolean
 
 function getCurrentProgram(channelId, now) {
+  const isRealtime = now === undefined;
   now = now || Date.now();
   const data = getPlaylistData(channelId);
   if (!data || data.cycleDuration === 0) return null;
 
-  // Track on-air transitions to reset playlist position
-  const currentlyOnAir = isChannelOnAir(channelId);
-  const wasOn = channelWasOnAir.get(channelId);
-  channelWasOnAir.set(channelId, currentlyOnAir);
+  // On server startup, mark currently on-air channels as already-on-air so the
+  // off→on transition block below doesn't falsely fire and reset the epoch.
+  // channelOnAirStart is intentionally left empty here; the LIVETV_EPOCH fallback
+  // below gives a stable wall-clock anchor that survives container restarts.
+  if (!channelWasOnAir.has(channelId) && isChannelOnAir(channelId)) {
+    channelWasOnAir.set(channelId, true);
+  }
 
-  if (currentlyOnAir && wasOn === false) {
-    // Channel just went on-air - record start time so playlist begins from position 0
-    channelOnAirStart.set(channelId, now);
-    console.log(`[LiveTV] Channel ${channelId} went on-air, resetting playlist to start`);
+  // Track off→on-air transitions for real-time calls only (guide/XMLTV lookups skip this).
+  // !wasOn covers both undefined (server startup) and false (was previously off-air).
+  if (isRealtime) {
+    const currentlyOnAir = isChannelOnAir(channelId);
+    const wasOn = channelWasOnAir.get(channelId);
+    channelWasOnAir.set(channelId, currentlyOnAir);
+    if (currentlyOnAir && !wasOn) {
+      // Channel went on-air — reset epoch so playlist restarts from position 0
+      channelOnAirStart.set(channelId, now);
+      console.log(`[LiveTV] Channel ${channelId} went on-air, resetting playlist to start`);
+    }
   }
 
   // Use channel-specific epoch if available (set when channel goes on-air)
@@ -4922,20 +4321,15 @@ async function scanPlexLibraries() {
 
   const upsert = db.prepare(`
     INSERT INTO programs (plex_rating_key, title, type, show_title, season_num, episode_num,
-      duration_ms, genre, year, thumb, art, content_rating, library_key, file_path, plex_key, added_at, summary, updated_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'))
+      duration_ms, genre, year, thumb, art, content_rating, library_key, file_path, plex_key, added_at, summary, guid, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'))
     ON CONFLICT(plex_rating_key) DO UPDATE SET
-      title=excluded.title, duration_ms=excluded.duration_ms, genre=excluded.genre,
+      title=excluded.title, type=excluded.type, show_title=excluded.show_title,
+      season_num=excluded.season_num, episode_num=excluded.episode_num,
+      duration_ms=excluded.duration_ms, genre=excluded.genre,
       year=excluded.year, thumb=excluded.thumb, art=excluded.art, content_rating=excluded.content_rating,
       file_path=excluded.file_path, summary=COALESCE(excluded.summary, programs.summary),
-      -- MUST refresh season/episode/show/type from Plex on every scan. Plex reassigns numeric
-      -- ratingKeys on a library rescan (see api-quirks memory), so a ratingKey that used to be
-      -- S01E01 can come back pointing at S05E03. Without these, the row kept its STALE season/
-      -- episode numbers while its title/duration updated to the new episode — scrambling "by order"
-      -- playlists (the "jumped from season 1 to season 5" + duplicate-SxxExx-rows bug).
-      type=excluded.type, show_title=excluded.show_title,
-      season_num=excluded.season_num, episode_num=excluded.episode_num,
-      added_at=COALESCE(programs.added_at, excluded.added_at), updated_at=datetime('now')
+      added_at=COALESCE(programs.added_at, excluded.added_at), guid=excluded.guid, updated_at=datetime('now')
   `);
 
   for (const lib of libraries) {
@@ -4957,7 +4351,8 @@ async function scanPlexLibraries() {
             lib.key, item.Media?.[0]?.Part?.[0]?.file || null,
             `/library/metadata/${item.ratingKey}`,
             item.addedAt ? item.addedAt * 1000 : null,
-            item.summary || null
+            item.summary || null,
+            item.guid || null
           );
           if (existing) updated++; else added++;
         }
@@ -4977,8 +4372,6 @@ async function scanPlexLibraries() {
               const existing = db.prepare('SELECT id FROM programs WHERE plex_rating_key = ?').get(String(ep.ratingKey));
               upsert.run(
                 String(ep.ratingKey), ep.title, 'episode',
-                // Number.isFinite (not `|| null`) so season 0 (specials) / episode 0 are preserved
-                // as 0 instead of collapsing to null and sorting unpredictably.
                 ep.grandparentTitle || show.title,
                 Number.isFinite(ep.parentIndex) ? ep.parentIndex : null,
                 Number.isFinite(ep.index) ? ep.index : null,
@@ -4990,7 +4383,8 @@ async function scanPlexLibraries() {
                 ep.addedAt ? ep.addedAt * 1000 : null,
                 // Episode summaries are often empty; fall back to the show-level summary so the
                 // Add-Programs card has something to read.
-                ep.summary || show.summary || null
+                ep.summary || show.summary || null,
+                ep.guid || null
               );
               if (existing) updated++; else added++;
             }
@@ -5314,8 +4708,7 @@ app.get('/api/livetv/programs/search', (req, res) => {
   const q = (req.query.q || '').trim();
   const group = (req.query.group || 'any').toLowerCase();
   const libraryKey = (req.query.library_key || '').trim();
-  const limit = Math.min(100, parseInt(req.query.limit) || 50);
-  const offset = Math.max(0, parseInt(req.query.offset) || 0);
+  const limit = Math.min(100, parseInt(req.query.limit) || 25);
   // Two-mode trigger: typed search (q>=2) OR browsing a library (library_key set). Neither
   // → empty so the UI doesn't spam huge unfiltered list payloads on first paint.
   if (q.length < 2 && !libraryKey) return res.json({ results: [], group });
@@ -5328,14 +4721,12 @@ app.get('/api/livetv/programs/search', (req, res) => {
   if (group === 'show') {
     // Group by show_title. Pick one representative episode (prefer S01E01) for cover/year/genre.
     let where = "duration_ms > 0 AND type = 'episode' AND show_title IS NOT NULL";
-    const whereParams = [];
-    if (q) { where += ' AND show_title LIKE ?'; whereParams.push(like); }
-    if (libraryKey) { where += ' AND library_key = ?'; whereParams.push(libraryKey); }
-    const total = db.prepare(`SELECT COUNT(DISTINCT show_title) AS n FROM programs WHERE ${where}`).get(...whereParams).n;
+    const params = [];
+    if (q) { where += ' AND show_title LIKE ?'; params.push(like); }
+    if (libraryKey) { where += ' AND library_key = ?'; params.push(libraryKey); }
     const orderBy = q ? 'CASE WHEN show_title LIKE ? THEN 0 ELSE 1 END, show_title' : 'show_title';
-    const params = [...whereParams];
     if (q) params.push(startLike);
-    params.push(limit, offset);
+    params.push(limit);
     const rows = db.prepare(`
       SELECT show_title,
              COUNT(*) AS episode_count,
@@ -5348,7 +4739,7 @@ app.get('/api/livetv/programs/search', (req, res) => {
       WHERE ${where}
       GROUP BY show_title
       ORDER BY ${orderBy}
-      LIMIT ? OFFSET ?
+      LIMIT ?
     `).all(...params);
     const results = rows.map(r => {
       // Representative thumb/summary: the show's pilot if we have one, else any episode.
@@ -5376,25 +4767,23 @@ app.get('/api/livetv/programs/search', (req, res) => {
         episode_ids: epIds
       };
     });
-    return res.json({ results, group, total, offset });
+    return res.json({ results, group });
   }
 
   if (group === 'movie') {
     let where = "duration_ms > 0 AND type = 'movie'";
-    const whereParams = [];
-    if (q) { where += ' AND title LIKE ?'; whereParams.push(like); }
-    if (libraryKey) { where += ' AND library_key = ?'; whereParams.push(libraryKey); }
-    const total = db.prepare(`SELECT COUNT(*) AS n FROM programs WHERE ${where}`).get(...whereParams).n;
+    const params = [];
+    if (q) { where += ' AND title LIKE ?'; params.push(like); }
+    if (libraryKey) { where += ' AND library_key = ?'; params.push(libraryKey); }
     const orderBy = q ? 'CASE WHEN title LIKE ? THEN 0 ELSE 1 END, title' : 'title';
-    const params = [...whereParams];
     if (q) params.push(startLike);
-    params.push(limit, offset);
+    params.push(limit);
     const rows = db.prepare(`
       SELECT id, title, year, duration_ms, genre, thumb, summary, content_rating
       FROM programs
       WHERE ${where}
       ORDER BY ${orderBy}
-      LIMIT ? OFFSET ?
+      LIMIT ?
     `).all(...params);
     const results = rows.map(r => ({
       kind: 'movie',
@@ -5407,26 +4796,24 @@ app.get('/api/livetv/programs/search', (req, res) => {
       cover: thumbUrl(r.thumb),
       summary: r.summary || null
     }));
-    return res.json({ results, group, total, offset });
+    return res.json({ results, group });
   }
 
   // Legacy / mixed mode (one row per program, including each episode individually).
   let where = 'duration_ms > 0';
-  const whereParams = [];
-  if (q) { where += ' AND (title LIKE ? OR show_title LIKE ?)'; whereParams.push(like, like); }
-  if (libraryKey) { where += ' AND library_key = ?'; whereParams.push(libraryKey); }
-  const total = db.prepare(`SELECT COUNT(*) AS n FROM programs WHERE ${where}`).get(...whereParams).n;
+  const params = [];
+  if (q) { where += ' AND (title LIKE ? OR show_title LIKE ?)'; params.push(like, like); }
+  if (libraryKey) { where += ' AND library_key = ?'; params.push(libraryKey); }
   const orderBy = q ? 'CASE WHEN title LIKE ? THEN 0 ELSE 1 END, title' : 'title';
-  const params = [...whereParams];
   if (q) params.push(startLike);
-  params.push(limit, offset);
+  params.push(limit);
   const rows = db.prepare(`
     SELECT id, plex_rating_key, title, type, show_title, season_num, episode_num,
            duration_ms, genre, year, thumb, summary, content_rating
     FROM programs
     WHERE ${where}
     ORDER BY ${orderBy}
-    LIMIT ? OFFSET ?
+    LIMIT ?
   `).all(...params);
   const results = rows.map(r => ({
     kind: r.type === 'episode' ? 'episode' : 'movie',
@@ -5441,7 +4828,7 @@ app.get('/api/livetv/programs/search', (req, res) => {
     cover: thumbUrl(r.thumb),
     summary: r.summary || null
   }));
-  res.json({ results, group: 'any', total, offset });
+  res.json({ results, group: 'any' });
 });
 
 app.post('/api/livetv/channels/:id/rebuild', (req, res) => {
@@ -5479,6 +4866,33 @@ function _readSchedSettings() {
   return { rerunDays };
 }
 
+// Per-show playback mode: an explicit shuffle_shows[showTitle] entry wins; otherwise a show
+// inherits the channel-wide default ("shuffle" when channel.shuffle is on, "order" otherwise).
+function _effectiveShowMode(channel, showTitle) {
+  let shuffleShows = {};
+  try { shuffleShows = JSON.parse(channel.shuffle_shows || '{}'); } catch(e) {}
+  return shuffleShows[showTitle] || (channel.shuffle ? 'shuffle' : 'order');
+}
+
+// Sequential "order" shows must resume right after the last episode that actually aired, not
+// restart at S01E01 every rebuild. `sortedEps` is ascending by (season_num, episode_num); this
+// rotates it to start just past the cursor, wrapping to the top once the whole series has aired.
+// No cursor yet (never aired, or the cursored episode was pruned since) => start from the top.
+function _rotateEpisodesFromCursor(channelId, showName, sortedEps) {
+  if (sortedEps.length === 0) return sortedEps;
+  let lastId = null;
+  try {
+    const row = db.prepare('SELECT last_program_id FROM channel_show_cursor WHERE channel_id = ? AND show_title = ?').get(channelId, showName);
+    lastId = row ? row.last_program_id : null;
+  } catch(e) {}
+  if (lastId == null) return sortedEps;
+  const idx = sortedEps.findIndex(e => e.id === lastId);
+  if (idx === -1) return sortedEps;
+  const nextIdx = (idx + 1) % sortedEps.length;
+  if (nextIdx === 0) return sortedEps;
+  return sortedEps.slice(nextIdx).concat(sortedEps.slice(0, nextIdx));
+}
+
 function _writePlaylogForChannel(channelId, items, dateStr) {
   if (!items || items.length === 0) return;
   const stmt = db.prepare("INSERT INTO channel_playlog (channel_id, program_id, filler_id, aired_on) VALUES (?, ?, ?, ?)");
@@ -5498,10 +4912,15 @@ function _gcPlaylog() {
   } catch(e) {}
 }
 
-// Resolve a channel's raw source pool — the programs matched by its genre/library/filter source,
-// BEFORE exclusions, anti-rerun, boost or shuffling. Shared by buildChannelPlaylist and the
-// air-count endpoint so both agree on "what content belongs to this channel".
-function _selectChannelBasePrograms(channel) {
+function buildChannelPlaylist(channelId) {
+  const channel = db.prepare('SELECT * FROM channels WHERE id = ?').get(channelId);
+  if (!channel) return 0;
+
+  // Clear existing programming
+  db.prepare('DELETE FROM channel_programming WHERE channel_id = ?').run(channelId);
+
+  // Find matching programs
+  let programs = [];
   if (channel.source_type === 'library' && channel.source_value && channel.source_value.startsWith('{')) {
     // New filter-based mode: source_value is JSON with filter criteria
     try {
@@ -5515,33 +4934,23 @@ function _selectChannelBasePrograms(channel) {
         exclude_genres: filters.exclude_genres || [],
         library_key: channel.library_key || null
       });
-      return db.prepare(sql + ' ORDER BY title').all(...params);
+      programs = db.prepare(sql + ' ORDER BY title').all(...params);
     } catch(e) {
       console.error('LiveTV: Failed to parse channel filters:', e.message);
-      return db.prepare('SELECT * FROM programs WHERE library_key = ? AND duration_ms > 0 ORDER BY title')
+      programs = db.prepare('SELECT * FROM programs WHERE library_key = ? AND duration_ms > 0 ORDER BY title')
         .all(channel.library_key || channel.source_value);
     }
   } else if (channel.source_type === 'genre') {
     // Legacy: primary genre matching
-    return db.prepare("SELECT * FROM programs WHERE (genre = ? OR genre LIKE ?) AND duration_ms > 0 ORDER BY title")
+    programs = db.prepare("SELECT * FROM programs WHERE (genre = ? OR genre LIKE ?) AND duration_ms > 0 ORDER BY title")
       .all(channel.source_value, `${channel.source_value},%`);
   } else if (channel.source_type === 'library') {
     // Legacy: library-only (no JSON filters)
-    return db.prepare('SELECT * FROM programs WHERE library_key = ? AND duration_ms > 0 ORDER BY title')
+    programs = db.prepare('SELECT * FROM programs WHERE library_key = ? AND duration_ms > 0 ORDER BY title')
       .all(channel.library_key || channel.source_value);
+  } else {
+    programs = db.prepare('SELECT * FROM programs WHERE duration_ms > 0 ORDER BY title').all();
   }
-  return db.prepare('SELECT * FROM programs WHERE duration_ms > 0 ORDER BY title').all();
-}
-
-function buildChannelPlaylist(channelId) {
-  const channel = db.prepare('SELECT * FROM channels WHERE id = ?').get(channelId);
-  if (!channel) return 0;
-
-  // Clear existing programming
-  db.prepare('DELETE FROM channel_programming WHERE channel_id = ?').run(channelId);
-
-  // Find matching programs
-  let programs = _selectChannelBasePrograms(channel);
 
   // Apply exclusions, except never exclude programs the user explicitly included. The manual
   // "Add Programs" list is the user's override of every other filter — if it's on that list
@@ -5564,21 +4973,6 @@ function buildChannelPlaylist(channelId) {
       const extras = db.prepare(`SELECT * FROM programs WHERE id IN (${placeholders}) AND duration_ms > 0`).all(...missing);
       programs = programs.concat(extras);
     }
-  }
-
-  // Auto-retire (#7): once a program has aired retire_after_airings times on this channel
-  // (lifetime, from the playlog), drop it from the pool — "don't show after it aired N times".
-  // Non-destructive: recomputed every build, so raising the threshold or clearing the playlog
-  // brings content back. Explicitly-included programs are never auto-retired.
-  const retireAfter = Number(channel.retire_after_airings) || 0;
-  if (retireAfter > 0 && programs.length > 0) {
-    const counts = new Map(
-      db.prepare("SELECT program_id, COUNT(*) c FROM channel_playlog WHERE channel_id = ? AND program_id IS NOT NULL GROUP BY program_id")
-        .all(channelId).map(r => [r.program_id, r.c])
-    );
-    const before = programs.length;
-    programs = programs.filter(p => includedSet.has(p.id) || (counts.get(p.id) || 0) < retireAfter);
-    if (programs.length < before) console.log(`[LiveTV] Channel ${channel.name}: auto-retired ${before - programs.length} program(s) at >=${retireAfter} airings`);
   }
 
   // Anti-rerun: skip programs that aired on this channel within the last N days.
@@ -5619,6 +5013,16 @@ function buildChannelPlaylist(channelId) {
       const renewShowSet = new Set();
       const autoRenew = !!channel.auto_renew_shows;
       for (const [show, eps] of byShow) {
+        // Shows in sequential "order" mode use a persistent per-show cursor (resume right after
+        // the last-aired episode — see _rotateEpisodesFromCursor / buildChannelPlaylist below)
+        // instead of this rolling rerun window. Without this exemption, S01E01 drops out of the
+        // window after rerunDays and re-enters the pool at the *front* of the resorted list,
+        // jumping the queue ahead of episodes further along that hadn't aired yet — e.g. the
+        // pilot kept re-airing every 1-2 weeks while over half the series had never aired once.
+        if (_effectiveShowMode(channel, show) === 'order') {
+          keptEpisodes.push(...eps);
+          continue;
+        }
         const fresh = eps.filter(e => !recentIds.has(e.id));
         if (fresh.length >= 2) {
           // Plenty of unaired episodes left — filter normally.
@@ -5653,17 +5057,6 @@ function buildChannelPlaylist(channelId) {
   if (programs.length === 0) {
     invalidatePlaylistCache(channelId);
     return 0;
-  }
-
-  // Boost (#7): give user-boosted programs an extra copy in the pool (~2x airtime). Applied
-  // after anti-rerun so a boosted item that's currently rerun-filtered isn't re-added — only
-  // programs that survived the filters get amplified.
-  let boostedIds = [];
-  try { const v = JSON.parse(channel.boosted_programs || '[]'); if (Array.isArray(v)) boostedIds = v; } catch(e) {}
-  if (boostedIds.length > 0) {
-    const boostedSet = new Set(boostedIds);
-    const extra = programs.filter(p => boostedSet.has(p.id));
-    if (extra.length > 0) programs = programs.concat(extra);
   }
 
   // Apply schedule rules (seasonal genre boost)
@@ -5725,12 +5118,12 @@ function buildChannelPlaylist(channelId) {
     for (const [showName, eps] of Object.entries(showGroups)) {
       const mode = shuffleShows[showName] || 'shuffle'; // default to shuffle when channel shuffle is on
       if (mode === 'order') {
-        // Keep in sequential order
+        // Keep in sequential order, resuming right after the last-aired episode
         eps.sort((a, b) => {
           if ((a.season_num || 0) !== (b.season_num || 0)) return (a.season_num || 0) - (b.season_num || 0);
           return (a.episode_num || 0) - (b.episode_num || 0);
         });
-        processedShows[showName] = eps;
+        processedShows[showName] = _rotateEpisodesFromCursor(channelId, showName, eps);
       } else if (mode === 'random') {
         // True random (not deterministic)
         processedShows[showName] = eps.sort(() => Math.random() - 0.5);
@@ -5794,51 +5187,41 @@ function buildChannelPlaylist(channelId) {
       return a.title.localeCompare(b.title);
     });
 
-    // Apply per-show shuffle/random overrides
-    const hasOverrides = Object.values(shuffleShows).some(v => v !== 'order');
-    if (hasOverrides) {
+    // Apply per-show overrides. Always runs (not just when an override is present) because the
+    // default "order" mode itself needs the cursor rotation below — previously this whole block
+    // was skipped whenever shuffle_shows had no overrides, so sequential channels never resumed
+    // past S01E01 on rebuild.
+    {
       // Group by show, apply overrides, then reconstruct
-      const showGroups = {};
       const result = [];
       let currentShow = null;
       let currentGroup = [];
-
-      for (const p of programs) {
-        const showKey = (p.type === 'episode' && p.show_title) ? p.show_title : null;
-        if (showKey !== currentShow) {
-          if (currentShow && currentGroup.length > 0) {
-            const mode = shuffleShows[currentShow];
-            if (mode === 'shuffle') {
-              const seed = channelId * 2654435761 + currentShow.split('').reduce((s,c) => s + c.charCodeAt(0), 0) + daySalt;
-              result.push(...deterministicShuffle(currentGroup, seed));
-            } else if (mode === 'random') {
-              result.push(...currentGroup.sort(() => Math.random() - 0.5));
-            } else {
-              result.push(...currentGroup);
-            }
-          } else if (currentGroup.length > 0) {
-            result.push(...currentGroup);
-          }
-          currentShow = showKey;
-          currentGroup = [p];
-        } else {
-          currentGroup.push(p);
-        }
-      }
-      // Flush last group
-      if (currentShow && currentGroup.length > 0) {
-        const mode = shuffleShows[currentShow];
+      const flush = () => {
+        if (currentGroup.length === 0) return;
+        if (!currentShow) { result.push(...currentGroup); return; }
+        const mode = shuffleShows[currentShow] || 'order';
         if (mode === 'shuffle') {
           const seed = channelId * 2654435761 + currentShow.split('').reduce((s,c) => s + c.charCodeAt(0), 0) + daySalt;
           result.push(...deterministicShuffle(currentGroup, seed));
         } else if (mode === 'random') {
           result.push(...currentGroup.sort(() => Math.random() - 0.5));
         } else {
-          result.push(...currentGroup);
+          // currentGroup is already sorted ascending by the pre-sort above.
+          result.push(..._rotateEpisodesFromCursor(channelId, currentShow, currentGroup));
         }
-      } else if (currentGroup.length > 0) {
-        result.push(...currentGroup);
+      };
+
+      for (const p of programs) {
+        const showKey = (p.type === 'episode' && p.show_title) ? p.show_title : null;
+        if (showKey !== currentShow) {
+          flush();
+          currentShow = showKey;
+          currentGroup = [p];
+        } else {
+          currentGroup.push(p);
+        }
       }
+      flush();
       programs = result;
     }
   }
@@ -5948,6 +5331,16 @@ function buildChannelPlaylist(channelId) {
   buildTx();
 
   invalidatePlaylistCache(channelId);
+  // Rebase the on-air epoch to "now" so the freshly-built array starts playing from position 0
+  // immediately. Without this, getCurrentProgram's `elapsed % cycleDuration` reused the OLD epoch
+  // against the NEW (different-length, differently-ordered) array, landing on an arbitrary
+  // position — which the airtime-cron then logged as "aired", teleporting order-mode shows'
+  // cursors forward by however many episodes happened to lie between the old and new position
+  // (e.g. Family Matters' cursor jumped from S01E02 straight to S07E13 on one rebuild, silently
+  // skipping every episode in between for a full ~35-day rotation). Resetting position 0 = "now"
+  // on every rebuild guarantees each show resumes exactly one episode past its last cursor, with
+  // nothing skipped.
+  channelOnAirStart.set(channelId, Date.now());
   // last_rebuilt_at lets the daily auto-rebuild loop skip channels already rebuilt today.
   // NOTE: we used to stamp every scheduled item into channel_playlog here, but that conflated
   // "scheduled today" with "actually aired" and made the rerun filter + completion report
@@ -6143,9 +5536,7 @@ app.get('/api/livetv/now-playing', (req, res) => {
   const channels = db.prepare('SELECT * FROM channels WHERE enabled = 1 ORDER BY number').all();
   const baseUrl = getBaseUrl(req);
   const result = channels.map(ch => {
-    // Strict on-air so the Now-Playing strip agrees with the guide: during off-hours we show
-    // no current program (the stream itself still honors the finish-current-program grace).
-    const onAir = isChannelOnAir(ch.id);
+    const onAir = isChannelEffectivelyOnAir(ch.id);
     const rules = db.prepare('SELECT * FROM schedule_rules WHERE channel_id = ?').all(ch.id);
     const nextOnAirTime = onAir ? null : getNextOnAirTime(ch.id);
     // When off-air, don't return current program info
@@ -6265,7 +5656,7 @@ app.get('/api/livetv/watch/:channelId', async (req, res) => {
 
   // Handle local filler (YouTube downloaded)
   if (isFiller && current.item.filler_local_path && require('fs').existsSync(current.item.filler_local_path)) {
-    const offsetSec = Math.floor(current.offsetMs / 1000);
+    const offsetSec = toOffsetSec(current.offsetMs);
     const baseUrl = getBaseUrl(req);
     const localUrl = `${baseUrl}/fillers/${encodeURIComponent(path.basename(current.item.filler_local_path))}`;
     return res.json({
@@ -6278,13 +5669,12 @@ app.get('/api/livetv/watch/:channelId', async (req, res) => {
 
   if (!ratingKey) return res.status(503).json({ error: 'No playable content' });
 
-  const offsetSec = Math.floor(current.offsetMs / 1000);
+  const offsetSec = toOffsetSec(current.offsetMs);
   let title = current.item.prog_title || current.item.filler_name || 'Unknown';
 
   // Look up media info from Plex to determine best playback method
   let streamUrl, streamType = 'direct', sessionId = null;
   let pickedMediaIndex = '0'; // visible to transcodeParams below so we hand Plex the working entry
-  let sidecarTrack = null;    // populated by the OpenSubtitles fallback inside the try; read by res.json below
   try {
     const metaRes = await axios.get(`${config.plex.url}/library/metadata/${ratingKey}`, {
       params: { 'X-Plex-Token': config.plex.token },
@@ -6351,47 +5741,14 @@ app.get('/api/livetv/watch/:channelId', async (req, res) => {
     const chromiumSafeAudio = ['aac', 'mp3', 'opus', 'flac', 'vorbis'];
     const audioOk = chromiumSafeAudio.includes(audioCodec);
 
-    // Resolve subtitle source up front so the direct-play decision can account for it.
-    //   * Plex-native sub stream: requires Plex transcode + burn (only path to get subs into
-    //     a <video> via Plex's pipeline).
-    //   * OpenSubtitles SRT sidecar: rendered client-side as <track>, so direct-play is fine.
+    // Desktop app (Electron/Chromium) can direct-play H264 and HEVC in MP4/MKV
+    // Browser can only direct-play H264 in MP4/M4V/MOV
+    // Both require Chromium-compatible audio
+    // Direct play bypasses Plex's transcoder entirely, so it can't burn in subtitles. When the
+    // user has a sub language configured we force transcode so the sub picker logic below can run.
     const _subPref = readSubtitleSettings();
-    const wantsSubs = !!(_subPref.language && _subPref.mode === 'burn');
-    let plexSubStreamId = null;
-    if (wantsSubs && !isFiller) {
-      plexSubStreamId = pickPlexSubtitleStreamId(media, _subPref.language, { textOnly: true });
-      if (!plexSubStreamId) {
-        // Fire-and-forget Bazarr search so future airings get a permanent Plex-native sub.
-        // We don't await — Bazarr + Plex scan latency is way longer than the watch RTT.
-        // Prefer Plex metadata (grandparentTitle/parentIndex/index) over our local programs row:
-        // the LiveTV scanner sometimes leaves season_num null for older series, which would
-        // cause findBazarrEpisodeId to bail before even looking.
-        try {
-          const dbProg = db.prepare('SELECT show_title, season_num, episode_num FROM programs WHERE plex_rating_key = ?').get(String(ratingKey)) || {};
-          const prog = {
-            show_title: metadata?.grandparentTitle || dbProg.show_title || null,
-            season_num: (metadata?.parentIndex != null ? metadata.parentIndex : dbProg.season_num),
-            episode_num: (metadata?.index != null ? metadata.index : dbProg.episode_num)
-          };
-          if (prog.show_title) kickBazarrSearch(ratingKey, prog, _subPref.language);
-        } catch(e) { /* ignore */ }
-
-        // Immediate-gratification fallback: OpenSubtitles sidecar SRT for THIS airing.
-        try {
-          const os = await findOpenSubtitlesSubtitle(ratingKey, _subPref.language);
-          if (os) {
-            const lc = osLangCode(_subPref.language);
-            sidecarTrack = { url: `/api/livetv/subs/${ratingKey}/${lc}.vtt`, srclang: lc, label: lc.toUpperCase() };
-            console.log(`LiveTV Watch: OpenSubtitles sidecar for "${title}" rk=${ratingKey} lang=${lc}`);
-          }
-        } catch(e) { /* swallow — playback continues without subs */ }
-      }
-    }
-    // Desktop app (Electron/Chromium) can direct-play H264 and HEVC in MP4/MKV;
-    // browser can only direct-play H264 in MP4/M4V/MOV. Plex-burn subs force transcode;
-    // sidecar subs do not.
-    const needsBurnTranscode = !!plexSubStreamId;
-    const canDirectPlay = !needsBurnTranscode && audioOk && (isDesktopApp
+    const subsRequested = !!(_subPref.language && _subPref.mode === 'burn');
+    const canDirectPlay = !subsRequested && audioOk && (isDesktopApp
       ? ['h264', 'hevc', 'h265'].includes(videoCodec) && ['mp4', 'm4v', 'mov', 'mkv'].includes(container)
       : videoCodec === 'h264' && ['mp4', 'm4v', 'mov'].includes(container));
 
@@ -6406,6 +5763,10 @@ app.get('/api/livetv/watch/:channelId', async (req, res) => {
       // Only allow direct stream for Chromium-safe audio; otherwise full transcode
       const chromiumAudio = ['aac', 'mp3', 'opus', 'flac', 'vorbis'];
       const audioSafe = chromiumAudio.includes((media?.audioCodec || '').toLowerCase());
+      const subSettings = readSubtitleSettings();
+      const subStreamId = (subSettings.language && subSettings.mode === 'burn')
+        ? pickPlexSubtitleStreamId(media, subSettings.language)
+        : null;
       const transcodeParams = {
         path: `/library/metadata/${ratingKey}`,
         mediaIndex: pickedMediaIndex,
@@ -6428,14 +5789,14 @@ app.get('/api/livetv/watch/:channelId', async (req, res) => {
         'X-Plex-Client-Identifier': sessionId,
         'X-Plex-Token': config.plex.token
       };
-      if (plexSubStreamId) {
-        transcodeParams.subtitleStream = String(plexSubStreamId);
+      if (subStreamId) {
+        transcodeParams.subtitleStream = String(subStreamId);
         // `subtitles=burn` forces Plex to render the sub into the video frame. Without this,
         // Plex picks per-client capability and for browsers defaults to sidecar SRT — which
         // <video> can't display. Burning is the only way to guarantee subs in our web/desktop
         // player.
         transcodeParams.subtitles = 'burn';
-        console.log(`LiveTV Watch: Burning '${_subPref.language}' subtitle (Plex stream id=${plexSubStreamId}) for ${title}`);
+        console.log(`LiveTV Watch: Burning '${subSettings.language}' subtitle (Plex stream id=${subStreamId}) for ${title}`);
       }
       // Call decision endpoint first to set up the transcode session (required by Plex)
       try {
@@ -6485,6 +5846,16 @@ app.get('/api/livetv/watch/:channelId', async (req, res) => {
     console.log(`LiveTV Watch: Fallback transcode for ${title}:`, e.message);
   }
 
+  // Desktop app (Electron): Plex transcode returns HLS which stalls at segment boundaries.
+  // Redirect to PCC's own MPEG-TS ffmpeg pipeline — same schedule position, no segment gaps.
+  if (req.query.client === 'desktop' && streamType === 'transcode') {
+    const baseUrl = getBaseUrl(req);
+    streamUrl = `${baseUrl}/api/livetv/stream/${channelId}.ts`;
+    streamType = 'mpegts';
+    sessionId = null; // no Plex transcode session; stopPlexSession guards on null
+    console.log(`LiveTV Watch: Desktop → MPEG-TS pipeline for transcode content (${title})`);
+  }
+
   // Generate a watchId for tracking (used for both direct and transcode sessions)
   const watchId = sessionId || `PCC-Direct-${Date.now()}`;
 
@@ -6516,8 +5887,7 @@ app.get('/api/livetv/watch/:channelId', async (req, res) => {
     sessionId,
     watchId,
     isFiller,
-    contentType: current.item.program_id ? (current.item.prog_type || 'program') : 'filler',
-    subtitleTrack: sidecarTrack
+    contentType: current.item.program_id ? (current.item.prog_type || 'program') : 'filler'
   });
 });
 
@@ -6541,42 +5911,22 @@ app.get('/api/livetv/watch/:channelId/from-start', async (req, res) => {
   // <video> can't decode those audio codecs. Forcing Plex to transcode audio to AAC fixes that.
   let streamUrl, streamType = 'transcode', sessionId = `PCC-WFS-${Date.now()}`;
   let media = null;
-  let metadata = null;
   let pickedMediaIndex = '0';
   try {
     const metaRes = await axios.get(`${config.plex.url}/library/metadata/${ratingKey}`, {
       params: { 'X-Plex-Token': config.plex.token },
       headers: { Accept: 'application/json' }, timeout: 5000
     });
-    metadata = metaRes.data?.MediaContainer?.Metadata?.[0];
+    const metadata = metaRes.data?.MediaContainer?.Metadata?.[0];
     const picked = await pickPlayableMedia(ratingKey, metadata);
     media = picked?.media || metadata?.Media?.[0];
     if (picked) pickedMediaIndex = String(picked.mediaIdx);
   } catch(e) { /* fall through — we can still build a transcode URL without metadata */ }
 
   const subSettings = readSubtitleSettings();
-  const wantsSubs = !!(subSettings.language && subSettings.mode === 'burn');
-  const subStreamId = wantsSubs ? pickPlexSubtitleStreamId(media, subSettings.language, { textOnly: true }) : null;
-  let sidecarTrack = null;
-  if (wantsSubs && !subStreamId) {
-    try {
-      const dbProg = db.prepare('SELECT show_title, season_num, episode_num FROM programs WHERE plex_rating_key = ?').get(String(ratingKey)) || {};
-      const prog = {
-        show_title: metadata?.grandparentTitle || dbProg.show_title || null,
-        season_num: (metadata?.parentIndex != null ? metadata.parentIndex : dbProg.season_num),
-        episode_num: (metadata?.index != null ? metadata.index : dbProg.episode_num)
-      };
-      if (prog.show_title) kickBazarrSearch(ratingKey, prog, subSettings.language);
-    } catch(e) { /* ignore */ }
-    try {
-      const os = await findOpenSubtitlesSubtitle(ratingKey, subSettings.language);
-      if (os) {
-        const lc = osLangCode(subSettings.language);
-        sidecarTrack = { url: `/api/livetv/subs/${ratingKey}/${lc}.vtt`, srclang: lc, label: lc.toUpperCase() };
-        console.log(`[LiveTV/from-start] OpenSubtitles sidecar for "${title}" rk=${ratingKey} lang=${lc}`);
-      }
-    } catch(e) { /* swallow */ }
-  }
+  const subStreamId = (subSettings.language && subSettings.mode === 'burn')
+    ? pickPlexSubtitleStreamId(media, subSettings.language)
+    : null;
 
   const params = {
     path: `/library/metadata/${ratingKey}`, mediaIndex: pickedMediaIndex, partIndex: '0',
@@ -6610,153 +5960,8 @@ app.get('/api/livetv/watch/:channelId/from-start', async (req, res) => {
     seasonNum: current.item.season_num || null,
     episodeNum: current.item.episode_num || null,
     channelId: ch.id, channelName: ch.name, channelNumber: ch.number,
-    offsetSec: 0, sessionId, watchId, fromStart: true,
-    subtitleTrack: sidecarTrack
+    offsetSec: 0, sessionId, watchId, fromStart: true
   });
-});
-
-// --- LiveTV subtitle pre-cache scanner ---
-// Walks every program in enabled channels, checks Plex for the configured-language sub,
-// and asks OpenSubtitles to fetch missing ones. The point: by the time you tune to an
-// episode, the SRT is already on PCC's disk (and ideally already uploaded to Plex) so the
-// first watch is instant — no live 2-4s OS round-trip in the play path.
-let _subScanState = { running: false, total: 0, done: 0, fetched: 0, plexHad: 0, alreadyCached: 0, uploaded: 0, noMatch: 0, errors: 0, startedAt: null, finishedAt: null, lastError: null };
-
-async function scanLiveTVForMissingSubs(opts = {}) {
-  if (_subScanState.running) throw new Error('scan already running');
-  const { language } = readSubtitleSettings();
-  if (!language) throw new Error('no subtitle_language configured');
-  if (!config.opensubtitles.apiKey) throw new Error('OpenSubtitles not configured');
-  const throttleMs = Math.max(500, opts.throttleMs || 3000); // delay between OS network hits
-  const limit = opts.limit > 0 ? opts.limit : null;
-  const lc = osLangCode(language);
-
-  // De-dupe by rkey so a program that appears on multiple channels is only checked once.
-  let rows = db.prepare(`
-    SELECT DISTINCT p.plex_rating_key as rkey, p.show_title, p.season_num, p.episode_num
-    FROM channel_programming cp
-    JOIN channels c ON cp.channel_id = c.id
-    JOIN programs p ON cp.program_id = p.id
-    WHERE c.enabled = 1 AND p.plex_rating_key IS NOT NULL
-  `).all();
-  if (limit) rows = rows.slice(0, limit);
-
-  _subScanState = { running: true, total: rows.length, done: 0, fetched: 0, plexHad: 0, alreadyCached: 0, uploaded: 0, noMatch: 0, errors: 0, startedAt: new Date().toISOString(), finishedAt: null, lastError: null };
-  console.log(`[SubScan] starting: ${rows.length} programs, lang=${lc}, throttle=${throttleMs}ms`);
-
-  try {
-    for (const row of rows) {
-      if (!_subScanState.running) break; // allow external cancel
-      try {
-        const destPath = path.join(SUBS_CACHE_DIR, `${row.rkey}.${lc}.srt`);
-        if (fs.existsSync(destPath)) { _subScanState.alreadyCached++; continue; }
-
-        // Quick Plex metadata check first — no network cost on the OS side.
-        let plexHas = false;
-        try {
-          const meta = await axios.get(`${config.plex.url}/library/metadata/${row.rkey}`, {
-            params: { 'X-Plex-Token': config.plex.token },
-            headers: { Accept: 'application/json' }, timeout: 5000
-          });
-          const media = meta.data?.MediaContainer?.Metadata?.[0]?.Media?.[0];
-          if (pickPlexSubtitleStreamId(media, language, { textOnly: true })) plexHas = true;
-        } catch (e) { /* metadata error → still try OS */ }
-
-        if (plexHas) { _subScanState.plexHad++; continue; }
-
-        // Respect cooldown set by OS 429/503 — don't even try if we're throttled.
-        if (Date.now() < _osCooldownUntil) { _subScanState.errors++; continue; }
-
-        const r = await findOpenSubtitlesSubtitle(row.rkey, language);
-        if (r) {
-          _subScanState.fetched++;
-          // findOpenSubtitlesSubtitle already fires Plex upload async; track it best-effort.
-          _subScanState.uploaded++;
-        } else {
-          _subScanState.noMatch++;
-        }
-        // Throttle so we don't blow the daily OS quota in one minute.
-        await new Promise(r => setTimeout(r, throttleMs));
-      } catch (e) {
-        _subScanState.errors++;
-        _subScanState.lastError = e.message;
-      } finally {
-        _subScanState.done++;
-      }
-    }
-  } finally {
-    _subScanState.running = false;
-    _subScanState.finishedAt = new Date().toISOString();
-    console.log(`[SubScan] done: fetched=${_subScanState.fetched} plexHad=${_subScanState.plexHad} cached=${_subScanState.alreadyCached} noMatch=${_subScanState.noMatch} errors=${_subScanState.errors}`);
-  }
-  return _subScanState;
-}
-
-app.post('/api/livetv/subs/scan', requireAdmin, (req, res) => {
-  if (_subScanState.running) return res.status(409).json({ error: 'scan already running', state: _subScanState });
-  const throttleMs = parseInt(req.query.throttleMs) || undefined;
-  const limit = parseInt(req.query.limit) || undefined;
-  scanLiveTVForMissingSubs({ throttleMs, limit }).catch(e => { _subScanState.lastError = e.message; console.warn('[SubScan] error:', e.message); });
-  res.json({ ok: true, state: _subScanState });
-});
-app.post('/api/livetv/subs/scan/stop', requireAdmin, (req, res) => {
-  _subScanState.running = false;
-  res.json({ ok: true, state: _subScanState });
-});
-app.get('/api/livetv/subs/status', requireAdmin, (req, res) => {
-  let cacheCount = 0, cacheBytes = 0;
-  try {
-    for (const f of fs.readdirSync(SUBS_CACHE_DIR)) {
-      if (!f.endsWith('.srt')) continue;
-      cacheCount++;
-      try { cacheBytes += fs.statSync(path.join(SUBS_CACHE_DIR, f)).size; } catch(e) {}
-    }
-  } catch(e) {}
-  res.json({
-    scan: _subScanState,
-    cache: { count: cacheCount, bytes: cacheBytes, dir: SUBS_CACHE_DIR },
-    quota: _osQuotaState,
-    cooldownUntil: _osCooldownUntil > Date.now() ? new Date(_osCooldownUntil).toISOString() : null,
-    language: readSubtitleSettings().language || null
-  });
-});
-
-// Nightly scan at 03:00 local. setInterval polls each minute and runs once when the hour
-// hits — keeps the cache warm for new episodes added by the channel scanner.
-let _subScanDoneToday = null;
-setInterval(() => {
-  try {
-    if (!config.opensubtitles.apiKey) return;
-    if (!LIVETV_ENABLED) return;
-    if (_subScanState.running) return;
-    const now = new Date();
-    if (now.getHours() !== 3) return;
-    const key = now.toISOString().slice(0, 10);
-    if (_subScanDoneToday === key) return;
-    _subScanDoneToday = key;
-    console.log('[SubScan] cron tick — nightly pre-cache run');
-    scanLiveTVForMissingSubs().catch(e => console.warn('[SubScan] cron error:', e.message));
-  } catch(e) { /* ignore */ }
-}, 60 * 1000);
-
-// Serve a cached OpenSubtitles SRT as WebVTT for <track> playback. Path matches the URL
-// shape returned in the watch response (subtitleTrack.url). Reads from SUBS_CACHE_DIR so
-// only subs already fetched by findOpenSubtitlesSubtitle are served — this endpoint never
-// triggers a download itself.
-app.get('/api/livetv/subs/:rkey/:lang.vtt', (req, res) => {
-  const rkey = String(req.params.rkey).replace(/[^0-9]/g, '');
-  const lang = String(req.params.lang).replace(/[^a-z]/gi, '').toLowerCase();
-  if (!rkey || !lang) return res.status(400).send('bad params');
-  const srtPath = path.join(SUBS_CACHE_DIR, `${rkey}.${lang}.srt`);
-  if (!fs.existsSync(srtPath)) return res.status(404).send('no subs');
-  try {
-    const vtt = srtToWebVTT(fs.readFileSync(srtPath, 'utf8'));
-    res.set('Content-Type', 'text/vtt; charset=utf-8');
-    res.set('Cache-Control', 'public, max-age=86400');
-    res.send(vtt);
-  } catch (e) {
-    res.status(500).send('read failed');
-  }
 });
 
 // Stop a watch session
@@ -7051,46 +6256,23 @@ function readSubtitleSettings() {
 // code. Returns the Plex Stream id or null. This is used to drive `subtitleStream=<id>` on the
 // Plex /video/:/transcode/universal/start URL so Plex burns the chosen sub into the video stream
 // (the only way to get subtitles into a <video> element via Plex's direct transcode pipeline).
-// Prefer text-based subtitle codecs (srt/ass/vtt) over image-based ones (pgs/vobsub/dvdsub)
-// for the same language. Plex's transcoder can technically burn image subs but in practice it
-// often silently no-ops on them — meanwhile if the same file has an srt track in the same
-// language we should pick that one. This is the root cause of "The Office has subs but burn
-// doesn't fire": picker used to return whichever sub came first in the Stream array, which
-// for many ripped episodes is the pgs/vobsub track.
-const PLEX_PICK_TEXT_SUBS = new Set(['srt', 'ass', 'ssa', 'vtt', 'webvtt', 'ttml', 'subrip', 'mov_text', 'sub']);
-const PLEX_PICK_IMAGE_SUBS = new Set(['pgs', 'pgssub', 'hdmv_pgs', 'vobsub', 'dvdsub', 'dvd_subtitle', 'xsub']);
-function pickPlexSubtitleStreamId(media, langCode, opts = {}) {
+function pickPlexSubtitleStreamId(media, langCode) {
   if (!langCode) return null;
   const target = String(langCode).toLowerCase();
-  // `target.startsWith(lang)` would match an empty `lang` (every string starts with '');
-  // that turned untagged tracks into false-positive matches. Strip trim and require length.
-  const matches = []; // collect every language match, then sort by codec preference
   for (const part of (media?.Part || [])) {
     for (const s of (part.Stream || [])) {
       if (s.streamType !== 3) continue; // 1=video, 2=audio, 3=subtitle
-      const lang = (s.languageCode || s.language || s.languageTag || '').toLowerCase().trim();
-      if (!lang) continue; // untagged stream — can't claim it matches any specific language
-      const matchesLang = lang === target
-        || (target.length > 1 && lang.startsWith(target))
-        || (lang.length > 1 && target.startsWith(lang));
-      if (!matchesLang) continue;
-      const codec = String(s.codec || '').toLowerCase();
-      const isImage = PLEX_PICK_IMAGE_SUBS.has(codec);
-      // Caller can opt out of image-codec results entirely: Plex's burn pipeline often
-      // silently no-ops on PGS/VobSub, so counting them as "Plex has a sub" leaves users
-      // with no subs and OS never gets consulted. The scanner sets textOnly=true.
-      if (opts.textOnly && isImage) continue;
-      // Rank: 0 = text (best for burning), 1 = unknown/other, 2 = image (Plex flakes on these)
-      let rank = 1;
-      if (PLEX_PICK_TEXT_SUBS.has(codec)) rank = 0;
-      else if (isImage) rank = 2;
-      const tieBreak = (s.forced ? 2 : 0) + (s.hearingImpaired ? 1 : 0);
-      matches.push({ id: s.id, rank, tieBreak, codec });
+      const lang = (s.languageCode || s.language || s.languageTag || '').toLowerCase();
+      // An empty `lang` (stream has no language metadata at all) must never match — every
+      // string "starts with" '', so target.startsWith(lang) is true for lang='' and used to
+      // wrongly treat untagged streams as a match for whatever language is configured. Plex's
+      // own transcode decision engine silently drops such untagged streams from the burn plan
+      // anyway (confirmed via /video/:/transcode/universal/decision), so matching them here
+      // just picks a stream that will never actually render.
+      if (lang && (lang === target || lang.startsWith(target) || target.startsWith(lang))) return s.id;
     }
   }
-  if (matches.length === 0) return null;
-  matches.sort((a, b) => a.rank - b.rank || a.tieBreak - b.tieBreak);
-  return matches[0].id;
+  return null;
 }
 
 // --- OpenSubtitles fallback ---
@@ -7099,17 +6281,20 @@ function pickPlexSubtitleStreamId(media, langCode, opts = {}) {
 // OPENSUBTITLES_USERNAME, and OPENSUBTITLES_PASSWORD env vars are set; otherwise no-op.
 // API docs: https://opensubtitles.stoplight.io/docs/opensubtitles-api/
 const OPENSUBTITLES_API = 'https://api.opensubtitles.com/api/v1';
-const SUBS_CACHE_DIR = paths.subsCacheDir;
+const SUBS_CACHE_DIR = '/app/data/subs';
 const OS_USER_AGENT = 'PlexCommandCenter v3.0';
 let _osTokenCache = { token: null, expiresAt: 0 };
-// Hard backoff after OS returns 429 or 503: skip subsequent calls until this timestamp.
-// Set by osRetry on the final failed attempt so the scanner doesn't burn through quota
-// pounding a degraded endpoint.
 let _osCooldownUntil = 0;
+let _osQuotaState = { remaining: null, resetTime: null, updatedAt: null };
 
-// Retry helper. OS frequently returns 429 (quota/rate) and 503 (transient). Retries with
-// jittered backoff, honoring Retry-After when present. Throws the last error if all
-// attempts fail. Updates _osCooldownUntil on terminal 429/503 so callers can skip new work.
+function osLangCode(code) {
+  const map = { eng:'en', heb:'he', spa:'es', fre:'fr', fra:'fr', ger:'de', deu:'de', ita:'it',
+                por:'pt', rus:'ru', jpn:'ja', chi:'zh', zho:'zh', ara:'ar', nld:'nl', dut:'nl',
+                swe:'sv', nor:'no', dan:'da', fin:'fi', pol:'pl', tur:'tr', kor:'ko' };
+  const c = String(code || '').toLowerCase();
+  return map[c] || c.slice(0, 2);
+}
+
 async function osRetry(fn, opName) {
   const delays = [1500, 4500, 12000];
   let last;
@@ -7122,31 +6307,18 @@ async function osRetry(fn, opName) {
         || (!status && (e.code === 'ECONNRESET' || e.code === 'ETIMEDOUT' || e.code === 'EAI_AGAIN'));
       if (!retriable || i === delays.length) {
         if (status === 429 || status === 503) {
-          // Distinguish rate-limit-second (transient, recovers in seconds) from daily-quota /
-          // outage. 429 with Retry-After: cooldown the suggested time. 503 without Retry-After:
-          // OS flaps for short windows — 60s pause is enough, longer just delays first user fetch.
           const retryAfter = parseInt(e.response?.headers?.['retry-after']);
           const cooldown = Number.isFinite(retryAfter) ? retryAfter * 1000 : 60 * 1000;
           _osCooldownUntil = Math.max(_osCooldownUntil, Date.now() + cooldown);
-          const body = typeof e.response?.data === 'string' ? e.response.data.slice(0, 200) : JSON.stringify(e.response?.data || {}).slice(0, 200);
-          console.warn(`[OS] ${opName} terminal ${status}; cooling down ${Math.round(cooldown/1000)}s. body=${body}`);
+          console.warn(`[OS] ${opName} terminal ${status}; cooling ${Math.round(cooldown/1000)}s`);
         } else if (status === 406) {
-          // OpenSubtitles signals *daily download quota exhausted* with a 406 (NOT a 429) on the
-          // /download endpoint. The body carries `remaining:-1` plus a `reset_time_utc`. Without
-          // handling it here we'd re-hit /download for every watch/scan and get 406 in a tight
-          // loop (observed: ~1700 failures in 18h) while silently showing the user "no subs".
-          // Treat it as a long cooldown until the quota renews, and surface it via _osQuotaState
-          // so the admin panel can explain the silence ("quota exhausted, resets in ...").
           const data = e.response?.data || {};
-          if (data && (data.remaining === -1 || data.reset_time_utc)) {
+          if (data.remaining === -1 || data.reset_time_utc) {
             const resetMs = data.reset_time_utc ? Date.parse(data.reset_time_utc) : NaN;
-            const until = Number.isFinite(resetMs) && resetMs > Date.now() ? resetMs : Date.now() + 60 * 60 * 1000;
+            const until = Number.isFinite(resetMs) && resetMs > Date.now() ? resetMs : Date.now() + 3600 * 1000;
             _osCooldownUntil = Math.max(_osCooldownUntil, until);
             _osQuotaState = { remaining: 0, resetTime: data.reset_time || null, updatedAt: new Date().toISOString() };
-            console.warn(`[OS] ${opName} quota exhausted (406); cooling down until ${new Date(until).toISOString()} (renews in ${data.reset_time || '?'})`);
-          } else {
-            const body = typeof e.response?.data === 'string' ? e.response.data.slice(0, 200) : JSON.stringify(data).slice(0, 200);
-            console.warn(`[OS] ${opName} terminal 406 (non-quota). body=${body}`);
+            console.warn(`[OS] ${opName} quota exhausted (406); cooldown until ${new Date(until).toISOString()}`);
           }
         }
         throw e;
@@ -7159,15 +6331,6 @@ async function osRetry(fn, opName) {
     }
   }
   throw last;
-}
-
-// OpenSubtitles uses ISO 639-1 (2-letter); Plex uses 639-2 (3-letter). Map the common ones.
-function osLangCode(code) {
-  const map = { eng:'en', heb:'he', spa:'es', fre:'fr', fra:'fr', ger:'de', deu:'de', ita:'it',
-                por:'pt', rus:'ru', jpn:'ja', chi:'zh', zho:'zh', ara:'ar', nld:'nl', dut:'nl',
-                swe:'sv', nor:'no', dan:'da', fin:'fi', pol:'pl', tur:'tr', kor:'ko' };
-  const c = String(code || '').toLowerCase();
-  return map[c] || c.slice(0, 2);
 }
 
 async function osLogin() {
@@ -7191,46 +6354,94 @@ async function osSearch(program, langCode) {
   } else {
     params.type = 'movie';
     if (program.year) params.year = program.year;
+    // Fetch IMDB/TMDB IDs from Plex for more precise timing-accurate SRT matching.
+    // Title+year alone can match multiple releases with different timing offsets.
+    try {
+      const metaRes = await axios.get(`${config.plex.url}/library/metadata/${program.plex_rating_key}`, {
+        params: { 'X-Plex-Token': config.plex.token }, headers: { Accept: 'application/json' }, timeout: 4000
+      });
+      const guids = metaRes.data?.MediaContainer?.Metadata?.[0]?.Guid || [];
+      for (const g of guids) {
+        if (g.id?.startsWith('imdb://')) { params.imdb_id = g.id.replace('imdb://', ''); break; }
+        if (g.id?.startsWith('tmdb://')) { params.tmdb_id = g.id.replace('tmdb://', ''); }
+      }
+    } catch(e) {}
   }
   const r = await osRetry(() => axios.get(`${OPENSUBTITLES_API}/subtitles`, {
-    params, headers: { 'Api-Key': apiKey, 'User-Agent': OS_USER_AGENT, Accept: 'application/json' },
-    timeout: 10000
+    params, headers: { 'Api-Key': apiKey, 'User-Agent': OS_USER_AGENT, Accept: 'application/json' }, timeout: 10000
   }), 'search');
   const data = r.data?.data || [];
   if (!data.length) return null;
-  data.sort((a, b) => (b.attributes?.ratings || 0) - (a.attributes?.ratings || 0));
+  data.sort((a, b) => (b.attributes?.download_count || 0) - (a.attributes?.download_count || 0));
   return data[0]?.attributes?.files?.[0]?.file_id || null;
 }
 
-// Tracked publicly via _osQuotaState so the admin status endpoint can surface it.
-let _osQuotaState = { remaining: null, resetTime: null, updatedAt: null };
 async function osDownload(fileId, destPath) {
   const apiKey = config.opensubtitles.apiKey;
   const token = await osLogin();
   if (!apiKey || !token) return false;
   const r = await osRetry(() => axios.post(`${OPENSUBTITLES_API}/download`, { file_id: fileId },
-    { headers: { 'Api-Key': apiKey, 'Authorization': `Bearer ${token}`, 'User-Agent': OS_USER_AGENT, 'Content-Type': 'application/json', Accept: 'application/json' }, timeout: 10000 }),
-    'download/link');
+    { headers: { 'Api-Key': apiKey, 'Authorization': `Bearer ${token}`, 'User-Agent': OS_USER_AGENT, 'Content-Type': 'application/json', Accept: 'application/json' }, timeout: 10000 }), 'download/link');
   if (!r.data?.link) return false;
   _osQuotaState = { remaining: r.data.remaining ?? null, resetTime: r.data.reset_time || null, updatedAt: new Date().toISOString() };
   const fileRes = await osRetry(() => axios.get(r.data.link, { responseType: 'arraybuffer', timeout: 15000 }), 'download/file');
   await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
   await fs.promises.writeFile(destPath, Buffer.from(fileRes.data));
-  console.log(`[OpenSubtitles] cached -> ${destPath} (${fileRes.data.length}b, quota remaining today: ${r.data.remaining})`);
+  console.log(`[OpenSubtitles] cached -> ${destPath} (${fileRes.data.length}b, quota remaining: ${r.data.remaining})`);
   return true;
 }
 
-// --- Plex subtitle upload (Plex Pass) ---
-// Push a cached SRT into Plex's library as an external sub stream so EVERY Plex client
-// (web, mobile, TV) sees it, not just LiveTV. After this lands, the next time we hit
-// /api/livetv/watch the existing Plex-native picker finds the new stream and Plex burns
-// it via universal-transcode — no sidecar needed. Plex Pass is required to upload.
-//
-// Endpoint shape lifted from python-plexapi's Video.uploadSubtitles(): POST to
-// /library/metadata/{rk}/subtitles with the SRT as the raw body, ONLY `title` + `format`
-// in the query, and Accept: text/plain. Plex auto-detects language from the filename
-// (e.g. "12119.en.srt" -> English). Adding a language= param or a Content-Type header
-// makes PMS return 500. Adding language to the filename is the documented way.
+// Ratingkeys get reassigned to different content on a library rescan/rebuild (see
+// [[project_plex_api_quirks]] point 4). Anything we cache or upload keyed by rkey needs to be
+// checked against the program's current `guid` before being trusted, or a stale-content bug
+// results: a rescan reassigns rk=X from Movie A to Movie B, and PCC keeps serving Movie A's
+// subtitle (wrong text, wrong timing) because the disk cache / Plex-attached stream still exists.
+function _currentProgramGuid(rkey) {
+  const row = db.prepare('SELECT guid FROM programs WHERE plex_rating_key = ?').get(String(rkey));
+  return row?.guid || null;
+}
+function _recordSubtitleUpload(rkey, langCode, guid) {
+  db.prepare(`
+    INSERT INTO subtitle_uploads (rkey, lang, guid, uploaded_at) VALUES (?,?,?, datetime('now'))
+    ON CONFLICT(rkey, lang) DO UPDATE SET guid=excluded.guid, uploaded_at=datetime('now')
+  `).run(String(rkey), osLangCode(langCode), guid || null);
+}
+// Returns true when we previously uploaded a subtitle for (rkey, lang) tagged with a guid that
+// no longer matches what's currently at that ratingKey — i.e. the upload belongs to whatever
+// content used to live at this rkey before a rescan reassigned it.
+function _isStaleSubtitleUpload(rkey, langCode) {
+  const rec = db.prepare('SELECT guid FROM subtitle_uploads WHERE rkey = ? AND lang = ?')
+    .get(String(rkey), osLangCode(langCode));
+  if (!rec) return false;
+  const currentGuid = _currentProgramGuid(rkey);
+  if (!currentGuid || !rec.guid) return false; // can't prove staleness without both guids — leave alone
+  return rec.guid !== currentGuid;
+}
+// Stricter check used against subtitle streams Plex already has attached. `uploadSubToPlex`
+// always sets the stream's `title` to `<rkey>.<lang>` (e.g. "4766.en"), so a stream with that
+// exact title was uploaded by PCC at some point. If it isn't in `subtitle_uploads` at all, it
+// predates that tracking table (added when this guid-fix shipped) — we have no historical guid
+// to compare, so we can't prove it's fine either. Treat "ours by naming convention but untracked"
+// the same as a proven mismatch: don't trust it, and let it get re-verified/re-fetched. This is
+// what actually cleans up subtitles that went stale from a rescan *before* this fix existed.
+function _shouldDistrustPlexUploadedStream(rkey, langCode, streamTitle) {
+  const lc = osLangCode(langCode);
+  if (streamTitle !== `${rkey}.${lc}`) return false; // not our naming convention — never touch
+  const rec = db.prepare('SELECT guid FROM subtitle_uploads WHERE rkey = ? AND lang = ?').get(String(rkey), lc);
+  if (!rec) return true; // ours, but predates tracking — unproven
+  const currentGuid = _currentProgramGuid(rkey);
+  if (!currentGuid) return false; // scan hasn't populated a guid yet — nothing to compare against
+  return rec.guid !== currentGuid;
+}
+function _clearStaleSubtitleCache(rkey, langCode) {
+  const destPath = path.join(SUBS_CACHE_DIR, `${rkey}.${osLangCode(langCode)}.srt`);
+  try { if (fs.existsSync(destPath)) fs.unlinkSync(destPath); } catch(e) {}
+  try { db.prepare('DELETE FROM subtitle_uploads WHERE rkey = ? AND lang = ?').run(String(rkey), osLangCode(langCode)); } catch(e) {}
+  for (const k of [..._subtitleProbeCache.keys()]) {
+    if (k.startsWith(`${rkey}|`)) _subtitleProbeCache.delete(k);
+  }
+}
+
 async function uploadSubToPlex(rkey, srtPath, langCode) {
   if (!config.plex.url || !config.plex.token) return false;
   try {
@@ -7239,32 +6450,31 @@ async function uploadSubToPlex(rkey, srtPath, langCode) {
     const filename = `${rkey}.${lc}.srt`;
     await axios.post(`${config.plex.url}/library/metadata/${rkey}/subtitles`, buf, {
       params: { title: filename, format: 'srt', 'X-Plex-Token': config.plex.token },
-      headers: { Accept: 'text/plain, */*' },
-      timeout: 15000,
-      maxContentLength: 5 * 1024 * 1024,
-      maxBodyLength: 5 * 1024 * 1024
+      headers: { Accept: 'text/plain, */*' }, timeout: 15000,
+      maxContentLength: 5 * 1024 * 1024, maxBodyLength: 5 * 1024 * 1024
     });
     console.log(`[Plex] uploaded SRT for rk=${rkey} as ${filename} (${buf.length}b)`);
-    // Bust local probe cache so the next watch sees the new Plex stream
+    _recordSubtitleUpload(rkey, langCode, _currentProgramGuid(rkey));
     for (const k of [..._subtitleProbeCache.keys()]) {
       if (k.startsWith(`${rkey}|`)) _subtitleProbeCache.delete(k);
     }
     return true;
   } catch (e) {
-    const status = e.response?.status;
-    const body = typeof e.response?.data === 'string' ? e.response.data.slice(0, 250) : '';
-    console.warn(`[Plex] subtitle upload failed for rk=${rkey}: ${status||e.code} ${body}`);
+    console.warn(`[Plex] subtitle upload failed for rk=${rkey}: ${e.response?.status||e.code}`);
     return false;
   }
 }
 
 async function findOpenSubtitlesSubtitle(rkey, langCode) {
   if (!config.opensubtitles.apiKey) return null;
+  if (_isStaleSubtitleUpload(rkey, langCode)) {
+    console.log(`[OpenSubtitles] cached sub for rk=${rkey} lang=${langCode} belongs to a different guid (ratingKey was reassigned) — purging and refetching`);
+    _clearStaleSubtitleCache(rkey, langCode);
+  }
   const destPath = path.join(SUBS_CACHE_DIR, `${rkey}.${osLangCode(langCode)}.srt`);
   if (fs.existsSync(destPath)) return { kind: 'external', url: destPath, codec: 'srt' };
-  // Bail if a previous call hit a 429/503 cooldown — coming back too soon just burns more quota.
   if (Date.now() < _osCooldownUntil) {
-    console.log(`[OpenSubtitles] in cooldown until ${new Date(_osCooldownUntil).toISOString()}, skipping rk=${rkey}`);
+    console.log(`[OpenSubtitles] cooldown active until ${new Date(_osCooldownUntil).toISOString()}, skipping rk=${rkey}`);
     return null;
   }
   const program = db.prepare('SELECT * FROM programs WHERE plex_rating_key = ?').get(String(rkey));
@@ -7272,15 +6482,19 @@ async function findOpenSubtitlesSubtitle(rkey, langCode) {
   try {
     const fileId = await osSearch(program, langCode);
     if (!fileId) {
-      console.log(`[OpenSubtitles] no match: "${program.show_title || program.title}" S${program.season_num || '?'}E${program.episode_num || '?'} lang=${osLangCode(langCode)}`);
+      console.log(`[OpenSubtitles] no match: "${program.show_title || program.title}" lang=${osLangCode(langCode)}`);
       return null;
     }
     const ok = await osDownload(fileId, destPath);
-    if (ok) {
-      // Fire-and-forget Plex upload — pushes the sub into the library for cross-client use
-      // and for future native-burn in LiveTV. Doesn't block the sidecar response for this airing.
-      uploadSubToPlex(rkey, destPath, langCode).catch(()=>{});
+    if (ok && program.duration_ms) {
+      const srtText = await fs.promises.readFile(destPath, 'utf8').catch(() => '');
+      if (!_srtMatchesDuration(srtText, program.duration_ms)) {
+        console.warn(`[OpenSubtitles] rejecting rk=${rkey} "${program.show_title || program.title}": subtitle runtime doesn't match video (likely wrong cut/release)`);
+        try { fs.unlinkSync(destPath); } catch(e) {}
+        return null;
+      }
     }
+    if (ok) uploadSubToPlex(rkey, destPath, langCode).catch(()=>{});
     return ok ? { kind: 'external', url: destPath, codec: 'srt' } : null;
   } catch (e) {
     console.warn(`[OpenSubtitles] fetch failed for rk=${rkey}:`, e.response?.status || e.message);
@@ -7288,84 +6502,111 @@ async function findOpenSubtitlesSubtitle(rkey, langCode) {
   }
 }
 
-// --- Bazarr search-trigger for LiveTV ---
-// When Plex has no native sub track and the user has a sub language configured, we ask
-// Bazarr to search providers (Sonarr-side) and write the SRT into Plex's library. Bazarr
-// + Plex scan latency means this won't help the *current* airing — that's what the
-// OpenSubtitles sidecar is for. Bazarr is the permanent fix: on the next airing the sub
-// is part of the Plex stream and gets burned in like any other.
-const _bazarrSearchedRecent = new Map(); // key=`${rkey}|${lang}` -> ts (ms)
-function _bazarrSearchedRecently(rkey, lang) {
-  const k = `${rkey}|${lang}`;
-  const ts = _bazarrSearchedRecent.get(k);
-  if (ts && Date.now() - ts < 60 * 60 * 1000) return true;
-  _bazarrSearchedRecent.set(k, Date.now());
-  if (_bazarrSearchedRecent.size > 500) {
-    const cutoff = Date.now() - 60 * 60 * 1000;
-    for (const [kk, vv] of _bazarrSearchedRecent) if (vv < cutoff) _bazarrSearchedRecent.delete(kk);
+// Different releases/cuts of the same title (theatrical vs extended, DVD vs BluRay, etc.) commonly
+// carry subtitle files timed for a DIFFERENT runtime. OpenSubtitles' title+season/episode text
+// search has no way to tell those apart, so it can hand back a subtitle whose dialogue lines up
+// at the start but drifts increasingly wrong — "completely wrong content" further into playback.
+// Comparing the SRT's last timestamp against the video's actual duration catches gross mismatches
+// (found via a real case: a 90-min BluRay rip got an ~85-min-cut subtitle, 4.5min off) without
+// false-rejecting normal dialogue-free end credits, which is why the tolerance is generous.
+const SUBTITLE_DURATION_TOLERANCE_MS = 4 * 60 * 1000;
+function _srtLastTimestampMs(srtText) {
+  const matches = [...String(srtText || '').matchAll(/(\d\d):(\d\d):(\d\d)[,.](\d\d\d)\s*-->/g)];
+  let maxMs = 0;
+  for (const m of matches) {
+    const ms = (+m[1] * 3600 + +m[2] * 60 + +m[3]) * 1000 + +m[4];
+    if (ms > maxMs) maxMs = ms;
   }
-  return false;
+  return maxMs;
 }
-// Cache Bazarr's series list — it can be huge and we look up a series per uncached episode.
-const _bazarrSeriesCache = { rows: null, fetchedAt: 0 };
-async function _bazarrAllSeries() {
-  if (_bazarrSeriesCache.rows && Date.now() - _bazarrSeriesCache.fetchedAt < 30 * 60 * 1000) {
-    return _bazarrSeriesCache.rows;
-  }
-  const d = await bazarrGet('/api/series', { length: 10000 });
-  const rows = Array.isArray(d?.data) ? d.data : [];
-  _bazarrSeriesCache.rows = rows;
-  _bazarrSeriesCache.fetchedAt = Date.now();
-  return rows;
-}
-async function findBazarrEpisodeId(showTitle, seasonNum, episodeNum) {
-  if (!config.bazarr.url || !config.bazarr.apiKey) return null;
-  if (!showTitle || seasonNum == null || episodeNum == null) return null;
-  try {
-    const series = await _bazarrAllSeries();
-    const lt = String(showTitle).toLowerCase();
-    let match = series.find(s => String(s.title || '').toLowerCase() === lt);
-    if (!match) match = series.find(s => {
-      const t = String(s.title || '').toLowerCase();
-      return t && (t.includes(lt) || lt.includes(t));
-    });
-    if (!match) return null;
-    const eps = await bazarrGet('/api/episodes', { seriesid: [match.sonarrSeriesId] });
-    const items = Array.isArray(eps?.data) ? eps.data : [];
-    const want = items.find(e => Number(e.season) === Number(seasonNum) && Number(e.episode) === Number(episodeNum));
-    return want?.sonarrEpisodeId || null;
-  } catch (e) {
-    console.warn('[Bazarr] findBazarrEpisodeId failed:', e.response?.status || e.message);
-    return null;
-  }
-}
-function kickBazarrSearch(rkey, program, langCode) {
-  if (!config.bazarr.url || !config.bazarr.apiKey) return;
-  if (_bazarrSearchedRecently(rkey, langCode)) return;
-  (async () => {
-    try {
-      const epId = await findBazarrEpisodeId(program.show_title, program.season_num, program.episode_num);
-      if (!epId) {
-        console.log(`[Bazarr] no match for "${program.show_title}" S${program.season_num}E${program.episode_num} (rk=${rkey})`);
-        return;
-      }
-      await bazarrPatch('/api/episodes', null, { episodeid: `[${epId}]`, action: 'search-missing' });
-      console.log(`[Bazarr] search kicked for "${program.show_title}" S${program.season_num}E${program.episode_num} rk=${rkey} bazarrEpId=${epId}`);
-    } catch (e) {
-      console.warn(`[Bazarr] kick failed for rk=${rkey}:`, e.response?.status || e.message);
-    }
-  })();
+function _srtMatchesDuration(srtText, durationMs) {
+  if (!durationMs) return true; // no known duration to validate against — accept
+  const srtMs = _srtLastTimestampMs(srtText);
+  if (!srtMs) return true; // couldn't parse any timestamp — don't block on a parse miss
+  return Math.abs(srtMs - durationMs) <= SUBTITLE_DURATION_TOLERANCE_MS;
 }
 
-// Convert an SRT subtitle file to WebVTT so the <video> element's <track> can render it.
-// SRT and WebVTT are nearly identical — WebVTT just wants a header line and dot-millisecond
-// timestamps instead of comma-millisecond. Anything more elaborate (styling, cue settings)
-// we leave alone; browsers tolerate plain converted SRT just fine.
 function srtToWebVTT(srtText) {
   const body = String(srtText || '').replace(/\r\n/g, '\n')
     .replace(/(\d\d:\d\d:\d\d),(\d\d\d)/g, '$1.$2');
   return 'WEBVTT\n\n' + body;
 }
+
+let _subScanState = { running: false, total: 0, done: 0, fetched: 0, plexHad: 0, alreadyCached: 0, uploaded: 0, noMatch: 0, errors: 0, startedAt: null, finishedAt: null, lastError: null };
+
+async function scanLiveTVForMissingSubs(opts = {}) {
+  if (_subScanState.running) throw new Error('scan already running');
+  const { language } = readSubtitleSettings();
+  if (!language) throw new Error('no subtitle_language configured');
+  if (!config.opensubtitles.apiKey) throw new Error('OpenSubtitles not configured');
+  const throttleMs = Math.max(500, opts.throttleMs || 3000);
+  const limit = opts.limit > 0 ? opts.limit : null;
+  const lc = osLangCode(language);
+
+  let rows = db.prepare(`
+    SELECT DISTINCT p.plex_rating_key as rkey, p.show_title, p.season_num, p.episode_num
+    FROM channel_programming cp
+    JOIN channels c ON cp.channel_id = c.id
+    JOIN programs p ON cp.program_id = p.id
+    WHERE c.enabled = 1 AND p.plex_rating_key IS NOT NULL
+  `).all();
+  if (limit) rows = rows.slice(0, limit);
+
+  _subScanState = { running: true, total: rows.length, done: 0, fetched: 0, plexHad: 0, alreadyCached: 0, uploaded: 0, noMatch: 0, errors: 0, startedAt: new Date().toISOString(), finishedAt: null, lastError: null };
+  console.log(`[SubScan] starting: ${rows.length} programs, lang=${lc}, throttle=${throttleMs}ms`);
+
+  try {
+    for (const row of rows) {
+      if (!_subScanState.running) break;
+      try {
+        const destPath = path.join(SUBS_CACHE_DIR, `${row.rkey}.${lc}.srt`);
+        if (fs.existsSync(destPath)) { _subScanState.alreadyCached++; continue; }
+
+        let plexHas = false;
+        try {
+          const meta = await axios.get(`${config.plex.url}/library/metadata/${row.rkey}`,
+            { params: { 'X-Plex-Token': config.plex.token }, headers: { Accept: 'application/json' }, timeout: 5000 });
+          const media = meta.data?.MediaContainer?.Metadata?.[0]?.Media?.[0];
+          if (pickPlexSubtitleStreamId(media, language, { textOnly: true })) plexHas = true;
+        } catch (e) { /* metadata error — still try OS */ }
+
+        if (plexHas) { _subScanState.plexHad++; continue; }
+        if (Date.now() < _osCooldownUntil) { _subScanState.errors++; continue; }
+
+        const r = await findOpenSubtitlesSubtitle(row.rkey, language);
+        if (r) { _subScanState.fetched++; _subScanState.uploaded++; }
+        else    { _subScanState.noMatch++; }
+
+        await new Promise(r => setTimeout(r, throttleMs));
+      } catch (e) {
+        _subScanState.errors++;
+        _subScanState.lastError = e.message;
+      } finally {
+        _subScanState.done++;
+      }
+    }
+  } finally {
+    _subScanState.running = false;
+    _subScanState.finishedAt = new Date().toISOString();
+    console.log(`[SubScan] done: fetched=${_subScanState.fetched} plexHad=${_subScanState.plexHad} cached=${_subScanState.alreadyCached} noMatch=${_subScanState.noMatch} errors=${_subScanState.errors}`);
+  }
+  return _subScanState;
+}
+
+// Nightly pre-cache at 03:00 local
+let _subScanDoneToday = null;
+setInterval(() => {
+  try {
+    if (!config.opensubtitles.apiKey || !LIVETV_ENABLED || _subScanState.running) return;
+    const now = new Date();
+    if (now.getHours() !== 3) return;
+    const key = now.toISOString().slice(0, 10);
+    if (_subScanDoneToday === key) return;
+    _subScanDoneToday = key;
+    console.log('[SubScan] nightly cron tick');
+    scanLiveTVForMissingSubs().catch(e => console.warn('[SubScan] cron error:', e.message));
+  } catch(e) { /* ignore */ }
+}, 60 * 1000);
 
 const _subtitleProbeCache = new Map();
 const SUBTITLE_PROBE_TTL_MS = 5 * 60 * 1000;
@@ -7396,7 +6637,7 @@ async function findPlexSubtitleStream(rkey, fileUrl, langCode) {
   const target = String(langCode).toLowerCase();
 
   // 1) ffprobe of the video URL — finds EMBEDDED subs only.
-  const r = spawnSync(binPath('ffprobe'), [
+  const r = spawnSync('ffprobe', [
     '-v', 'error', '-select_streams', 's',
     '-show_entries', 'stream=index,codec_name:stream_tags=language',
     '-of', 'json', fileUrl
@@ -7416,37 +6657,77 @@ async function findPlexSubtitleStream(rkey, fileUrl, langCode) {
     } catch(e) { /* ignore parse errors */ }
   }
 
-  // 2) Fallback: Plex metadata. Catches external sidecar SRTs that ffprobe of the video can't see.
-  if (!result) {
+  // 2) Plex metadata — always checks for external sidecar SRTs (e.g. our uploaded OS SRTs).
+  // Also runs when ffprobe found embedded PGS/text, because a Plex-managed external SRT lets us
+  // delegate the entire subtitle burn to Plex's transcoder (correct timing, no libass drift).
+  // Only skipped when ffprobe found a non-PGS/non-text embedded stream (e.g. dvd_subtitle).
+  const embeddedNeedsExternalCheck = result?.kind === 'embedded' &&
+    (TEXT_SUB_CODECS.has(result.codec) || result.codec === 'hdmv_pgs_subtitle' || result.codec === 'pgssub');
+  if (!result || embeddedNeedsExternalCheck) {
     try {
       const metaRes = await axios.get(`${config.plex.url}/library/metadata/${rkey}`, {
         params: { 'X-Plex-Token': config.plex.token },
         headers: { Accept: 'application/json' }, timeout: 5000
       });
       const media = metaRes.data?.MediaContainer?.Metadata?.[0]?.Media?.[0];
+      let plexExternal = null;
+      let firstCandidate = null;
+      let sawDistrustedStream = false;
+      const staleUpload = _isStaleSubtitleUpload(rkey, langCode);
+      // Collect ALL matching external candidates instead of stopping at the first one — a Part
+      // can have more than one external sub in the same language (e.g. a sidecar file Plex found
+      // on its own, plus one PCC or Bazarr uploaded later). Prefer whichever Plex itself marks
+      // `selected`, since that's what Plex's own web/mobile clients default to; without this, PCC
+      // could burn a *different* (and possibly wrong-cut) subtitle than what regular Plex playback
+      // shows for the same title.
       for (const part of (media?.Part || [])) {
         for (const s of (part.Stream || [])) {
           if (s.streamType !== 3) continue;
           const lang = (s.languageCode || s.language || '').toLowerCase();
-          if (lang !== target && !lang.startsWith(target) && !target.startsWith(lang)) continue;
+          // Empty lang (no language metadata) must never match — see identical note in
+          // pickPlexSubtitleStreamId. An untagged external stream also gets silently dropped by
+          // Plex's own transcode decision engine, so treating it as a match just burns nothing.
+          if (!lang || (lang !== target && !lang.startsWith(target) && !target.startsWith(lang))) continue;
           // External streams have a `key` like `/library/streams/<id>`; embedded ones don't.
-          // For embedded matches we still need ffmpeg's si= index, but since ffprobe didn't find
-          // one above, treating it as external+key won't make matters worse.
           if (s.key) {
-            const url = `${config.plex.url}${s.key}?X-Plex-Token=${config.plex.token}`;
-            result = { kind: 'external', url, codec: (s.codec || s.format || 'srt').toLowerCase() };
-            break;
+            // If this stream was uploaded by us (title matches our `<rkey>.<lang>` convention)
+            // but either predates our upload-tracking table, or its recorded guid no longer
+            // matches the live content (ratingKey got reassigned by a rescan), it's a leftover
+            // from OLD content — wrong text, wrong timing. Don't trust it; best-effort delete it
+            // from Plex and fall through so we re-search/re-upload against the current content.
+            if (_shouldDistrustPlexUploadedStream(rkey, langCode, s.title)) {
+              sawDistrustedStream = true;
+              console.warn(`[Subtitles] rk=${rkey} lang=${langCode}: Plex-attached external sub "${s.title}" is unproven/stale — removing ${s.key}`);
+              axios.delete(`${config.plex.url}${s.key}`, { params: { 'X-Plex-Token': config.plex.token }, timeout: 5000 })
+                .catch(e => console.warn(`[Subtitles] failed to delete stale stream ${s.key}: ${e.response?.status || e.code}`));
+              continue; // don't use it — behave as if Plex has nothing for this language
+            }
+            const candidate = { kind: 'external', url: `${config.plex.url}${s.key}?X-Plex-Token=${config.plex.token}`, codec: (s.codec || s.format || 'srt').toLowerCase() };
+            if (!firstCandidate) firstCandidate = candidate;
+            if (s.selected) { plexExternal = candidate; break; }
           }
         }
-        if (result) break;
+        if (plexExternal) break;
       }
-    } catch(e) { /* ignore — fall through with result=null */ }
+      if (!plexExternal) plexExternal = firstCandidate;
+      if (sawDistrustedStream) _clearStaleSubtitleCache(rkey, langCode);
+      if (staleUpload) _clearStaleSubtitleCache(rkey, langCode);
+      if (plexExternal) result = plexExternal; // prefer Plex-hosted external SRT over embedded
+    } catch(e) { /* ignore — fall through with existing result */ }
   }
 
-  // 3) Final fallback: OpenSubtitles (only if env keys configured). Caches SRT to disk so
-  // re-airs of the same episode are instant.
-  if (!result) {
-    result = await findOpenSubtitlesSubtitle(rkey, langCode);
+  // 3) OpenSubtitles fallback — runs when Plex has nothing burnable:
+  //    a) no sub found at all
+  //    b) embedded TEXT sub (subrip, ass, etc.) — can't burn without a download URL
+  //    c) embedded PGS (hdmv_pgs_subtitle/pgssub) — sub2video produces inconsistent frame sizes
+  //       (e.g. 1920×1500 init vs 1920×1080 frames) which silently breaks the overlay filter;
+  //       an OS SRT is more reliable for these Blu-ray tracks.
+  //    dvd_subtitle uses fixed-size bitmaps and overlays correctly, so it stays.
+  const embeddedText = result?.kind === 'embedded' && TEXT_SUB_CODECS.has(result.codec);
+  const embeddedPGS  = result?.kind === 'embedded' && (result.codec === 'hdmv_pgs_subtitle' || result.codec === 'pgssub');
+  if (!result || embeddedText || embeddedPGS) {
+    const osResult = await findOpenSubtitlesSubtitle(rkey, langCode);
+    if (osResult) result = osResult;
   }
 
   _subtitleProbeCache.set(cacheKey, { found: result, expiresAt: Date.now() + SUBTITLE_PROBE_TTL_MS });
@@ -7460,28 +6741,156 @@ async function findPlexSubtitleStream(rkey, fileUrl, langCode) {
 const TEXT_SUB_CODECS = new Set(['mov_text', 'subrip', 'srt', 'ass', 'ssa', 'webvtt']);
 const BITMAP_SUB_CODECS = new Set(['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'pgssub']);
 
-// Build the ffmpeg burn-in arguments for a given matched subtitle stream. Returns:
-//   { vfArgs: ['-vf', 'subtitles=...'], forceTranscode: true } if burnable
-//   null otherwise
-function buildSubtitleBurnArgs(fileUrl, sub) {
+// Elapsed schedule position (ms) -> seek offset in seconds, keeping sub-second precision.
+// Both Plex's transcode `offset` param and ffmpeg's `-ss` accept fractional seconds; flooring to
+// whole seconds (the old behavior) silently discards up to 999ms of position accuracy on every
+// tune-in, which showed up as a small persistent subtitle/AV offset even once the Plex-transcode
+// delegation path was correctly selected.
+function toOffsetSec(offsetMs) {
+  return Math.max(0, Math.round(offsetMs)) / 1000;
+}
+
+function secToSrtTime(sec) {
+  const s = Math.max(0, sec);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = Math.floor(s % 60);
+  const ms = Math.round((s - Math.floor(s)) * 1000);
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')},${String(ms).padStart(3,'0')}`;
+}
+
+// Build the ffmpeg burn-in arguments for a given matched subtitle stream. Returns one of:
+//   { type:'text',   vfArgs: ['-vf','subtitles=...'], forceTranscode:true, tmpFile? }
+//   { type:'bitmap', filterComplex:'...', mapVideo:'[vout]', forceTranscode:true }
+//   null — not burnable
+async function buildSubtitleBurnArgs(fileUrl, sub, offsetSec = 0) {
   if (!sub) return null;
+
   if (BITMAP_SUB_CODECS.has(sub.codec)) {
-    console.log(`[LiveTV] Subtitle stream is bitmap (${sub.codec}); skipping burn-in.`);
-    return null;
+    // DVD/PGS bitmap subs can't use the subtitles= filter (text-only). Instead use
+    // filter_complex with ffmpeg's overlay filter — reads the sub from the same HTTP
+    // input, no separate download needed. Only works for embedded streams.
+    if (sub.kind !== 'embedded') {
+      console.log(`[LiveTV] Bitmap sub (${sub.codec}) is not embedded; skipping burn-in.`);
+      return null;
+    }
+    const si = sub.relIdx ?? 0;
+    // PGS (hdmv_pgs_subtitle) decoders emit frames ONLY at display events — between events
+    // the decoder is silent, which stalls the overlay filter waiting for its second input.
+    // Piping through fps=25 repeats the last subtitle frame (including the transparent "clear"
+    // frame produced when a subtitle ends) so the overlay always has something to consume.
+    // dvd_subtitle decoders already emit continuous frames, so fps is harmless for them too.
+    const filterComplex = `[0:s:${si}]fps=fps=25[sfps];[0:v][sfps]overlay=shortest=1:eof_action=pass[vout]`;
+    console.log(`[LiveTV] Using filter_complex overlay for bitmap subtitle (${sub.codec}, s:${si})`);
+    return {
+      type: 'bitmap',
+      filterComplex,
+      mapVideo: '[vout]',
+      forceTranscode: true
+    };
   }
+
   if (!TEXT_SUB_CODECS.has(sub.codec)) {
     console.log(`[LiveTV] Subtitle stream codec '${sub.codec}' isn't in the known-text list; trying burn-in anyway.`);
   }
-  // ffmpeg's `subtitles` filter takes a file/URL and optional stream index. For embedded we use
-  // `si=<rel>` to select the Nth subtitle stream of the input. For external (sidecar SRTs Plex
-  // serves at /library/streams/<id>) the file is single-track so no si= is needed.
-  let filterValue;
-  if (sub.kind === 'external') {
-    filterValue = `subtitles='${sub.url}'`;
-  } else {
-    filterValue = `subtitles='${fileUrl}':si=${sub.relIdx}`;
+
+  let subFilePath = null;
+  let tmpFile = null;
+
+  if (sub.kind === 'external' && sub.url) {
+    // Plex-hosted external SRT — delegate subtitle rendering entirely to Plex's transcoder.
+    // Plex aligns the subtitle timeline with its own seek, eliminating the libass timing drift
+    // we see when burning the SRT ourselves. We remux Plex's output to MPEG-TS instead.
+    if (sub.url.includes('/library/streams/')) {
+      const m = sub.url.match(/\/library\/streams\/(\d+)/);
+      if (m) {
+        console.log(`[LiveTV] Delegating subtitle burn to Plex transcode (stream ${m[1]})`);
+        return { type: 'plex_transcode', plexStreamId: m[1], forceTranscode: true };
+      }
+    }
+
+    if (sub.url.startsWith('http://') || sub.url.startsWith('https://')) {
+      // Download to a temp file — ffmpeg's subtitles= filter treats `:` as an option separator,
+      // so HTTP URLs (http: scheme, :port) break option parsing regardless of backslash escaping.
+      tmpFile = `/tmp/pcc-sub-${Date.now()}.srt`;
+      try {
+        const dlRes = await axios.get(sub.url, { responseType: 'arraybuffer', timeout: 10000 });
+        require('fs').writeFileSync(tmpFile, Buffer.from(dlRes.data));
+        subFilePath = tmpFile;
+        console.log(`[LiveTV] Subtitle downloaded to temp file (${dlRes.data.byteLength} bytes)`);
+      } catch (e) {
+        console.log(`[LiveTV] Subtitle download failed: ${e.message}`);
+        return null;
+      }
+    } else {
+      // Already a local path (OpenSubtitles download)
+      subFilePath = sub.url;
+    }
+  } else if (sub.kind === 'embedded') {
+    // Embedded text subs have no separate downloadable URL. Fall through so the caller
+    // gets null and can try OpenSubtitles as a fallback.
+    console.log(`[LiveTV] Embedded text subtitle burn skipped (no downloadable URL)`);
+    return null;
   }
-  return { vfArgs: ['-vf', filterValue], forceTranscode: true };
+
+  if (!subFilePath) return null;
+
+  // Append an invisible warm-up subtitle at the stream's start position.
+  // libass initializes font metrics on the very first render call. In -re (real-time)
+  // mode that 100-300ms spike stalls the output pipe and causes a visible stutter.
+  // Appending a 0.5s dummy entry at offsetSec forces initialization on the first frame
+  // while the player is still filling its initial buffer, hiding the spike.
+  // NOTE: entry 999999 at offsetSec may appear earlier in the file than other entries
+  // at times < offsetSec, but libass renders events by timestamp regardless of file order.
+  try {
+    const t0 = secToSrtTime(offsetSec), t1 = secToSrtTime(offsetSec + 0.5);
+    const warmup = `\n999999\n${t0} --> ${t1}\n \n\n`;
+    const warmPath = `/tmp/pcc-sub-${Date.now()}.srt`;
+    const original = require('fs').readFileSync(subFilePath);
+    require('fs').writeFileSync(warmPath, original.toString() + warmup);
+    if (tmpFile) { try { require('fs').unlinkSync(tmpFile); } catch(e) {} }
+    tmpFile = warmPath;
+    subFilePath = warmPath;
+  } catch(e) {
+    console.log(`[LiveTV] Subtitle warm-up write failed: ${e.message}`);
+  }
+
+  return { type: 'text', vfArgs: ['-vf', `subtitles='${subFilePath}'`], forceTranscode: true, tmpFile };
+}
+
+// Build a Plex universal transcode URL that burns the given subtitle stream into the video.
+// Used when the subtitle source is a Plex-hosted external SRT — Plex handles the seek/timing,
+// and our ffmpeg just remuxes the HLS output to MPEG-TS with -c copy.
+async function buildPlexTranscodeSubUrl(rkey, mediaIdx, offsetSec, subStreamId, sessionId) {
+  const params = {
+    path: `/library/metadata/${rkey}`,
+    mediaIndex: String(mediaIdx || 0),
+    partIndex: '0',
+    protocol: 'http',
+    fastSeek: '1',
+    directPlay: '0',
+    directStream: '0',
+    directStreamAudio: '0',
+    videoQuality: '80',
+    maxVideoBitrate: '8000',
+    subtitleSize: '100',
+    audioBoost: '100',
+    location: 'lan',
+    offset: String(offsetSec),
+    hasMDE: '1',
+    session: sessionId,
+    subtitleStream: String(subStreamId),
+    subtitles: 'burn',
+    'X-Plex-Product': 'Plex Web',
+    'X-Plex-Platform': 'Chrome',
+    'X-Plex-Client-Identifier': sessionId,
+    'X-Plex-Token': config.plex.token,
+  };
+  // Plex requires a /decision call to set up the transcode session before /start will accept
+  try {
+    await axios.get(`${config.plex.url}/video/:/transcode/universal/decision`, {
+      params, headers: { Accept: 'application/json' }, timeout: 10000
+    });
+  } catch(de) { console.log(`[LiveTV] Plex transcode decision note: ${de.message}`); }
+  return `${config.plex.url}/video/:/transcode/universal/start?${new URLSearchParams(params).toString()}`;
 }
 
 // Plex can hold multiple Media entries per item (e.g. when a file gets moved on disk, the old
@@ -7727,25 +7136,20 @@ function isChannelOnAir(channelId, atTime) {
   return false; // has time rules but none match now
 }
 
-// Check if channel is effectively on-air, allowing the single program that was airing at
-// the moment the channel went off-air to finish before cutting to off-air. Used by the live
-// stream so a viewer mid-program isn't cut off exactly at the boundary.
+// Check if channel is effectively on-air, allowing a currently-playing program
+// that started during on-air time to finish before going off-air.
 function isChannelEffectivelyOnAir(channelId) {
   if (isChannelOnAir(channelId)) return true;
 
-  // Off-air now. The previous logic inferred the program's start as (now - offsetMs), but the
-  // virtual playlist clock free-runs through off-hours, so a long program (or even one that
-  // *started* during off-hours) could keep the channel "on-air" for hours. Anchor on the real
-  // off-air boundary instead and only extend grace until the program airing AT that boundary ends.
+  // Channel is technically off-air — check if a program started during on-air time
+  // and hasn't finished yet (so we let it complete instead of cutting mid-content)
   try {
-    const now = Date.now();
-    const ranges = getOnAirRanges(channelId, now - 24 * 3600 * 1000, now);
-    if (!ranges || ranges.length === 0) return false;
-    const boundary = ranges[ranges.length - 1].end; // end of the most recent on-air block
-    if (boundary >= now) return false;
-    const progAtBoundary = getCurrentProgram(channelId, boundary);
-    if (!progAtBoundary || progAtBoundary.remainingMs <= 0) return false;
-    return now < boundary + progAtBoundary.remainingMs;
+    const current = getCurrentProgram(channelId);
+    if (!current || !current.offsetMs || current.offsetMs <= 0) return false;
+
+    // When did this program start in real time?
+    const programStartTime = Date.now() - current.offsetMs;
+    return isChannelOnAir(channelId, programStartTime);
   } catch (e) {
     return false;
   }
@@ -7848,7 +7252,7 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
       'Cache-Control': 'no-cache, no-store',
       'Access-Control-Allow-Origin': '*'
     });
-    const ff = spawn(binPath('ffmpeg'), [
+    const ff = spawn('ffmpeg', [
       '-f', 'lavfi', '-i',
       `color=c=0x0a0e27:s=1280x720:d=60,drawtext=text='${safeChName}':fontcolor=white:fontsize=52:x=(w-text_w)/2:y=(h/2)-60,drawtext=text='Off Air':fontcolor=0x94a3b8:fontsize=36:x=(w-text_w)/2:y=(h/2)+10,drawtext=text='Resumes ${nextOnFmt}':fontcolor=0x60a5fa:fontsize=28:x=(w-text_w)/2:y=(h/2)+70`,
       '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
@@ -7932,13 +7336,14 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
 
     // Handle local filler files (YouTube downloads)
     if (localPath && require('fs').existsSync(localPath)) {
-      const offsetSec = Math.floor(prog.offsetMs / 1000);
+      const offsetSec = toOffsetSec(prog.offsetMs);
       const segmentDurationSec = Math.round(prog.item.duration_ms / 1000);
       const title = prog.item.filler_name || 'Local Filler';
       console.log(`[LiveTV] Stream ch=${ch.number} local filler "${title}" offset=${offsetSec}s`);
 
       const ffArgs = [
         '-hide_banner', '-loglevel', 'error',
+        '-re',
         '-ss', String(offsetSec), '-i', localPath,
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
         '-c:a', 'aac', '-b:a', '192k', '-ac', '2', '-ar', '44100',
@@ -7948,7 +7353,7 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
         '-output_ts_offset', String(cumulativeDurationSec),
         'pipe:1'
       ];
-      const ff = spawn(binPath('ffmpeg'), ffArgs);
+      const ff = spawn('ffmpeg', ffArgs);
       ff.on('error', (err) => {
         console.error('[LiveTV local filler] ffmpeg spawn error:', err.message);
         if (!clientDisconnected && !res.writableEnded) {
@@ -7960,8 +7365,6 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
       ff.stderr.on('data', () => {});
       ff.on('close', () => {
         cumulativeDurationSec += segmentDurationSec;
-        // Advance by playlist position (ffmpeg streams faster than real-time so wall-clock is
-        // ahead of the slot's natural end — wall-clock pick would land mid-way into the next).
         consecutiveFailures = 0;
         forceFromPosition = prog.nextIndex;
         if (!clientDisconnected && !res.writableEnded) {
@@ -7996,7 +7399,7 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
       return;
     }
 
-    const offsetSec = Math.floor(prog.offsetMs / 1000);
+    const offsetSec = toOffsetSec(prog.offsetMs);
 
     try {
       const metaRes = await axios.get(`${config.plex.url}/library/metadata/${progRkey}`, {
@@ -8032,47 +7435,63 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
       const title = prog.item.prog_title || prog.item.filler_name || 'Unknown';
       console.log(`[LiveTV] Stream ch=${ch.number} "${title}" rk=${progRkey} offset=${offsetSec}s video=${videoCodec} audio=${audioCodec}`);
 
-      // Pick a subtitle stream matching the user's preferred language, if configured. When found
-      // and burnable, this forces the video encode path (libx264) — pixels are the only universal
-      // delivery for subs in raw MPEG-TS to Plex DVR.
       const subSettings = readSubtitleSettings();
       let burnArgs = null;
       if (subSettings.language && subSettings.mode === 'burn') {
         const sub = await findPlexSubtitleStream(progRkey, fileUrl, subSettings.language);
-        if (sub) {
-          burnArgs = buildSubtitleBurnArgs(fileUrl, sub);
-          if (burnArgs) console.log(`[LiveTV] Burning ${subSettings.language} subtitle (codec=${sub.codec}, si=${sub.relIdx})`);
-        } else {
-          console.log(`[LiveTV] No '${subSettings.language}' subtitle stream found for rk=${progRkey}, streaming without subs`);
-        }
+        if (sub) console.log(`[LiveTV] Burning ${subSettings.language} subtitle (codec=${sub.codec}, kind=${sub.kind})`);
+        burnArgs = await buildSubtitleBurnArgs(fileUrl, sub, offsetSec);
       }
-      const needsTranscode = ['hevc', 'h265', 'vp9', 'av1'].includes(videoCodec) || !!burnArgs;
-      const videoArgs = needsTranscode
-        ? ['-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+
+      // plex_transcode: Plex renders the subtitle and outputs H264+AAC HLS.
+      // Our ffmpeg just remuxes HLS→MPEG-TS with -c copy. No libass, no seek timing drift.
+      const usePlexTranscode = burnArgs?.type === 'plex_transcode';
+      const needsTranscode = !usePlexTranscode && (['hevc', 'h265', 'vp9', 'av1'].includes(videoCodec) || !!burnArgs);
+      const videoArgs = (usePlexTranscode || !needsTranscode)
+        ? ['-c:v', 'copy']
+        : ['-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
            '-crf', '23', '-profile:v', 'main', '-level', '4.0', '-pix_fmt', 'yuv420p',
            '-b:v', '4M', '-maxrate', '5M', '-bufsize', '8M',
-           '-g', '48', '-keyint_min', '48', '-sc_threshold', '0']
-        : ['-c:v', 'copy'];
-      const audioArgs = ['-c:a', 'aac', '-b:a', '192k', '-ac', '2'];
+           '-g', '48', '-keyint_min', '48', '-sc_threshold', '0'];
+      const audioArgs = usePlexTranscode
+        ? ['-c:a', 'copy']
+        : ['-c:a', 'aac', '-b:a', '192k', '-ac', '2'];
 
-      console.log(`[LiveTV] Video: ${needsTranscode ? 'transcode' : 'copy'} (${videoCodec})${burnArgs ? ' +subs' : ''}, Audio: transcode to aac`);
+      let ffInput = fileUrl;
+      let inputSeekArgs = ['-re', '-ss', String(offsetSec)];
+      let plexTsSessionId = null;
+
+      if (usePlexTranscode) {
+        plexTsSessionId = `PCC-TS-${progRkey}-${Date.now()}`;
+        ffInput = await buildPlexTranscodeSubUrl(progRkey, picked.mediaIdx || 0, offsetSec, burnArgs.plexStreamId, plexTsSessionId);
+        inputSeekArgs = []; // Plex handles seek offset and real-time pacing via HLS segment rate
+        console.log(`[LiveTV] Plex transcode+subtitle pipeline: stream=${burnArgs.plexStreamId} offset=${offsetSec}s`);
+      } else {
+        console.log(`[LiveTV] Video: ${needsTranscode ? 'transcode' : 'copy'} (${videoCodec})${burnArgs ? ' +subs' : ''}, Audio: transcode to aac`);
+      }
 
       // Calculate expected segment duration for TS offset tracking
-      const segmentDurationSec = Math.max(0, Math.floor(prog.item.duration_ms / 1000) - offsetSec);
+      const segmentDurationSec = Math.max(0, (prog.item.duration_ms / 1000) - offsetSec);
+
+      // For bitmap subs (DVD/PGS): filter_complex overlay replaces -map 0:v:0.
+      // For text subs: simple -vf subtitles= after the normal -map.
+      // For plex_transcode: standard -map (Plex already burned the sub, no filter needed).
+      const mapAndFilterArgs = burnArgs?.type === 'bitmap'
+        ? ['-filter_complex', burnArgs.filterComplex, '-map', burnArgs.mapVideo, '-map', '0:a:0?']
+        : ['-map', '0:v:0', '-map', '0:a:0?'];
+      const subFilterArgs = burnArgs?.type === 'text' ? burnArgs.vfArgs : [];
 
       const ffArgs = [
         '-nostdin',
         '-hide_banner', '-loglevel', 'error',
         '-fflags', '+genpts+discardcorrupt+igndts',
         '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
-        '-ss', String(offsetSec),
-        '-i', fileUrl,
+        ...inputSeekArgs,
+        '-i', ffInput,
         '-threads', '0',
-        '-map', '0:v:0', '-map', '0:a:0?',
+        ...mapAndFilterArgs,
         ...videoArgs,
-        // Subtitle filter must come AFTER the video codec is chosen (it implies transcode).
-        // The filter reads from the Plex media URL itself via libavformat — no extra fetch.
-        ...(burnArgs ? burnArgs.vfArgs : []),
+        ...subFilterArgs,
         ...audioArgs,
         '-avoid_negative_ts', 'make_zero',
         '-muxdelay', '0', '-muxpreload', '0',
@@ -8084,7 +7503,7 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
         'pipe:1'
       ];
 
-      const ffmpeg = spawn(binPath('ffmpeg'), ffArgs);
+      const ffmpeg = spawn('ffmpeg', ffArgs);
 
       // Spawn-level error (e.g. ENOENT) emits 'error' instead of throwing — handle it so it
       // doesn't escape as an unhandled exception. The 'close' handler in the Promise below
@@ -8093,9 +7512,15 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
         console.error('[LiveTV] ffmpeg spawn error:', err.message);
       });
 
-      // Kill ffmpeg if client disconnects mid-segment
-      const onDisconnect = () => { ffmpeg.kill('SIGTERM'); };
-      if (clientDisconnected) { ffmpeg.kill('SIGTERM'); return; }
+      // Kill ffmpeg if client disconnects mid-segment.
+      // SIGTERM first; if the process is stuck in network I/O (D state) it may not
+      // respond, so escalate to SIGKILL after 2 s.
+      const killFfmpeg = () => {
+        ffmpeg.kill('SIGTERM');
+        setTimeout(() => { try { ffmpeg.kill('SIGKILL'); } catch(e) {} }, 2000);
+      };
+      const onDisconnect = killFfmpeg;
+      if (clientDisconnected) { killFfmpeg(); return; }
       req.on('close', onDisconnect);
 
       ffmpeg.stdout.on('data', (chunk) => {
@@ -8128,20 +7553,23 @@ app.get('/api/livetv/stream/:channelId', async (req, res) => {
         ffmpeg.on('close', (code) => {
           console.log(`[LiveTV] Segment ended: "${title}" ${segBytes} bytes in ${Date.now() - segStart}ms, exit=${code}`);
           req.removeListener('close', onDisconnect);
+          if (plexTsSessionId) stopPlexSession(plexTsSessionId);
           // Accumulate duration for next segment's TS offset
           cumulativeDurationSec += segmentDurationSec;
           resolve();
         });
       });
 
+      if (burnArgs?.tmpFile) {
+        try { require('fs').unlinkSync(burnArgs.tmpFile); } catch(e) {}
+      }
+
       // Small delay to allow player to process the transition
       await new Promise(r => setTimeout(r, 50));
 
-      // Hand the next slot to streamNextProgram by playlist position, not by wall-clock.
-      // ffmpeg with -c:v copy streams MUCH faster than real-time (it remuxes the whole file in
-      // seconds), so wall-clock has typically passed the natural end of this slot by the time
-      // we get here. A wall-clock pick would land us mid-way into the *next* show. Forcing the
-      // position guarantees the next show starts at offset 0.
+      // Advance by playlist position so the next show always starts at offset 0.
+      // (-re throttles ffmpeg to real-time, but we still use forceFromPosition as a safety net
+      // for files whose actual duration differs from the DB value.)
       consecutiveFailures = 0; // we successfully streamed a segment — clear the failure counter
       forceFromPosition = prog.nextIndex;
 
@@ -8233,77 +7661,6 @@ app.delete('/api/livetv/fillers/:id', (req, res) => {
   db.prepare('DELETE FROM fillers WHERE id = ?').run(req.params.id);
   invalidatePlaylistCache();
   res.json({ success: true });
-});
-
-// Streaming upload for local video files (multi-file drag-drop on the UI side calls this once
-// per file). Client sends raw binary with the file name in X-Filename. We pipe to disk to avoid
-// buffering large videos in memory, then ffprobe for duration before inserting the filler row.
-const FILLER_UPLOAD_MAX = 1024 * 1024 * 1024; // 1 GiB per file
-const FILLER_ALLOWED_EXT = new Set(['.mp4','.mkv','.mov','.webm','.m4v','.avi','.ts','.mpg','.mpeg']);
-app.post('/api/livetv/fillers/upload', (req, res) => {
-  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
-  const rawName = req.headers['x-filename'] || `upload-${Date.now()}.mp4`;
-  const decodedName = (() => {
-    try { return decodeURIComponent(String(rawName)); } catch(e) { return String(rawName); }
-  })();
-  // Strip path separators and dodgy chars — keep the file's actual extension for ffprobe muxer detection.
-  const baseName = path.basename(decodedName);
-  const ext = path.extname(baseName).toLowerCase();
-  if (!FILLER_ALLOWED_EXT.has(ext)) {
-    return res.status(400).json({ error: `Unsupported file type "${ext}". Allowed: ${[...FILLER_ALLOWED_EXT].join(', ')}` });
-  }
-  const safeName = baseName.replace(/[^a-zA-Z0-9._\- ]/g, '_').slice(0, 200);
-
-  const destDir = paths.fillerUploadDir;
-  fs.mkdirSync(destDir, { recursive: true });
-  const destPath = path.join(destDir, `${Date.now()}-${safeName}`);
-
-  let bytes = 0;
-  let aborted = false;
-  const ws = fs.createWriteStream(destPath);
-  let responded = false;
-  const sendErr = (code, msg) => {
-    if (responded) return;
-    responded = true;
-    try { ws.destroy(); } catch(e) {}
-    try { fs.unlinkSync(destPath); } catch(e) {}
-    res.status(code).json({ error: msg });
-  };
-
-  req.on('data', (chunk) => {
-    bytes += chunk.length;
-    if (bytes > FILLER_UPLOAD_MAX) {
-      aborted = true;
-      req.destroy();
-      sendErr(413, `File exceeds ${(FILLER_UPLOAD_MAX/1024/1024).toFixed(0)} MB limit`);
-    }
-  });
-  req.on('error', (e) => sendErr(500, 'upload stream error: ' + e.message));
-  ws.on('error', (e) => sendErr(500, 'disk write error: ' + e.message));
-
-  req.pipe(ws);
-  ws.on('finish', () => {
-    if (aborted || responded) return;
-    let durMs = 0;
-    try {
-      const r = spawnSync(binPath('ffprobe'), ['-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', destPath], { timeout: 15000 });
-      const dur = (r.stdout || '').toString().trim();
-      durMs = Math.round(parseFloat(dur) * 1000) || 0;
-    } catch(e) {}
-    if (!durMs) return sendErr(400, 'Could not determine duration — file may be corrupt or unsupported');
-
-    const title = path.basename(safeName, ext).slice(0, 200) || `Upload ${new Date().toLocaleString()}`;
-    const fillerType = req.headers['x-filler-type'] || 'upload';
-    const contentType = req.headers['x-content-type'] || null;
-    const genre = req.headers['x-genre'] ? String(req.headers['x-genre']).slice(0, 200) : null;
-    const result = db.prepare(`
-      INSERT INTO fillers (name, type, duration_ms, local_path, enabled, verified, content_type, genre)
-      VALUES (?,?,?,?,1,1,?,?)
-    `).run(title, fillerType, durMs, destPath, contentType, genre);
-
-    responded = true;
-    res.json({ success: true, id: result.lastInsertRowid, name: title, duration_ms: durMs, bytes });
-  });
 });
 
 app.post('/api/livetv/fillers/scan-trailers', async (req, res) => {
@@ -8408,7 +7765,7 @@ app.post('/api/livetv/fillers/scan-trailers', async (req, res) => {
 const activeDownloads = new Map(); // downloadId -> child process
 
 // Static serving for downloaded fillers
-app.use('/fillers', express.static(paths.fillerDir));
+app.use('/fillers', express.static(path.join(__dirname, 'data', 'fillers')));
 
 app.get('/api/livetv/fillers/disk-space', async (req, res) => {
   if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
@@ -8430,7 +7787,8 @@ app.get('/api/livetv/fillers/disk-space', async (req, res) => {
         }
         return total;
       };
-      if (fsLocal.existsSync(paths.fillerDir)) fillersSize = walk(paths.fillerDir);
+      const fillerDir = path.join(__dirname, 'data', 'fillers');
+      if (fsLocal.existsSync(fillerDir)) fillersSize = walk(fillerDir);
     } catch(e) {}
     res.json({
       total: main?.size || 0,
@@ -8477,7 +7835,7 @@ app.post('/api/livetv/fillers/yt-scan', async (req, res) => {
     const searchQuery = `${searchTitle} ${prog.year || ''} official trailer`.trim();
     try {
       // spawnSync with array args — no shell, query passed as a single literal arg
-      const r = spawnSync(binPath('yt-dlp'), [
+      const r = spawnSync('yt-dlp', [
         `ytsearch1:${searchQuery}`,
         '--dump-json', '--no-download', '--no-playlist'
       ], { timeout: 15000, maxBuffer: 5 * 1024 * 1024 });
@@ -8524,7 +7882,7 @@ app.get('/api/livetv/fillers/yt-info', async (req, res) => {
     return res.status(400).json({ error: 'Only http(s) URLs are allowed' });
   }
   try {
-    const r = spawnSync(binPath('yt-dlp'), ['--dump-json', '--no-download', parsed.toString()], {
+    const r = spawnSync('yt-dlp', ['--dump-json', '--no-download', parsed.toString()], {
       timeout: 30000, maxBuffer: 5 * 1024 * 1024
     });
     if (r.error) throw r.error;
@@ -8554,18 +7912,19 @@ function startYtDownload(url, quality, channelIds, fillerName, meta) {
   const result = db.prepare('INSERT INTO yt_downloads (url, quality, title) VALUES (?, ?, ?)').run(url, q, fillerName || null);
   const dlId = result.lastInsertRowid;
 
-  if (!fs.existsSync(paths.fillerDir)) fs.mkdirSync(paths.fillerDir, { recursive: true });
+  const fillerDir = path.join(__dirname, 'data', 'fillers');
+  if (!require('fs').existsSync(fillerDir)) require('fs').mkdirSync(fillerDir, { recursive: true });
 
   const args = [
     '-f', `bestvideo[height<=${height}]+bestaudio/best[height<=${height}]`,
     '--merge-output-format', 'mp4',
-    '-o', path.join(paths.fillerDir, '%(title)s.%(ext)s'),
+    '-o', path.join(fillerDir, '%(title)s.%(ext)s'),
     '--progress', '--newline',
     '--no-playlist',
     url
   ];
 
-  const proc = spawn(binPath('yt-dlp'), args);
+  const proc = spawn('yt-dlp', args);
   activeDownloads.set(dlId, proc);
   // Keep the tail of stderr so a failure stores a useful reason in error_msg instead of just
   // "exit code 1". Plain progress lines get filtered out so we keep only the meaningful chatter.
@@ -8609,7 +7968,7 @@ function startYtDownload(url, quality, channelIds, fillerName, meta) {
         fileSize = require('fs').statSync(filePath).size;
         try {
           // spawnSync with array args — filePath is a single literal arg (cannot break out of quotes)
-          const r = spawnSync(binPath('ffprobe'), [
+          const r = spawnSync('ffprobe', [
             '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', filePath
           ], { timeout: 10000 });
           if (r.status === 0) {
@@ -8691,7 +8050,7 @@ app.post('/api/livetv/fillers/auto-fetch', async (req, res) => {
 
   try {
     // yt-dlp --dump-json gives one JSON line per result; --flat-playlist keeps it light (no per-video extraction).
-    const search = spawnSync(binPath('yt-dlp'),
+    const search = spawnSync('yt-dlp',
       ['--dump-json', '--flat-playlist', '--no-warnings', `ytsearch${n * 2}:${query}`],
       { timeout: 60000, maxBuffer: 8 * 1024 * 1024 });
     if (search.status !== 0) {
@@ -9462,9 +8821,21 @@ app.get('/api/health', (req, res) => {
 
 // Desktop app download
 app.get('/download/PlexLiveTV-win64.zip', (req, res) => {
+  const exePath = path.join(__dirname, 'PlexLiveTV.exe');
   const zipPath = path.join(__dirname, 'PlexLiveTV-win64.zip');
-  if (fs.existsSync(zipPath)) {
+  if (fs.existsSync(exePath)) {
+    res.download(exePath, 'PlexLiveTV.exe');
+  } else if (fs.existsSync(zipPath)) {
     res.download(zipPath, 'PlexLiveTV-win64.zip');
+  } else {
+    res.status(404).send('File not found');
+  }
+});
+
+app.get('/download/PlexLiveTV.exe', (req, res) => {
+  const exePath = path.join(__dirname, 'PlexLiveTV.exe');
+  if (fs.existsSync(exePath)) {
+    res.download(exePath, 'PlexLiveTV.exe');
   } else {
     res.status(404).send('File not found');
   }
@@ -9500,7 +8871,7 @@ app.get('/api/security/gateway', requireAdmin, (req, res) => {
   });
 });
 
-app.put('/api/security/gateway', requireAdmin, async (req, res) => {
+app.put('/api/security/gateway', requireAdmin, (req, res) => {
   const body = req.body || {};
   const updates = [];
   if (typeof body.port !== 'undefined') {
@@ -9519,16 +8890,16 @@ app.put('/api/security/gateway', requireAdmin, async (req, res) => {
   let restarted = false;
   if (_gatewayServer && updates.length > 0) {
     stopGateway();
-    const r = await startGateway();
+    const r = startGateway();
     restarted = true;
     if (!r.ok) return res.status(500).json({ error: 'Restart failed: ' + r.error, restarted });
   }
   res.json({ success: true, restarted, config: readGatewayConfig() });
 });
 
-app.post('/api/security/gateway/start', requireAdmin, async (req, res) => {
+app.post('/api/security/gateway/start', requireAdmin, (req, res) => {
   pccDb.prepare("UPDATE regional_settings SET value = '1' WHERE key = 'gateway_enabled'").run();
-  const r = await startGateway();
+  const r = startGateway();
   if (!r.ok) return res.status(500).json({ error: r.error || 'start failed' });
   res.json({ success: true, ...r });
 });
@@ -9539,8 +8910,8 @@ app.post('/api/security/gateway/stop', requireAdmin, (req, res) => {
   res.json({ success: r.ok, ...r });
 });
 
-// gateway_log API for the UI — admin-gated like the rest of /api/security/*.
-app.get('/api/security/gateway-log', requireAdmin, (req, res) => {
+// gateway_log API for the UI
+app.get('/api/security/gateway-log', (req, res) => {
   const limit = Math.min(500, parseInt(req.query.limit) || 100);
   const onlyDenied = req.query.denied === '1';
   const sql = onlyDenied
@@ -9548,16 +8919,12 @@ app.get('/api/security/gateway-log', requireAdmin, (req, res) => {
     : 'SELECT * FROM gateway_log ORDER BY created_at DESC LIMIT ?';
   res.json(pccDb.prepare(sql).all(limit));
 });
-app.get('/api/security/gateway-stats', requireAdmin, (req, res) => {
-  // Earlier revisions referenced GATEWAY_ENABLED/PORT/TARGET as module-scoped variables, but
-  // those names only ever existed as DB-seed strings — calling this endpoint threw a bare
-  // ReferenceError that bubbled out as a 500. Source-of-truth is the regional_settings table
-  // via readGatewayConfig(), same as the /gateway endpoint already uses.
-  const cfg = readGatewayConfig();
+app.get('/api/security/gateway-stats', (req, res) => {
+  const gw = readGatewayConfig();
   res.json({
-    enabled: cfg.enabled,
-    port: cfg.port,
-    target: cfg.target,
+    enabled: gw.enabled,
+    port: gw.port,
+    target: gw.target,
     totals: pccDb.prepare("SELECT SUM(CASE WHEN allowed=1 THEN 1 ELSE 0 END) AS allowed, SUM(CASE WHEN allowed=0 THEN 1 ELSE 0 END) AS denied FROM gateway_log WHERE created_at > datetime('now','-7 days')").get()
   });
 });
@@ -9682,11 +9049,11 @@ app.get('/api/livetv/show-completion', (req, res) => {
   const out = [];
 
   for (const ch of channels) {
-    // Reuse the rebuild's source-of-truth path: the *current* matching pool is what's in
-    // channel_programming. That's already the post-filter set, so for "in-pool" we look at
-    // every episode the channel COULD play — i.e. the genre-filter result, not the live
-    // playlist (which might have items pruned away by rerun protection). We approximate by
-    // pulling all programs that match the channel's filters.
+    // Mirror buildChannelPlaylist's actual pool: genre-filter result, minus excluded_programs,
+    // plus a union of included_programs (manually-added shows/episodes bypass the genre filter
+    // entirely there — this endpoint used to skip that union, so any show only on the channel via
+    // manual inclusion, e.g. Lucifer on a genre="Action" channel, was invisible here even though
+    // it airs and has real progress).
     let filters; try { filters = JSON.parse(ch.source_value || '{}'); } catch(e) { continue; }
     if (filters.content_type === 'movie') continue; // movie-only channels don't have shows
     const { sql: progSql, params } = buildGenreQuery({
@@ -9698,24 +9065,65 @@ app.get('/api/livetv/show-completion', (req, res) => {
       exclude_genres: filters.exclude_genres || [],
       library_key: ch.library_key || null
     });
-    const eps = db.prepare(progSql + ' AND type = \'episode\'').all(...params);
+    let eps = db.prepare(progSql + ' AND type = \'episode\'').all(...params);
+
+    const excludedIds = ch.excluded_programs ? JSON.parse(ch.excluded_programs) : [];
+    let includedIds = [];
+    try { const v = JSON.parse(ch.included_programs || '[]'); if (Array.isArray(v)) includedIds = v; } catch(e) {}
+    const includedSet = new Set(includedIds);
+    const effectiveExcluded = excludedIds.filter(id => !includedSet.has(id));
+    if (effectiveExcluded.length > 0) eps = eps.filter(e => !effectiveExcluded.includes(e.id));
+    if (includedIds.length > 0) {
+      const have = new Set(eps.map(e => e.id));
+      const missing = includedIds.filter(id => !have.has(id));
+      if (missing.length > 0) {
+        const placeholders = missing.map(() => '?').join(',');
+        const extras = db.prepare(`SELECT * FROM programs WHERE id IN (${placeholders}) AND type = 'episode' AND duration_ms > 0`).all(...missing);
+        eps = eps.concat(extras);
+      }
+    }
     if (eps.length === 0) continue;
 
-    const recent = _recentlyAiredProgramIds(ch.id, rerunDays);
+    // Lifetime "ever aired" set — NOT scoped to rerun_window_days. The rolling window only exists
+    // to decide short-term repeat avoidance for shuffle/random shows; it says nothing about how
+    // much of a series has actually been broadcast, and reporting it as "aired" here made a
+    // 214-episode show with 15 recent airings look like it had only ever played 15 episodes.
+    const airedEver = new Set(
+      db.prepare('SELECT DISTINCT program_id FROM channel_playlog WHERE channel_id = ?').all(ch.id).map(r => r.program_id)
+    );
     const byShow = new Map();
     for (const e of eps) {
       const key = e.show_title || '(no title)';
-      if (!byShow.has(key)) byShow.set(key, { show: key, total: 0, aired: 0 });
+      if (!byShow.has(key)) byShow.set(key, { show: key, total: 0, aired: 0, episodes: [] });
       const row = byShow.get(key);
       row.total++;
-      if (recent.has(e.id)) row.aired++;
+      row.episodes.push(e);
+      if (airedEver.has(e.id)) row.aired++;
     }
-    const shows = [...byShow.values()].map(r => ({
-      ...r,
-      remaining: r.total - r.aired,
-      completed: r.total > 0 && (r.total - r.aired) <= 1, // within 1 episode of fully aired
-      percent: r.total > 0 ? Math.round((r.aired / r.total) * 100) : 0
-    })).sort((a, b) => b.percent - a.percent);
+    const shows = [...byShow.values()].map(r => {
+      const mode = _effectiveShowMode(ch, r.show);
+      let aired = r.aired, remaining, completed, percent, cursorPosition = null;
+      if (mode === 'order') {
+        // Order-mode shows have an exact source of truth: the persistent per-show cursor
+        // (see buildChannelPlaylist / _rotateEpisodesFromCursor). Its position in the sorted
+        // episode list is authoritative and immune to the historical channel_playlog gaps /
+        // duplication left over from before that cursor system existed.
+        const sorted = [...r.episodes].sort((a, b) =>
+          ((a.season_num || 0) - (b.season_num || 0)) || ((a.episode_num || 0) - (b.episode_num || 0)));
+        const cursorRow = db.prepare('SELECT last_program_id FROM channel_show_cursor WHERE channel_id = ? AND show_title = ?').get(ch.id, r.show);
+        const idx = cursorRow ? sorted.findIndex(e => e.id === cursorRow.last_program_id) : -1;
+        cursorPosition = idx + 1; // 0 = no cursor yet, hasn't started this pass
+        aired = cursorPosition;
+        remaining = r.total - cursorPosition;
+        completed = r.total > 0 && remaining <= 0; // cursor has reached the last episode this pass
+        percent = r.total > 0 ? Math.round((cursorPosition / r.total) * 100) : 0;
+      } else {
+        remaining = r.total - r.aired;
+        completed = r.total > 0 && remaining <= 1; // within 1 episode of fully aired, lifetime
+        percent = r.total > 0 ? Math.round((r.aired / r.total) * 100) : 0;
+      }
+      return { show: r.show, mode, total: r.total, aired, cursor_position: cursorPosition, remaining, completed, percent };
+    }).sort((a, b) => b.percent - a.percent);
 
     out.push({
       channel_id: ch.id, channel_number: ch.number, channel_name: ch.name,
@@ -9755,173 +9163,6 @@ app.put('/api/livetv/channels/:id/auto-renew', (req, res) => {
   res.json({ success: true, auto_renew_shows: !!enabled });
 });
 
-// --- Air-count / boost / retire (#7) -------------------------------------------------------
-// Compute, for one channel, every program in its source pool annotated with how many times it
-// has aired (lifetime, from channel_playlog), plus boost/retire state. Episodes are aggregated
-// per show so the list stays readable; movies are listed individually.
-function _channelAirStats(channel) {
-  // Pool = source-matched programs ∪ explicitly-included, minus nothing (we want to SHOW retired
-  // items so the user can un-retire them). Mirrors buildChannelPlaylist's pool assembly.
-  let pool = _selectChannelBasePrograms(channel);
-  let includedIds = [];
-  try { const v = JSON.parse(channel.included_programs || '[]'); if (Array.isArray(v)) includedIds = v; } catch(e) {}
-  if (includedIds.length) {
-    const have = new Set(pool.map(p => p.id));
-    const missing = includedIds.filter(id => !have.has(id));
-    if (missing.length) {
-      const ph = missing.map(() => '?').join(',');
-      pool = pool.concat(db.prepare(`SELECT * FROM programs WHERE id IN (${ph}) AND duration_ms > 0`).all(...missing));
-    }
-  }
-  let excluded = []; try { excluded = JSON.parse(channel.excluded_programs || '[]'); } catch(e) {}
-  let boosted = [];  try { boosted = JSON.parse(channel.boosted_programs || '[]'); } catch(e) {}
-  const exSet = new Set(excluded), boSet = new Set(boosted);
-
-  const countRows = db.prepare(
-    "SELECT program_id, COUNT(*) c, MAX(aired_on) last FROM channel_playlog WHERE channel_id = ? AND program_id IS NOT NULL GROUP BY program_id"
-  ).all(channel.id);
-  const counts = new Map(countRows.map(r => [r.program_id, { c: r.c, last: r.last }]));
-
-  const plexUrl = config.plex.url || '', plexToken = config.plex.token || '';
-  const thumbUrl = t => t && plexUrl ? `${plexUrl}${t}?X-Plex-Token=${plexToken}` : null;
-
-  const movies = [];
-  const showMap = new Map(); // show_title -> aggregate
-  for (const p of pool) {
-    const stat = counts.get(p.id) || { c: 0, last: null };
-    if (p.type === 'episode' && p.show_title) {
-      let s = showMap.get(p.show_title);
-      if (!s) { s = { show_title: p.show_title, type: 'show', thumb: thumbUrl(p.thumb), episode_count: 0, episodes_aired: 0, total_airings: 0, last_aired: null, program_ids: [], boosted_count: 0, retired_count: 0 }; showMap.set(p.show_title, s); }
-      s.episode_count++;
-      s.total_airings += stat.c;
-      if (stat.c > 0) s.episodes_aired++;
-      if (stat.last && (!s.last_aired || stat.last > s.last_aired)) s.last_aired = stat.last;
-      s.program_ids.push(p.id);
-      if (boSet.has(p.id)) s.boosted_count++;
-      if (exSet.has(p.id)) s.retired_count++;
-    } else {
-      movies.push({
-        program_id: p.id, title: p.title, year: p.year, type: p.type || 'movie',
-        thumb: thumbUrl(p.thumb), air_count: stat.c, last_aired: stat.last,
-        boosted: boSet.has(p.id), retired: exSet.has(p.id), program_ids: [p.id]
-      });
-    }
-  }
-  const shows = [...showMap.values()].map(s => ({
-    show_title: s.show_title, type: 'show', thumb: s.thumb,
-    episode_count: s.episode_count, episodes_aired: s.episodes_aired,
-    air_count: s.total_airings, last_aired: s.last_aired, program_ids: s.program_ids,
-    boosted: s.episode_count > 0 && s.boosted_count === s.episode_count,
-    retired: s.episode_count > 0 && s.retired_count === s.episode_count
-  }));
-
-  // Pool-level exhaustion: a program is "exhausted" once it's hit the retire threshold (or, if
-  // no threshold set, once it has aired at least once). Drives the renewal alert + UI summary.
-  const retireAfter = Number(channel.retire_after_airings) || 0;
-  const allItems = [...movies, ...shows.map(s => ({ air_count: s.air_count, retired: s.retired }))];
-  const total = pool.length;
-  let aired = 0, exhausted = 0;
-  for (const p of pool) {
-    const c = (counts.get(p.id) || { c: 0 }).c;
-    if (c > 0) aired++;
-    if (retireAfter > 0 ? c >= retireAfter : c > 0) exhausted++;
-  }
-  const summary = {
-    total_programs: total,
-    aired_programs: aired,
-    never_aired_programs: total - aired,
-    exhausted_programs: exhausted,
-    exhaustion_pct: total > 0 ? Math.round((exhausted / total) * 100) : 0,
-    retire_after_airings: retireAfter
-  };
-  movies.sort((a, b) => b.air_count - a.air_count || (a.title || '').localeCompare(b.title || ''));
-  shows.sort((a, b) => b.air_count - a.air_count || (a.show_title || '').localeCompare(b.show_title || ''));
-  return { summary, movies, shows };
-}
-
-app.get('/api/livetv/channels/:id/airings', (req, res) => {
-  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
-  const ch = db.prepare('SELECT * FROM channels WHERE id = ?').get(req.params.id);
-  if (!ch) return res.status(404).json({ error: 'Channel not found' });
-  try {
-    const data = _channelAirStats(ch);
-    res.json({ channel: { id: ch.id, name: ch.name, retire_after_airings: Number(ch.retire_after_airings) || 0 }, ...data });
-  } catch (e) {
-    console.error('[LiveTV] airings error:', e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Toggle boost (extra airtime) or retire (exclude) for a set of program_ids. Body: { program_ids:[], on:bool }
-function _toggleProgramList(channelId, column, programIds, on) {
-  const ch = db.prepare(`SELECT ${column} AS list FROM channels WHERE id = ?`).get(channelId);
-  if (!ch) return null;
-  let cur = []; try { const v = JSON.parse(ch.list || '[]'); if (Array.isArray(v)) cur = v; } catch(e) {}
-  const set = new Set(cur);
-  const ids = (Array.isArray(programIds) ? programIds : []).map(Number).filter(Number.isFinite);
-  for (const id of ids) { if (on) set.add(id); else set.delete(id); }
-  db.prepare(`UPDATE channels SET ${column} = ?, updated_at = datetime('now') WHERE id = ?`).run(JSON.stringify([...set]), channelId);
-  return [...set];
-}
-
-app.post('/api/livetv/channels/:id/airings/boost', (req, res) => {
-  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
-  const r = _toggleProgramList(req.params.id, 'boosted_programs', req.body?.program_ids, !!req.body?.on);
-  if (r === null) return res.status(404).json({ error: 'Channel not found' });
-  const count = buildChannelPlaylist(parseInt(req.params.id));
-  res.json({ success: true, boosted_programs: r, programCount: count });
-});
-
-app.post('/api/livetv/channels/:id/airings/retire', (req, res) => {
-  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
-  const r = _toggleProgramList(req.params.id, 'excluded_programs', req.body?.program_ids, !!req.body?.on);
-  if (r === null) return res.status(404).json({ error: 'Channel not found' });
-  const count = buildChannelPlaylist(parseInt(req.params.id));
-  res.json({ success: true, excluded_programs: r, programCount: count });
-});
-
-app.put('/api/livetv/channels/:id/airings/settings', (req, res) => {
-  if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
-  const ch = db.prepare('SELECT id FROM channels WHERE id = ?').get(req.params.id);
-  if (!ch) return res.status(404).json({ error: 'Channel not found' });
-  const n = Math.max(0, Math.min(1000, parseInt(req.body?.retire_after_airings) || 0));
-  db.prepare("UPDATE channels SET retire_after_airings = ?, updated_at = datetime('now') WHERE id = ?").run(n, req.params.id);
-  const count = buildChannelPlaylist(parseInt(req.params.id));
-  res.json({ success: true, retire_after_airings: n, programCount: count });
-});
-
-// When a channel has cycled through this % of its pool, push a one-time Telegram "needs renewal"
-// alert. exhaustion_alerted_on latches the date so it fires once per exhaustion episode; it's
-// cleared automatically when fresh content drops the channel back below the threshold.
-const EXHAUSTION_ALERT_PCT = 90;
-async function checkChannelExhaustion() {
-  if (!LIVETV_ENABLED || !db) return;
-  try {
-    const channels = db.prepare('SELECT * FROM channels WHERE enabled = 1').all();
-    const today = _todayDateStr();
-    for (const ch of channels) {
-      let summary;
-      try { summary = _channelAirStats(ch).summary; } catch(e) { continue; }
-      if (!summary || summary.total_programs === 0) continue;
-      const exhausted = summary.exhaustion_pct >= EXHAUSTION_ALERT_PCT;
-      if (exhausted && ch.exhaustion_alerted_on !== today) {
-        const sent = await sendTelegramMessage([
-          '📺 *Channel content exhausted*',
-          '',
-          `*Channel:* ${ch.name}`,
-          `*Cycled through:* ${summary.exhausted_programs}/${summary.total_programs} programs (${summary.exhaustion_pct}%)`,
-          `*Never aired:* ${summary.never_aired_programs}`,
-          '',
-          `This channel has aired most of its content${(Number(ch.retire_after_airings)||0) > 0 ? ` (retire-after ${ch.retire_after_airings} airings)` : ''}. Add new programs or renew it to keep variety.`
-        ].join('\n'));
-        if (sent) db.prepare("UPDATE channels SET exhaustion_alerted_on = ? WHERE id = ?").run(today, ch.id);
-      } else if (!exhausted && ch.exhaustion_alerted_on) {
-        db.prepare("UPDATE channels SET exhaustion_alerted_on = NULL WHERE id = ?").run(ch.id);
-      }
-    }
-  } catch (e) { console.warn('[LiveTV] exhaustion check error:', e.message); }
-}
-
 app.post('/api/livetv/new-items/mark-seen', (req, res) => {
   if (!LIVETV_ENABLED) return res.status(404).json({ error: 'LiveTV not enabled' });
   db.prepare("INSERT OR REPLACE INTO livetv_settings (key, value) VALUES ('new_items_last_seen_at', datetime('now'))").run();
@@ -9947,6 +9188,146 @@ app.post('/api/livetv/new-items/add', (req, res) => {
   db.prepare("UPDATE channels SET included_programs = ?, updated_at = datetime('now') WHERE id = ?").run(JSON.stringify(next), channel_id);
   const count = buildChannelPlaylist(channel_id);
   res.json({ success: true, added: next.length - current.length, programCount: count });
+});
+
+// ============================================
+// LIVETV SUBS ENDPOINTS
+// ============================================
+
+app.post('/api/livetv/subs/scan', requireAdmin, (req, res) => {
+  if (_subScanState.running) return res.status(409).json({ error: 'scan already running', state: _subScanState });
+  const throttleMs = parseInt(req.query.throttleMs) || undefined;
+  const limit = parseInt(req.query.limit) || undefined;
+  scanLiveTVForMissingSubs({ throttleMs, limit }).catch(e => { _subScanState.lastError = e.message; console.warn('[SubScan] error:', e.message); });
+  res.json({ ok: true, state: _subScanState });
+});
+
+app.post('/api/livetv/subs/scan/stop', requireAdmin, (req, res) => {
+  _subScanState.running = false;
+  res.json({ ok: true, state: _subScanState });
+});
+
+app.get('/api/livetv/subs/status', requireAdmin, (req, res) => {
+  let cacheCount = 0, cacheBytes = 0;
+  try {
+    for (const f of fs.readdirSync(SUBS_CACHE_DIR)) {
+      if (!f.endsWith('.srt')) continue;
+      cacheCount++;
+      try { cacheBytes += fs.statSync(path.join(SUBS_CACHE_DIR, f)).size; } catch(e) {}
+    }
+  } catch(e) {}
+  res.json({
+    scan: _subScanState,
+    cache: { count: cacheCount, bytes: cacheBytes, dir: SUBS_CACHE_DIR },
+    quota: _osQuotaState,
+    cooldownUntil: _osCooldownUntil > Date.now() ? new Date(_osCooldownUntil).toISOString() : null,
+    language: readSubtitleSettings().language || null
+  });
+});
+
+app.get('/api/livetv/subs/:rkey/:lang.vtt', (req, res) => {
+  const rkey = String(req.params.rkey).replace(/[^0-9]/g, '');
+  const lang = String(req.params.lang).replace(/[^a-z]/gi, '').toLowerCase();
+  if (!rkey || !lang) return res.status(400).send('bad params');
+  const srtPath = path.join(SUBS_CACHE_DIR, `${rkey}.${lang}.srt`);
+  if (!fs.existsSync(srtPath)) return res.status(404).send('no subs');
+  try {
+    const vtt = srtToWebVTT(fs.readFileSync(srtPath, 'utf8'));
+    res.set('Content-Type', 'text/vtt; charset=utf-8');
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.send(vtt);
+  } catch (e) { res.status(500).send('read failed'); }
+});
+
+// ============================================
+// SETTINGS / SERVICES ENDPOINTS
+// ============================================
+
+app.get('/api/settings/services', requireAdmin, (req, res) => {
+  const out = [];
+  const dbRows = pccDb.prepare("SELECT service, field, value FROM service_settings WHERE service != '_meta'").all();
+  const hasDb = new Set(dbRows.filter(r => r.value && r.value !== '').map(r => `${r.service}|${r.field}`));
+  for (const [svc, def] of Object.entries(SERVICE_DEFS)) {
+    const fields = def.fields.map(f => {
+      const parts = f.configPath.split('.');
+      let v = config; for (const p of parts) v = v ? v[p] : undefined;
+      const has = v !== undefined && v !== '';
+      const dbOverride = hasDb.has(`${svc}|${f.name}`);
+      const envValue = process.env[f.envKey];
+      const source = dbOverride ? 'db' : (envValue ? 'env' : (has ? 'default' : 'unset'));
+      return {
+        name: f.name, label: f.label, type: f.type, envKey: f.envKey,
+        value: f.type === 'secret' ? (has ? '••••••••' : '') : (v || ''),
+        hasValue: has,
+        source
+      };
+    });
+    out.push({ service: svc, label: def.label, description: def.description, fields });
+  }
+  res.json(out);
+});
+
+app.put('/api/settings/services/:service', requireAdmin, (req, res) => {
+  const svc = req.params.service;
+  const def = SERVICE_DEFS[svc];
+  if (!def) return res.status(404).json({ error: 'Unknown service' });
+  const actor = req.user?.username || 'unknown';
+  const patch = req.body || {};
+  const fieldsByName = Object.fromEntries(def.fields.map(f => [f.name, f]));
+
+  const apply = pccDb.transaction(() => {
+    for (const [name, rawVal] of Object.entries(patch)) {
+      const f = fieldsByName[name];
+      if (!f) continue;
+      if (f.type === 'secret' && typeof rawVal === 'string' && /^[•*]+$/.test(rawVal)) continue;
+      const newVal = rawVal == null ? '' : String(rawVal);
+      const existing = pccDb.prepare("SELECT value FROM service_settings WHERE service=? AND field=?").get(svc, name);
+
+      if (newVal === '') {
+        if (existing) {
+          pccDb.prepare("DELETE FROM service_settings WHERE service=? AND field=?").run(svc, name);
+          settingsAudit(actor, svc, name, 'clear', 'reverted to env/default');
+        }
+        continue;
+      }
+      const isSecret = f.type === 'secret' ? 1 : 0;
+      const stored = isSecret ? encryptSecret(newVal) : newVal;
+      pccDb.prepare(`
+        INSERT INTO service_settings (service, field, value, is_secret, updated_at)
+        VALUES (?,?,?,?, datetime('now'))
+        ON CONFLICT(service, field) DO UPDATE SET value=excluded.value, is_secret=excluded.is_secret, updated_at=datetime('now')
+      `).run(svc, name, stored, isSecret);
+      settingsAudit(actor, svc, name, existing ? 'update' : 'create', isSecret ? 'secret changed' : `value="${newVal.slice(0, 100)}"`);
+    }
+  });
+  try { apply(); } catch (e) { return res.status(500).json({ error: e.message }); }
+
+  reapplyServiceConfigs();
+  if (svc === 'zabbix') {
+    zabbixAuthToken = null; zabbixAuthExpiry = 0; zabbixDisabled = false; zabbixDisabledReason = null;
+    console.log('[SETTINGS] Zabbix config updated — token cleared, polling re-enabled');
+  }
+  if (svc === 'opensubtitles') {
+    _osTokenCache = { token: null, expiresAt: 0 };
+  }
+  res.json({ success: true });
+});
+
+app.post('/api/settings/services/:service/test', requireAdmin, async (req, res) => {
+  const svc = req.params.service;
+  if (!SERVICE_DEFS[svc]) return res.status(404).json({ error: 'Unknown service' });
+  const actor = req.user?.username || 'unknown';
+  let result;
+  try { result = await runServiceTest(svc); }
+  catch (e) { result = { ok: false, error: e.response?.data?.error || e.message }; }
+  settingsAudit(actor, svc, '*', 'test', result.ok ? (result.detail || 'ok') : `fail: ${(result.error || '').slice(0, 200)}`);
+  res.json(result);
+});
+
+app.get('/api/settings/audit', requireAdmin, (req, res) => {
+  const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
+  const rows = pccDb.prepare('SELECT id, service, field, actor, action, detail, created_at FROM settings_audit ORDER BY id DESC LIMIT ?').all(limit);
+  res.json(rows);
 });
 
 app.get('*', (req, res) => {
@@ -9990,17 +9371,6 @@ function readGatewayConfig() {
     port: parseInt(map.gateway_port) || 32400,
     target: map.gateway_target || config.plex.url || ''
   };
-}
-
-// Path-prefix list that always passes through the gateway regardless of country. Plex.tv's
-// remote-access prober and various clients only need these to confirm the server is alive at
-// a given URL — they never expose the library or accept auth.
-const _GATEWAY_ALLOW_PATHS = ['/identity', '/resources', '/.well-known/'];
-function _gatewayHealthcheckPath(url) {
-  if (!url) return false;
-  const i = url.indexOf('?');
-  const path = i === -1 ? url : url.slice(0, i);
-  return _GATEWAY_ALLOW_PATHS.some(p => path === p || path.startsWith(p + '/') || path.startsWith(p));
 }
 
 async function checkGatewayAccess(ip) {
@@ -10065,7 +9435,7 @@ function denyPageHtml(ip, country) {
 let _gatewayServer = null;
 let _gatewayMeta = { port: 0, target: '', lastError: null };
 
-async function startGateway() {
+function startGateway() {
   if (_gatewayServer) return { ok: true, alreadyRunning: true, ..._gatewayMeta };
   const cfg = readGatewayConfig();
   if (!cfg.target) {
@@ -10086,15 +9456,7 @@ async function startGateway() {
     try { decision = await checkGatewayAccess(ip); }
     catch (e) { decision = { allowed: false, geo: { country: 'Unknown' }, reason: 'geo_lookup_failed' }; }
 
-    // ALWAYS-ALLOW paths: Plex.tv's reachability prober and other Plex clients hit /identity
-    // (and a couple of related discovery endpoints) to ask "is this server alive at this
-    // public URL?". If we deny those, Plex marks itself "not remotely accessible" and tells
-    // clients to use Relay — and with Relay disabled there's no fallback, so foreign clients
-    // can't even *attempt* the public URL (which is what the gateway exists to filter). The
-    // bypass paths only leak the server's machineIdentifier, version, and TLS cert hash, all
-    // of which Plex already publishes via plex.tv. No library, no auth, no streams.
-    const healthCheck = _gatewayHealthcheckPath(req.url);
-    if (!decision.allowed && !healthCheck) {
+    if (!decision.allowed) {
       logGatewayEvent(ip, decision, 'deny', req.url);
       res.writeHead(403, {
         'Content-Type': 'text/html; charset=utf-8',
@@ -10102,11 +9464,6 @@ async function startGateway() {
         'X-Geofence-Blocked': decision.geo.country || 'unknown'
       });
       return res.end(denyPageHtml(ip, decision.geo.country));
-    }
-    if (!decision.allowed && healthCheck) {
-      // Log as a distinct action so the admin can see "we leaked /identity to a foreign IP,
-      // but no library data went out". Useful to confirm the reachability probe is working.
-      logGatewayEvent(ip, decision, 'allow-health', req.url);
     }
 
     const proxyReq = httpMod.request({
@@ -10152,34 +9509,22 @@ async function startGateway() {
     logGatewayEvent(ip, decision, 'allow-ws', req.url);
   });
 
-  // listen() is async — we need to await its outcome before the API/UI can truthfully report
-  // "started" or "failed". Without this wait, EADDRINUSE arrived after the response was sent
-  // and the user saw a stale "running" status that contradicted the `lastError` field.
-  return await new Promise((resolve) => {
-    let settled = false;
-    const settleOk = () => {
-      if (settled) return; settled = true;
-      _gatewayServer = gateway;
-      _gatewayMeta = { port: cfg.port, target: cfg.target, lastError: null };
+  try {
+    gateway.listen(cfg.port, () => {
       console.log(`[Gateway] Plex reverse proxy listening on :${cfg.port} → ${cfg.target}`);
-      resolve({ ok: true, port: cfg.port, target: cfg.target });
-    };
-    const settleErr = (err) => {
-      if (settled) return; settled = true;
-      const msg = err && err.code === 'EADDRINUSE'
-        ? `Port ${cfg.port} is already in use on this host. Plex Media Server itself listens on 32400 — if PCC is running on the same machine as PMS, pick a different gateway port (e.g. 32401) and forward your router's WAN :32400 to it.`
-        : (err && err.message) || String(err);
-      console.error('[Gateway] listen error:', msg);
-      _gatewayMeta.lastError = msg;
+    });
+    gateway.on('error', (err) => {
+      console.error('[Gateway] listen error:', err.message);
+      _gatewayMeta.lastError = err.message;
       _gatewayServer = null;
-      try { gateway.close(); } catch(_) {}
-      resolve({ ok: false, error: msg });
-    };
-    gateway.once('listening', settleOk);
-    gateway.once('error', settleErr);
-    try { gateway.listen(cfg.port); }
-    catch (e) { settleErr(e); }
-  });
+    });
+    _gatewayServer = gateway;
+    _gatewayMeta = { port: cfg.port, target: cfg.target, lastError: null };
+    return { ok: true, port: cfg.port, target: cfg.target };
+  } catch (e) {
+    _gatewayMeta.lastError = e.message;
+    return { ok: false, error: e.message };
+  }
 }
 
 function stopGateway() {
@@ -10195,17 +9540,61 @@ function stopGateway() {
 }
 
 // Auto-start on boot if DB flag is on. Settings are read here so seed values from env take
-// effect on the very first run. startGateway() is async now (it awaits listen() so EADDRINUSE
-// surfaces correctly), but we don't need to block app boot on it — fire-and-warn.
+// effect on the very first run.
 {
   const cfg = readGatewayConfig();
   if (cfg.enabled) {
-    startGateway()
-      .then(r => { if (!r.ok) console.warn('[Gateway] auto-start failed:', r.error); })
-      .catch(e => console.warn('[Gateway] auto-start crashed:', e.message));
+    const r = startGateway();
+    if (!r.ok) console.warn('[Gateway] auto-start failed:', r.error);
   }
 }
 
+
+async function runServiceTest(svc) {
+  const c = config;
+  switch (svc) {
+    case 'plex': {
+      if (!c.plex.url || !c.plex.token) return { ok: false, error: 'URL and token required' };
+      const r = await axios.get(`${c.plex.url}/identity`, { params: { 'X-Plex-Token': c.plex.token }, headers: { Accept: 'application/json' }, timeout: 5000 });
+      const mid = r.data?.MediaContainer?.machineIdentifier;
+      return { ok: !!mid, detail: mid ? `machineId ${String(mid).slice(0, 12)}…` : 'no machineIdentifier in response' };
+    }
+    case 'tautulli': {
+      if (!c.tautulli.url || !c.tautulli.apiKey) return { ok: false, error: 'URL and API key required' };
+      const r = await axios.get(`${c.tautulli.url}/api/v2`, { params: { apikey: c.tautulli.apiKey, cmd: 'get_server_info' }, timeout: 5000 });
+      const ok = r.data?.response?.result === 'success';
+      return ok ? { ok: true, detail: `server: ${r.data?.response?.data?.pms_name || 'connected'}` }
+                : { ok: false, error: r.data?.response?.message || 'auth failed' };
+    }
+    case 'jellyseerr': {
+      if (!c.jellyseerr.url || !c.jellyseerr.apiKey) return { ok: false, error: 'URL and API key required' };
+      const r = await axios.get(`${c.jellyseerr.url}/api/v1/status`, { headers: { 'X-Api-Key': c.jellyseerr.apiKey, Accept: 'application/json' }, timeout: 5000 });
+      return { ok: !!r.data?.version, detail: `version ${r.data?.version}` };
+    }
+    case 'zabbix': {
+      zabbixAuthToken = null; zabbixDisabled = false; zabbixAuthExpiry = 0; zabbixDisabledReason = null;
+      if (!c.zabbix.url || !c.zabbix.user || !c.zabbix.password) return { ok: false, error: 'URL, user and password required' };
+      const t = await getZabbixToken();
+      if (!t) return { ok: false, error: zabbixDisabledReason || 'login failed' };
+      return { ok: true, detail: 'authenticated' };
+    }
+    case 'bazarr': {
+      if (!c.bazarr.url || !c.bazarr.apiKey) return { ok: false, error: 'URL and API key required' };
+      const r = await axios.get(`${c.bazarr.url.replace(/\/+$/, '')}/api/system/status`,
+        { headers: { 'X-API-KEY': c.bazarr.apiKey, Accept: 'application/json' }, timeout: 5000 });
+      const v = r?.data?.bazarr_version || r?.data?.data?.bazarr_version;
+      return { ok: !!v, detail: v ? `version ${v}` : 'unexpected response shape' };
+    }
+    case 'opensubtitles': {
+      if (!c.opensubtitles.apiKey) return { ok: false, error: 'API key required' };
+      const r = await axios.get('https://api.opensubtitles.com/api/v1/infos/formats',
+        { headers: { 'Api-Key': c.opensubtitles.apiKey, 'User-Agent': OS_USER_AGENT }, timeout: 5000 });
+      return { ok: r.status === 200, detail: 'API reachable' };
+    }
+    default:
+      return { ok: false, error: 'No test handler for this service' };
+  }
+}
 
 app.listen(PORT, () => {
   console.log(`\n╔══════════════════════════════════════════════════╗`);
