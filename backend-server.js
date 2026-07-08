@@ -648,15 +648,58 @@ async function getPlexMachineId() {
   return plexMachineId;
 }
 
-// Helper: determine Plex type number for a library
+// Helper: determine Plex type number for a library (1=movie, 2=show).
+// GET /library/sections/{id} does NOT expose the library's type (returns viewGroup:"secondary",
+// type:undefined) — querying it always fell through to 1 (movie), so every collection created on
+// a show library got type=1 and Plex silently rejected the show items (0-item "TV show
+// collections"). The type field only exists on the LIST endpoint's per-directory entries.
+const _libraryTypeCache = new Map();
 async function getLibraryType(libraryKey) {
-  const libRes = await axios.get(`${config.plex.url}/library/sections/${libraryKey}`, {
+  if (_libraryTypeCache.has(libraryKey)) return _libraryTypeCache.get(libraryKey);
+  const libRes = await axios.get(`${config.plex.url}/library/sections`, {
     params: { 'X-Plex-Token': config.plex.token },
     headers: { 'Accept': 'application/json' },
     timeout: 5000
   });
-  const libType = libRes.data.MediaContainer.type || libRes.data.MediaContainer.viewGroup;
-  return libType === 'show' ? 2 : 1; // 1=movie, 2=show
+  const dirs = libRes.data.MediaContainer.Directory || [];
+  const match = dirs.find(d => String(d.key) === String(libraryKey));
+  const plexType = match && match.type === 'show' ? 2 : 1;
+  _libraryTypeCache.set(libraryKey, plexType);
+  return plexType;
+}
+
+// Plex quirk: axios.post(url, null, ...) still attaches a body + Content-Type:
+// application/x-www-form-urlencoded header even with null data. Plex's server parses that (empty)
+// body as form data and silently drops the query-string `uri` parameter — the collection create
+// call returns 200 with a new ratingKey, but the collection ends up with 0 members. Node's raw
+// http/https client with an explicit empty body avoids the form-parsing path entirely. Use this
+// for any Plex POST/PUT whose real payload lives in the query string (collection create, add
+// items, hub pin/promote).
+function plexBodyless(method, fullUrl) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(fullUrl);
+    const isHttps = u.protocol === 'https:';
+    const mod = isHttps ? require('https') : http;
+    const req = mod.request({
+      method,
+      hostname: u.hostname,
+      port: u.port || (isHttps ? 443 : 80),
+      path: u.pathname + u.search,
+      headers: { 'Accept': 'application/json', 'Content-Length': 0 },
+      timeout: 15000
+    }, (res) => {
+      let body = '';
+      res.on('data', (c) => { body += c; });
+      res.on('end', () => {
+        let data = null;
+        try { data = body ? JSON.parse(body) : null; } catch (e) {}
+        resolve({ status: res.statusCode, data });
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('Plex request timed out')));
+    req.on('error', reject);
+    req.end();
+  });
 }
 
 // Create collection by genre/year/actor
@@ -710,11 +753,7 @@ app.post('/api/plex/collections/create', async (req, res) => {
     if (summary) createParams.append('summary', summary);
     createParams.append('uri', firstUri);
 
-    const createRes = await axios.post(
-      `${config.plex.url}/library/collections?${createParams.toString()}`,
-      null,
-      { headers: { 'Accept': 'application/json' }, timeout: 15000 }
-    );
+    const createRes = await plexBodyless('POST', `${config.plex.url}/library/collections?${createParams.toString()}`);
 
     // Get the new collection's ratingKey
     let colKey = createRes.data?.MediaContainer?.Metadata?.[0]?.ratingKey;
@@ -728,18 +767,14 @@ app.post('/api/plex/collections/create', async (req, res) => {
       if (match) colKey = match.ratingKey;
     }
 
-    // Add remaining items one by one
+    // Add remaining items in one batched call — Plex rejects a single ratingKey in this endpoint
+    // with HTTP 400 but accepts comma-separated ratingKeys in the same uri structure.
     if (colKey && selectedItems.length > 1) {
-      for (const item of selectedItems.slice(1)) {
-        try {
-          const addUri = `server://${machineId}/com.plexapp.plugins.library/library/metadata/${item.ratingKey}`;
-          await axios.put(
-            `${config.plex.url}/library/collections/${colKey}/items?X-Plex-Token=${config.plex.token}&uri=${encodeURIComponent(addUri)}`,
-            null,
-            { headers: { 'Accept': 'application/json' }, timeout: 5000 }
-          );
-        } catch(e) {}
-      }
+      const addRks = selectedItems.slice(1).map(it => it.ratingKey).join(',');
+      const addUri = `server://${machineId}/com.plexapp.plugins.library/library/metadata/${addRks}`;
+      try {
+        await plexBodyless('PUT', `${config.plex.url}/library/collections/${colKey}/items?X-Plex-Token=${config.plex.token}&uri=${encodeURIComponent(addUri)}`);
+      } catch(e) { console.error('Collection add-items error:', e.message); }
     }
 
     res.json({
@@ -788,14 +823,7 @@ app.post('/api/plex/collections/smart', async (req, res) => {
     params.append('uri', filterUri);
     if (summary) params.append('summary', summary);
 
-    await axios.post(
-      `${config.plex.url}/library/sections/${libraryKey}/collections?${params.toString()}`,
-      null,
-      {
-        headers: { 'Accept': 'application/json' },
-        timeout: 10000
-      }
-    );
+    await plexBodyless('POST', `${config.plex.url}/library/sections/${libraryKey}/collections?${params.toString()}`);
 
     res.json({
       success: true,
@@ -1373,16 +1401,12 @@ app.post('/api/plex/collections/:key/pin', async (req, res) => {
     }
 
     if (pin) {
-      // POST to managed hubs to pin
-      await axios.post(
-        `${config.plex.url}/hubs/sections/${sectionId}/manage`,
-        null,
-        {
-          params: { 'X-Plex-Token': config.plex.token, metadataItemId: key, promotedToOwnHome: 1, promotedToRecommended: 1, promotedToSharedHome: 1 },
-          headers: { 'Accept': 'application/json' },
-          timeout: 5000
-        }
-      );
+      // POST to managed hubs to pin (plexBodyless — see comment on its definition)
+      const pinParams = new URLSearchParams({
+        'X-Plex-Token': config.plex.token, metadataItemId: key,
+        promotedToOwnHome: 1, promotedToRecommended: 1, promotedToSharedHome: 1
+      });
+      await plexBodyless('POST', `${config.plex.url}/hubs/sections/${sectionId}/manage?${pinParams.toString()}`);
     } else {
       // DELETE from managed hubs to unpin
       await axios.delete(
@@ -2769,11 +2793,7 @@ async function createAutoCollection(sug, settings, machineId, globalDurationHour
   cParams.append('summary', `${summaryTag} Auto-created.${summaryUser} Expires after ${durationHours}h. Source: ${sug.sourceTitle || 'watch history'}`);
   cParams.append('uri', firstUri);
 
-  const createRes = await axios.post(
-    `${config.plex.url}/library/collections?${cParams.toString()}`,
-    null,
-    { headers: { 'Accept': 'application/json' }, timeout: 15000 }
-  );
+  const createRes = await plexBodyless('POST', `${config.plex.url}/library/collections?${cParams.toString()}`);
 
   let plexKey = createRes.data?.MediaContainer?.Metadata?.[0]?.ratingKey;
   if (!plexKey) {
@@ -2791,23 +2811,23 @@ async function createAutoCollection(sug, settings, machineId, globalDurationHour
     return false;
   }
 
-  for (const item of items.slice(1)) {
+  // Batched: Plex rejects a single ratingKey in this endpoint with HTTP 400 but accepts
+  // comma-separated ratingKeys in the same uri structure.
+  if (items.length > 1) {
+    const addRks = items.slice(1).map(it => it.ratingKey).join(',');
+    const addUri = `server://${machineId}/com.plexapp.plugins.library/library/metadata/${addRks}`;
     try {
-      const addUri = `server://${machineId}/com.plexapp.plugins.library/library/metadata/${item.ratingKey}`;
-      await axios.put(
-        `${config.plex.url}/library/collections/${plexKey}/items?X-Plex-Token=${config.plex.token}&uri=${encodeURIComponent(addUri)}`,
-        null,
-        { headers: { 'Accept': 'application/json' }, timeout: 5000 }
-      );
-    } catch(e) {}
+      await plexBodyless('PUT', `${config.plex.url}/library/collections/${plexKey}/items?X-Plex-Token=${config.plex.token}&uri=${encodeURIComponent(addUri)}`);
+    } catch(e) { result.errors.push({ title: sug.title, error: 'Add-items failed: ' + e.message }); }
   }
 
   if (settings.pin_to_home) {
     try {
-      await axios.post(`${config.plex.url}/hubs/sections/${libraryKey}/manage`, null, {
-        params: { 'X-Plex-Token': config.plex.token, metadataItemId: plexKey, promotedToOwnHome: 1, promotedToRecommended: 1, promotedToSharedHome: 1 },
-        headers: { 'Accept': 'application/json' }, timeout: 5000
+      const pinParams = new URLSearchParams({
+        'X-Plex-Token': config.plex.token, metadataItemId: plexKey,
+        promotedToOwnHome: 1, promotedToRecommended: 1, promotedToSharedHome: 1
       });
+      await plexBodyless('POST', `${config.plex.url}/hubs/sections/${libraryKey}/manage?${pinParams.toString()}`);
     } catch(e) {
       result.errors.push({ title: sug.title, error: 'Pin failed: ' + e.message });
     }
